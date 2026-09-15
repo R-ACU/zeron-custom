@@ -3112,6 +3112,7 @@ impl DocHost {
             .map(|mut current| {
                 if let Some(previous) = &previous {
                     current.auto_approve = previous.auto_approve;
+                    current.permission = previous.permission;
                     current.worktree = previous.worktree.clone();
                 }
                 current
@@ -4466,6 +4467,7 @@ impl DocHost {
                 .map(|c| c.sandbox)
                 .unwrap_or(zeron_proto::SandboxLevel::WorkspaceWrite),
             auto_approve: false,
+            permission: Default::default(),
             attachments: Vec::new(),
             resume: None,
             worktree: None,

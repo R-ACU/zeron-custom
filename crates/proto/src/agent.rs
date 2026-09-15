@@ -50,6 +50,49 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
+/// How much the agent may do without asking — the user-facing "Permissions"
+/// pick in the composer footer. Each harness maps it to its own native idea
+/// of a permission mode (claude `--permission-mode`, codex `approvalPolicy`,
+/// ACP's `mode` config option); a harness with no equivalent for a middle
+/// setting falls back toward [`PermissionMode::Ask`] rather than widening it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionMode {
+    /// Every tool the harness gates arrives as a question in the UI.
+    #[default]
+    Ask,
+    /// File edits apply unasked; anything else still asks where the harness
+    /// tells the two apart.
+    AutoEdits,
+    /// The harness's own auto mode: it approves the routine actions itself
+    /// and only asks about the rest (claude `--permission-mode auto`, codex
+    /// `approvalPolicy: never` inside the picked sandbox, ACP `auto`).
+    Auto,
+    /// Nothing is asked and nothing is sandboxed. The agent runs unattended.
+    Bypass,
+}
+
+impl PermissionMode {
+    /// Whether this is the wire default (used to keep it off the wire).
+    pub fn is_default(&self) -> bool {
+        matches!(self, PermissionMode::Ask)
+    }
+
+    /// Whether every permission request may be accepted outright — the
+    /// boolean the older `auto_approve` flag carried. Only
+    /// [`PermissionMode::Bypass`] does: [`PermissionMode::Auto`] leaves the
+    /// harness to decide what is routine, and what it does ask about is a
+    /// real question for the user.
+    pub fn auto_approves(self) -> bool {
+        matches!(self, PermissionMode::Bypass)
+    }
+
+    /// Whether file edits apply without asking.
+    pub fn auto_approves_edits(self) -> bool {
+        !matches!(self, PermissionMode::Ask)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SteeringMode {
@@ -107,8 +150,16 @@ pub struct RunRequest {
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub cwd: String,
     pub sandbox: SandboxLevel,
+    /// Legacy boolean form of [`Self::permission`]: `true` means "approve
+    /// everything". Kept so existing callers (and older wire peers) keep
+    /// working; [`Self::permission_mode`] reconciles the two.
     #[serde(default)]
     pub auto_approve: bool,
+    /// The user's permission pick for this run. Additive + serde-defaulted
+    /// for wire compat, and skipped when it is the default so an old reader
+    /// never sees a field it cannot parse.
+    #[serde(default, skip_serializing_if = "PermissionMode::is_default")]
+    pub permission: PermissionMode,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -125,6 +176,27 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+}
+
+impl RunRequest {
+    /// The permission mode this run actually carries: the explicit pick when
+    /// there is one, else the legacy `auto_approve` flag read as
+    /// [`PermissionMode::Bypass`] (that flag always meant
+    /// bypassPermissions). Every harness maps THIS, never the raw fields, so
+    /// a caller that only sets one of the two still gets what it asked for.
+    pub fn permission_mode(&self) -> PermissionMode {
+        if self.permission.is_default() && self.auto_approve {
+            PermissionMode::Bypass
+        } else {
+            self.permission
+        }
+    }
+
+    /// Set both forms at once, so the request never disagrees with itself.
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.permission = mode;
+        self.auto_approve = mode.auto_approves();
+    }
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -531,6 +603,43 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn run_request_permission_default_and_round_trip() {
+        // Old-wire JSON without the field parses as Ask (additive compat)…
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(req.permission, PermissionMode::Ask);
+        assert_eq!(req.permission_mode(), PermissionMode::Ask);
+        // …and Ask serializes away (old readers never see it).
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("permission").is_none());
+
+        // A legacy `auto_approve: true` with no explicit pick reads as Auto.
+        let legacy = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","autoApprove":true,"resume":null}"#;
+        let req: RunRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(req.permission, PermissionMode::Ask);
+        assert_eq!(req.permission_mode(), PermissionMode::Bypass);
+
+        // A real pick rides the wire kebab-cased and round-trips.
+        let mut req = req;
+        req.set_permission_mode(PermissionMode::AutoEdits);
+        assert!(!req.auto_approve, "the legacy flag follows the pick");
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["permission"], "auto-edits");
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(round.permission_mode(), PermissionMode::AutoEdits);
+
+        // Auto is NOT the legacy boolean: an old reader must not take it for
+        // bypassPermissions.
+        req.set_permission_mode(PermissionMode::Auto);
+        assert!(!req.auto_approve);
+        assert_eq!(serde_json::to_value(&req).unwrap()["permission"], "auto");
+
+        req.set_permission_mode(PermissionMode::Bypass);
+        assert!(req.auto_approve, "old readers still see the boolean");
+        assert_eq!(serde_json::to_value(&req).unwrap()["permission"], "bypass");
     }
 
     #[test]

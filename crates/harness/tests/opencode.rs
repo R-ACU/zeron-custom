@@ -226,6 +226,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: tmp_dir(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        permission: Default::default(),
         attachments: Vec::new(),
         resume: None,
         worktree: None,

@@ -52,6 +52,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        permission: Default::default(),
         attachments: Vec::new(),
         worktree: None,
         resume: None,

@@ -180,6 +180,7 @@ async fn exercise_projectless(command_first: bool) {
                         cwd: "~".into(),
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: true,
+                        permission: Default::default(),
                         attachments: Vec::new(),
                         worktree: None,
                         resume: None,

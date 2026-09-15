@@ -88,6 +88,8 @@ icon_assets![
     // scale transform at the pinned rev, so the flip is baked into the asset.
     (SIDEBAR_MINIMALISTIC_LEFT, "sidebar-minimalistic-left"),
     (KEY_MINIMALISTIC, "key-minimalistic"),
+    // Permission mode chip in the composer footer.
+    (SHIELD_CHECK, "shield-check"),
     (KEYBOARD, "keyboard"),
     (ARROW_LEFT, "arrow-left"),
     (ARROW_RIGHT, "arrow-right"),

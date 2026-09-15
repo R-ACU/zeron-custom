@@ -26,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
+    FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer,
     UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
@@ -3997,6 +3997,9 @@ pub struct Composer {
     /// Composer actions row plus the new-session floating target tab
     /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
+    /// The footer's Permissions dropdown (its own entity, so the composer
+    /// stays out of its persistence and popover bookkeeping).
+    permissions: Entity<crate::permission_picker::PermissionPicker>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
@@ -4130,6 +4133,7 @@ pub struct Composer {
     route_snap_until: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
+    _permissions_observe: Subscription,
     _picker_focus: Subscription,
     _input_events: Subscription,
 }
@@ -4200,6 +4204,11 @@ impl Composer {
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let permissions =
+            cx.new(|cx| crate::permission_picker::PermissionPicker::new(state.clone(), cx));
+        // Same reason as `pickers_observe`: the chip is rendered inline from
+        // the picker's state, so its notify has to repaint the composer.
+        let permissions_observe = cx.observe(&permissions, |_, _, cx| cx.notify());
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
@@ -4258,6 +4267,7 @@ impl Composer {
             input,
             queue_edit_draft: None,
             pickers,
+            permissions,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             appshots: HashMap::new(),
@@ -4324,6 +4334,7 @@ impl Composer {
             route_snap_until: None,
             _observe: observe,
             _pickers_observe: pickers_observe,
+            _permissions_observe: permissions_observe,
             _picker_focus: picker_focus,
             _input_events: input_events,
         };
@@ -6041,6 +6052,16 @@ impl Composer {
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
         let plan = self.pickers.read(cx).checkout_plan();
+        // The footer's Permissions pick, resolved NOW (same reason as `plan`).
+        // A new chat also ADOPTS it, so the id the composer just minted keeps
+        // what its first message was sent with instead of following the
+        // sticky default around.
+        let permission = self.permissions.read(cx).choice(cx);
+        if is_new {
+            let minted = chat_id.clone();
+            self.permissions
+                .update(cx, |picker, _| picker.adopt_new_chat(&minted));
+        }
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
@@ -6589,8 +6610,9 @@ impl Composer {
                         reasoning: resolved.reasoning,
                         model_options: resolved.model_options.clone(),
                         cwd,
-                        sandbox: SandboxLevel::WorkspaceWrite,
-                        auto_approve: false,
+                        sandbox: permission.sandbox,
+                        auto_approve: permission.mode.auto_approves(),
+                        permission: permission.mode,
                         resume: None,
                         attachments: attachment_paths,
                         worktree: run_worktree,
@@ -7866,11 +7888,6 @@ impl Render for Composer {
                 })
             })
             .flatten();
-        let has_new_thread_git_selectors = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .is_some_and(|space| space.git_detected);
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
@@ -7936,18 +7953,29 @@ impl Render for Composer {
 
         // The lower slot keeps a stable footprint for Git projects while its
         // old floating checkout/ref controls dissolve into the session footer.
-        // Non-Git sessions grow the slot continuously from zero.
-        let session_chrome = 1.0 - new_thread_chrome;
-        let bottom_slot = if has_new_thread_git_selectors || self.dock_frame.is_some() {
-            1.0
-        } else {
-            session_chrome
-        };
+        // It no longer collapses on a non-Git new-chat canvas: the Permissions
+        // chip lives in BOTH rows and has nothing to do with git, so the one
+        // case that used to grow the slot from zero now starts at full height
+        // like every other. (Git projects are unaffected — they were already 1.)
+        let bottom_slot = 1.0f32;
         let container = if bottom_slot > 0.0 {
             let footer = (session_chrome_opacity > 0.0).then(|| {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
+            // One chip, rendered into whichever row is showing (the two are
+            // cross-faded, never both fully opaque). The resolved harness
+            // rides along: only the adapters that actually read a sandbox
+            // level get that section in the dropdown.
+            let permission_chip = |this: &mut Self, cx: &mut Context<Self>| {
+                let harness = this.pickers.read(cx).resolved(cx).harness;
+                this.permissions
+                    .update(cx, |picker, cx| picker.render_chip(harness, cx))
+            };
+            let new_thread_permission_chip =
+                (new_thread_chrome_opacity > 0.0).then(|| permission_chip(self, cx));
+            let session_permission_chip =
+                (session_chrome_opacity > 0.0).then(|| permission_chip(self, cx));
             let usage = self.state.read(cx).context_usage;
             container.child(
                 div()
@@ -7965,7 +7993,9 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .opacity(new_thread_chrome_opacity)
-                                .children(new_thread_git_selectors),
+                                .children(new_thread_git_selectors)
+                                .child(div().flex_1().min_w_0())
+                                .children(new_thread_permission_chip),
                         )
                     })
                     .when(session_chrome_opacity > 0.0, |slot| {
@@ -7979,6 +8009,7 @@ impl Render for Composer {
                                 .items_center()
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
+                                .child(div().flex_none().children(session_permission_chip))
                                 .child(div().flex_none().pr(px(10.0)).child(
                                     crate::context_usage::render(usage, self.state.clone(), &theme),
                                 )),

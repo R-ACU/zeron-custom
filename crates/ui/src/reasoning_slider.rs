@@ -1,8 +1,9 @@
 //! The composer picker's EFFORT slider: the horizontal replacement for the
 //! old reasoning ladder rows (user request, modeled on ChatGPT's model sheet):
-//! a rounded track filled with a provider-colored gradient up to a large white
-//! thumb, the ladder's level names as small ticks underneath, and a field of
-//! drifting sparkles inside the fill at the top rung.
+//! a hairline track filled with a provider-colored gradient up to a small white
+//! thumb, the ladder's level names as small ticks underneath, and a sparse
+//! field of drifting sparkles inside the fill at the top rung. The row is
+//! deliberately light: it sits next to the model options, not above them.
 //!
 //! The data model is untouched: the steps ARE the `ReasoningLevel` ladder the
 //! harness advertises for the selected model (`Model::reasoning_levels`,
@@ -24,22 +25,34 @@ use zeron_proto::{HarnessId, ReasoningLevel};
 use crate::motion;
 use crate::theme::Theme;
 
-/// Track height (the rounded rail the fill rides in).
-pub const TRACK_HEIGHT: f32 = 11.0;
-/// Thumb diameter, deliberately larger than the track (ChatGPT-style).
-pub const THUMB_SIZE: f32 = 22.0;
+/// Track height (the rounded rail the fill rides in). A hairline rail, not a
+/// pill: the card reads as one calm row next to the option rows below it
+/// (user feedback: the old 11px track made the card "fat and thick").
+pub const TRACK_HEIGHT: f32 = 5.0;
+/// Thumb diameter. Still larger than the track so the grab target stays
+/// obvious, but nowhere near the old 22px puck.
+pub const THUMB_SIZE: f32 = 13.0;
 /// The control's name in the UI. "Effort", never "Reasoning" (user request):
 /// the ladder is what the run spends, not what it thinks.
 pub const EFFORT_LABEL: &str = "Effort";
 
+/// Tick caption size: the same small muted step the picker uses for its
+/// section headers ("EFFORT", "CONTEXT WINDOW"), so the row sits level with
+/// the option rows beneath it.
+pub const TICK_TEXT_SIZE: f32 = 10.0;
+
 /// What a ladder-less model (Claude Haiku) reads instead of a slider.
 pub const NO_EFFORT_HINT: &str = "No effort control for this model";
 
-/// Sparkle count at the top rung.
-pub const SPARKLE_COUNT: usize = 14;
+/// Sparkle count at the top rung. Fewer and dimmer than the first cut: the
+/// effect marks the ceiling, it does not decorate the row.
+pub const SPARKLE_COUNT: usize = 7;
 /// Sparkle alpha band (dimmest .. brightest).
-pub const SPARKLE_MIN_ALPHA: f32 = 0.35;
-pub const SPARKLE_MAX_ALPHA: f32 = 0.9;
+pub const SPARKLE_MIN_ALPHA: f32 = 0.25;
+pub const SPARKLE_MAX_ALPHA: f32 = 0.7;
+/// Sparkle diameter band in px: dust on a 5px rail, never dots on a pill.
+pub const SPARKLE_MIN_SIZE: f32 = 1.0;
+pub const SPARKLE_MAX_SIZE: f32 = 2.0;
 /// Twinkle cycles per drift cycle: the dots blink faster than they travel.
 const SPARKLE_TWINKLE_CYCLES: f32 = 3.0;
 /// How far a dot travels per drift cycle, as a fraction of the filled track
@@ -157,7 +170,7 @@ pub fn provider_ink(harness: Option<HarnessId>, theme: &Theme) -> Hsla {
 pub struct Sparkle {
     pub x: f32,
     pub y: f32,
-    /// Dot diameter in px (2..3).
+    /// Dot diameter in px ([`SPARKLE_MIN_SIZE`]..[`SPARKLE_MAX_SIZE`]).
     pub size: f32,
     /// Twinkle phase offset (0..1) so the dots never blink in unison.
     pub phase: f32,
@@ -176,7 +189,7 @@ pub fn sparkle_field(count: usize) -> Vec<Sparkle> {
         .map(|_| Sparkle {
             x: next(),
             y: next(),
-            size: 2.0 + next(),
+            size: SPARKLE_MIN_SIZE + (SPARKLE_MAX_SIZE - SPARKLE_MIN_SIZE) * next(),
             phase: next(),
         })
         .collect()
@@ -291,9 +304,7 @@ impl EffortSlider {
             .w(px(self.width))
             .h(px(TRACK_HEIGHT))
             .rounded(px(TRACK_HEIGHT / 2.0))
-            .bg(crate::theme::ink(0.07))
-            .border_1()
-            .border_color(crate::theme::hairline(0.10))
+            .bg(crate::theme::ink(0.09))
             .child(fill)
             .child(
                 gpui::canvas(
@@ -313,9 +324,9 @@ impl EffortSlider {
             .rounded_full()
             .bg(gpui::white())
             .shadow(vec![gpui::BoxShadow {
-                color: gpui::hsla(0.0, 0.0, 0.0, 0.35),
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.28),
                 offset: gpui::point(px(0.0), px(1.0)),
-                blur_radius: px(4.0),
+                blur_radius: px(3.0),
                 spread_radius: px(0.0),
                 inset: false,
             }]);
@@ -325,17 +336,17 @@ impl EffortSlider {
         // captions drift away from the positions they name.
         let ticks = div()
             .w(px(self.width))
-            .px(px(THUMB_SIZE / 2.0 - 4.0))
+            .px(px((THUMB_SIZE / 2.0 - 3.0).max(0.0)))
             .flex()
             .flex_row()
             .items_start()
             .justify_between()
-            .pt(px(6.0))
+            .pt(px(4.0))
             .children(tick_labels(&self.levels).into_iter().enumerate().map(
                 |(ix, label)| {
                     div()
                         .flex_none()
-                        .text_size(crate::typography::ui_rems(9.5))
+                        .text_size(crate::typography::ui_rems(TICK_TEXT_SIZE))
                         .font_weight(if ix == self.current {
                             gpui::FontWeight::SEMIBOLD
                         } else {
@@ -377,6 +388,36 @@ mod tests {
         assert!(
             !NO_EFFORT_HINT.to_lowercase().contains("reasoning"),
             "the UI never says Reasoning"
+        );
+    }
+
+    #[test]
+    fn the_slider_stays_a_hairline_row() {
+        // User feedback: the effort card read "too fat, thick and cluttered".
+        // The rail is a hairline, the thumb a small grab target, and the tick
+        // captions share the picker's section-header size.
+        assert!(
+            (4.0..=5.0).contains(&TRACK_HEIGHT),
+            "track {TRACK_HEIGHT} must stay a hairline rail"
+        );
+        assert!(
+            (12.0..=14.0).contains(&THUMB_SIZE),
+            "thumb {THUMB_SIZE} must stay small"
+        );
+        assert!(THUMB_SIZE > TRACK_HEIGHT, "the thumb still reads as a grab");
+        assert_eq!(TICK_TEXT_SIZE, 10.0, "same step as the section headers");
+    }
+
+    #[test]
+    fn the_sparkles_stay_subtle() {
+        assert!(
+            SPARKLE_MAX_ALPHA <= 0.7,
+            "max alpha {SPARKLE_MAX_ALPHA} must stay under the old 0.9"
+        );
+        assert!(SPARKLE_MIN_ALPHA < SPARKLE_MAX_ALPHA);
+        assert!(
+            SPARKLE_MAX_SIZE <= 2.0 && SPARKLE_MIN_SIZE >= 1.0,
+            "dots stay in the 1..2px band"
         );
     }
 
@@ -448,13 +489,19 @@ mod tests {
         assert_eq!(a, b, "same seed, same field");
         assert_eq!(a.len(), SPARKLE_COUNT);
         assert!(
-            (12..=18).contains(&SPARKLE_COUNT),
-            "the field stays in the 12..18 band"
+            (4..=10).contains(&SPARKLE_COUNT),
+            "a sparse field, not a glitter band"
         );
         for dot in &a {
             assert!((0.0..1.0).contains(&dot.x), "x {}", dot.x);
             assert!((0.0..1.0).contains(&dot.y), "y {}", dot.y);
-            assert!((2.0..3.0).contains(&dot.size), "size {}", dot.size);
+            assert!(
+                (SPARKLE_MIN_SIZE..=SPARKLE_MAX_SIZE).contains(&dot.size),
+                "size {}",
+                dot.size
+            );
+            // Dust, not dots: a sparkle never outgrows the rail it rides in.
+            assert!(dot.size <= TRACK_HEIGHT - 1.0, "size {} vs rail", dot.size);
             assert!((0.0..1.0).contains(&dot.phase), "phase {}", dot.phase);
         }
         // Not all dots stacked on one spot.

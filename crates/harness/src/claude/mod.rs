@@ -10,10 +10,11 @@
 //!   transport the Claude Agent SDK's `query()` drives, and was re-validated
 //!   live against 2.1.228: `can_use_tool` control requests arrive and
 //!   allow/deny responses are honored). The alternative channel — an MCP
-//!   permission tool — needs a server process and was rejected. Tool calls
-//!   auto-allow (zeron sessions run unattended, parity with the ACP
-//!   harness's preferred-allow behavior); `AskUserQuestion` round-trips
-//!   through [`RunControls::request_input`].
+//!   permission tool — needs a server process and was rejected. The run's
+//!   [`PermissionMode`] decides what happens next: `bypass` allows every
+//!   tool outright, every other mode turns whatever the CLI still gates into
+//!   a yes/no question. `AskUserQuestion` always round-trips through
+//!   [`RunControls::request_input`].
 //! - DONE is the CLI's own `result` frame, eagerly: background work (a
 //!   spawned subagent) never holds the turn. The CLI natively runs a second
 //!   wake turn when a background task finishes — a fresh `init` (same
@@ -49,8 +50,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, PermissionMode, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
@@ -187,15 +188,7 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
-            cmd.args([
-                "--permission-mode",
-                "bypassPermissions",
-                "--dangerously-skip-permissions",
-            ]);
-        } else {
-            cmd.args(["--permission-mode", "default"]);
-        }
+        cmd.args(permission_args(request.permission_mode()));
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
         }
@@ -403,7 +396,7 @@ impl Harness for ClaudeHarness {
         request.worktree = None;
         request.attachments.clear();
         request.model_options.clear();
-        request.auto_approve = false;
+        request.set_permission_mode(PermissionMode::Ask);
         self.run_with_mode(request, controls, true).await
     }
 }
@@ -477,6 +470,7 @@ impl ClaudeHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             title_only,
+            permission: request.permission_mode(),
             child,
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
@@ -601,6 +595,9 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 
 struct Session {
     title_only: bool,
+    /// The run's permission pick — decides whether a gated tool is allowed
+    /// outright or turned into a question.
+    permission: PermissionMode,
     child: Child,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
@@ -618,6 +615,7 @@ struct Session {
 async fn run_session(session: Session) {
     let Session {
         title_only,
+        permission,
         mut child,
         mut stdout_lines,
         stdin_tx,
@@ -665,7 +663,12 @@ async fn run_session(session: Session) {
                             }));
                             let _ = stdin_tx.send(StdinMsg::Line(line));
                         } else {
-                            handle_control_request(req, &request_input, &stdin_tx);
+                            handle_control_request(
+                                req,
+                                permission,
+                                &request_input,
+                                &stdin_tx,
+                            );
                         }
                         continue;
                     }
@@ -772,15 +775,67 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved
-/// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
-/// surface the questions through the engine's input bridge (which owns the
-/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
-/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
-/// by question text, as the tool expects.
+/// The CLI flags one permission mode maps to (`--permission-mode` choices on
+/// 2.1.272: acceptEdits, auto, bypassPermissions, manual, dontAsk, plan —
+/// plus `default`, the still-accepted older spelling of `manual`, kept here
+/// so the flag also works on the CLI versions that predate the rename).
+/// `default`, `acceptEdits` and `auto` all still gate SOME tools, so their
+/// requests reach us on the stdio permission channel and become questions;
+/// `bypassPermissions` (plus the skip flag the CLI demands alongside it)
+/// gates nothing. Pure so the mapping is testable without spawning the CLI.
+pub(crate) fn permission_args(mode: PermissionMode) -> &'static [&'static str] {
+    match mode {
+        PermissionMode::Ask => &["--permission-mode", "default"],
+        PermissionMode::AutoEdits => &["--permission-mode", "acceptEdits"],
+        PermissionMode::Auto => &["--permission-mode", "auto"],
+        PermissionMode::Bypass => &[
+            "--permission-mode",
+            "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ],
+    }
+}
+
+/// The yes/no question one gated tool becomes in every mode but
+/// [`PermissionMode::Bypass`] (the CLI already applied whatever its own mode
+/// treats as routine, so anything that still arrives is worth asking about).
+fn permission_question(tool_name: &str, input: &Value) -> UserInputQuestion {
+    // The one detail worth showing: the command for Bash, the path for
+    // anything file-shaped. Anything else is named by its tool.
+    let detail = input
+        .get("command")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("file_path").and_then(Value::as_str))
+        .or_else(|| input.get("path").and_then(Value::as_str))
+        .or_else(|| input.get("url").and_then(Value::as_str))
+        .unwrap_or_default();
+    let question = if detail.is_empty() {
+        format!("Claude wants to use {tool_name}. Allow it?")
+    } else {
+        format!("Claude wants to use {tool_name}: `{detail}`. Allow it?")
+    };
+    UserInputQuestion {
+        id: uuid::Uuid::new_v4().to_string(),
+        header: "Approve tool use".to_owned(),
+        question,
+        options: vec!["Yes".into(), "No".into()],
+        multi_select: false,
+    }
+}
+
+/// Serve one `can_use_tool` control request. In [`PermissionMode::Bypass`]
+/// every tool is allowed outright (the CLI still blocks until SOME response
+/// arrives, so every request must be answered); otherwise the gated tool
+/// becomes a yes/no question on the engine's input bridge — including in
+/// `auto`, where whatever the CLI did NOT treat as routine is exactly what
+/// the user should see. `AskUserQuestion`
+/// is always intercepted — surface the questions through that same bridge
+/// (which owns the `InputRequested`/`InputResolved` lifecycle), wait for the
+/// user's answers (in a subtask so the frame loop keeps flowing), and hand
+/// them back keyed by question text, as the tool expects.
 fn handle_control_request(
     req: ControlRequestFrame,
+    mode: PermissionMode,
     request_input: &Arc<RequestInputFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) {
@@ -792,8 +847,32 @@ fn handle_control_request(
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
-        let line = control_response_line(&req.request_id, allow_response(req.request.input));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+        if mode.auto_approves() {
+            let line = control_response_line(&req.request_id, allow_response(req.request.input));
+            let _ = stdin_tx.send(StdinMsg::Line(line));
+            return;
+        }
+        // Ask the user. A dropped sender (the caller went away) degrades to a
+        // denial so the CLI is unblocked — never silently allowed.
+        let question = permission_question(&req.request.tool_name, &req.request.input);
+        let request_input = Arc::clone(request_input);
+        let stdin_tx = stdin_tx.clone();
+        tokio::spawn(async move {
+            let answers = (request_input)(vec![question.clone()]).await.unwrap_or_default();
+            let allowed = answers.iter().any(|a| {
+                a.question_id == question.id
+                    && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
+            });
+            let body = if allowed {
+                allow_response(req.request.input)
+            } else {
+                serde_json::json!({
+                    "behavior": "deny",
+                    "message": "The user declined this tool use."
+                })
+            };
+            let _ = stdin_tx.send(StdinMsg::Line(control_response_line(&req.request_id, body)));
+        });
         return;
     }
     let request_input = Arc::clone(request_input);
@@ -928,5 +1007,68 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+
+    #[test]
+    fn permission_modes_map_to_cli_flags() {
+        assert_eq!(
+            permission_args(PermissionMode::Ask),
+            ["--permission-mode", "default"]
+        );
+        assert_eq!(
+            permission_args(PermissionMode::AutoEdits),
+            ["--permission-mode", "acceptEdits"]
+        );
+        // The CLI's OWN auto mode: it approves the routine work itself and
+        // still gates the rest, which reaches us as a question.
+        assert_eq!(
+            permission_args(PermissionMode::Auto),
+            ["--permission-mode", "auto"]
+        );
+        assert_eq!(
+            permission_args(PermissionMode::Bypass),
+            [
+                "--permission-mode",
+                "bypassPermissions",
+                "--dangerously-skip-permissions"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_legacy_auto_approve_request_still_bypasses() {
+        let mut request = RunRequest {
+            prompt: String::new(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            permission: Default::default(),
+            attachments: Vec::new(),
+            worktree: None,
+            resume: None,
+        };
+        assert_eq!(request.permission_mode(), PermissionMode::Bypass);
+        // An explicit pick wins over the legacy flag.
+        request.set_permission_mode(PermissionMode::AutoEdits);
+        assert_eq!(request.permission_mode(), PermissionMode::AutoEdits);
+        assert!(!request.auto_approve);
+    }
+
+    #[test]
+    fn a_gated_tool_becomes_a_yes_no_question() {
+        let q = permission_question("Bash", &json!({"command": "rm -rf /tmp/x"}));
+        assert_eq!(q.header, "Approve tool use");
+        assert!(q.question.contains("rm -rf /tmp/x"), "{}", q.question);
+        assert_eq!(q.options, vec!["Yes".to_string(), "No".to_string()]);
+        assert!(!q.multi_select);
+        // File-shaped tools name their path; anything else names the tool.
+        let q = permission_question("Write", &json!({"file_path": "/a.rs"}));
+        assert!(q.question.contains("/a.rs"), "{}", q.question);
+        let q = permission_question("Mystery", &json!({}));
+        assert!(q.question.contains("Mystery"), "{}", q.question);
     }
 }

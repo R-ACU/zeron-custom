@@ -54,6 +54,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        permission: Default::default(),
         attachments: Vec::new(),
         worktree: None,
         resume: None,

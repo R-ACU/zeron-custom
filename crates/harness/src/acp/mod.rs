@@ -48,8 +48,8 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, PermissionMode,
+    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -1527,6 +1527,35 @@ fn first_class_model_change(
     Ok(Some(requested.to_owned()))
 }
 
+/// The agent `mode` values one permission mode is willing to select, best
+/// first. Empty for [`PermissionMode::Ask`]: asking IS every ACP agent's
+/// default, so the option is left untouched — and a mode whose candidates an
+/// agent does not advertise likewise falls through to that default rather
+/// than being widened to something the user never picked (an agent with no
+/// accept-edits mode keeps asking; it does not get yolo).
+pub(crate) fn permission_mode_values(mode: PermissionMode) -> &'static [&'static str] {
+    match mode {
+        PermissionMode::Ask => &[],
+        // claude-agent-acp `acceptEdits`; nothing else advertises a
+        // dedicated one, so those agents stay on their default.
+        PermissionMode::AutoEdits => {
+            &["acceptEdits", "accept_edits", "accept-edits", "autoEdit", "auto-edit"]
+        }
+        // Kimi and codex-acp both call their unattended-but-sandboxed mode
+        // `auto`; claude-agent-acp has none, so it lands on acceptEdits.
+        PermissionMode::Auto => &["auto", "acceptEdits", "accept_edits", "accept-edits"],
+        PermissionMode::Bypass => &[
+            "bypassPermissions",
+            "bypass_permissions",
+            "bypass",
+            "yolo",
+            "agent-full-access",
+            "danger-full-access",
+            "full-access",
+        ],
+    }
+}
+
 /// The `session/set_config_option` calls a session response's `configOptions`
 /// warrant for this run:
 /// - the requested model (category `model`; a `contextWindow: "1m"` model
@@ -1544,6 +1573,7 @@ fn config_option_sets(
     model: Option<&str>,
     efforts: &[&'static str],
     model_options: &serde_json::Map<String, Value>,
+    permission: PermissionMode,
 ) -> Vec<(String, Value)> {
     let Some(options) = session_response
         .get("configOptions")
@@ -1576,31 +1606,26 @@ fn config_option_sets(
             ("select", Some("model")) => model
                 .and_then(|m| pick_model_value(m, &available, context_1m))
                 .map(Value::String),
-            // Unattended parity with the retired custom adapters (claude
-            // bypassPermissions / codex approvalPolicy never): pick the
-            // no-prompts mode when the agent offers one. claude-agent-acp
-            // calls it `bypassPermissions`, codex-acp `agent-full-access`
-            // (approvalPolicy "never" + danger-full-access sandbox), Devin
-            // `bypass`. Cursor instead exposes agent/plan/ask — those arrive
-            // as a Traits "Mode" option and win when the run selected one.
+            // The run's permission mode picks the agent's own mode option.
+            // `auto` wants the no-prompts one — claude-agent-acp calls it
+            // `bypassPermissions`, codex-acp `agent-full-access`
+            // (approvalPolicy "never" + danger-full-access sandbox), Kimi
+            // `yolo`, Devin `bypass`. `auto-edits` wants the accept-edits one
+            // (claude `acceptEdits`, Kimi/codex-acp `auto`); an agent with no
+            // such mode is left alone, which means it keeps asking. `ask`
+            // never touches the option at all. Cursor instead exposes
+            // agent/plan/ask — those arrive as a Traits "Mode" option and win
+            // over all of this when the run selected one.
             ("select", Some("mode")) => model_options
                 .get("mode")
                 .and_then(Value::as_str)
                 .filter(|c| available.contains(c))
                 .map(|c| Value::String(c.to_owned()))
                 .or_else(|| {
-                    [
-                        "bypassPermissions",
-                        "bypass_permissions",
-                        "bypass",
-                        "yolo",
-                        "agent-full-access",
-                        "danger-full-access",
-                        "full-access",
-                    ]
-                    .into_iter()
-                    .find(|v| available.contains(v))
-                    .map(|v| Value::String(v.to_owned()))
+                    permission_mode_values(permission)
+                        .iter()
+                        .find(|v| available.contains(*v))
+                        .map(|v| Value::String((*v).to_owned()))
                 }),
             ("select", Some("thought_level")) => efforts
                 .iter()
@@ -1822,17 +1847,21 @@ fn is_user_question(options: &[Value]) -> bool {
     })
 }
 
-/// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
-/// engine's input bridge (in a subtask so the message loop keeps flowing)
-/// and answer with the option whose name matches the chosen label. A dropped
-/// resolver degrades to `cancelled` — never a silent allow.
+/// The live-run request handler. Question-shaped requests always block on the
+/// engine's input bridge (in a subtask so the message loop keeps flowing) and
+/// answer with the option whose name matches the chosen label; a plain tool
+/// permission does the same unless the run's mode is
+/// [`PermissionMode::Bypass`], which accepts it like
+/// [`handle_server_request`]. In `auto` the agent's own mode option already
+/// waved the routine work through, so whatever still asks is worth asking.
+/// A dropped resolver degrades to `cancelled` — never a silent allow.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    permission: PermissionMode,
 ) -> Vec<AgentEvent> {
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -1842,7 +1871,8 @@ fn handle_server_request_live(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if !is_user_question(&options) {
+    let is_question = is_user_question(&options);
+    if !is_question && permission.auto_approves() {
         return handle_server_request(client, id, method, params);
     }
     let names: Vec<String> = options
@@ -1854,15 +1884,22 @@ fn handle_server_request_live(
                 .to_owned()
         })
         .collect();
+    let title = params
+        .get("toolCall")
+        .and_then(|t| t.get("title"))
+        .and_then(Value::as_str);
     let question = UserInputQuestion {
         id: new_message_id(),
-        header: "Agent question".into(),
-        question: params
-            .get("toolCall")
-            .and_then(|t| t.get("title"))
-            .and_then(Value::as_str)
-            .unwrap_or("The agent needs your input.")
-            .to_owned(),
+        header: if is_question {
+            "Agent question".into()
+        } else {
+            "Approve tool use".into()
+        },
+        question: match (is_question, title) {
+            (true, title) => title.unwrap_or("The agent needs your input.").to_owned(),
+            (false, Some(title)) => format!("The agent wants to run {title}. Allow it?"),
+            (false, None) => "The agent wants to use a tool. Allow it?".to_owned(),
+        },
         options: names.clone(),
         multi_select: false,
     };
@@ -2027,6 +2064,9 @@ async fn run_session(session: Session) {
         interrupt,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
+    // The run's permission pick: read once, before `request` is consumed
+    // piecemeal below, so every approval path agrees on it.
+    let permission = request.permission_mode();
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
@@ -2126,6 +2166,7 @@ async fn run_session(session: Session) {
             requested_model,
             &efforts,
             &request.model_options,
+            permission,
         ) {
             let mut params = serde_json::Map::new();
             params.insert("sessionId".into(), session_id.clone().into());
@@ -2441,6 +2482,7 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                permission,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2613,6 +2655,7 @@ async fn run_session(session: Session) {
                         &method,
                         &params,
                         &request_input,
+                        permission,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -2722,6 +2765,7 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        permission,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -3195,7 +3239,7 @@ mod tests {
         // Model switch + effort preference list; fastMode untouched without a
         // model-option selection.
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["medium"], &no_opts),
+            config_option_sets(&response, Some("claude-opus-5"), &["medium"], &no_opts, PermissionMode::Bypass),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5" })),
                 ("effort".to_owned(), json!({ "value": "medium" })),
@@ -3203,7 +3247,7 @@ mod tests {
         );
         // Effort preference order: first ADVERTISED candidate wins.
         assert_eq!(
-            config_option_sets(&response, None, &["xhigh", "max"], &no_opts),
+            config_option_sets(&response, None, &["xhigh", "max"], &no_opts, PermissionMode::Bypass),
             vec![("effort".to_owned(), json!({ "value": "max" }))]
         );
         // contextWindow=1m composes the [1m] model id; fastMode=on matches the
@@ -3212,7 +3256,7 @@ mod tests {
         opts.insert("contextWindow".into(), json!("1m"));
         opts.insert("fastMode".into(), json!("on"));
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts),
+            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts, PermissionMode::Bypass),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5[1m]" })),
                 (
@@ -3223,16 +3267,16 @@ mod tests {
         );
         // Already-current values and unadvertised models set nothing.
         assert_eq!(
-            config_option_sets(&response, Some("claude-sonnet-5"), &["high"], &no_opts),
+            config_option_sets(&response, Some("claude-sonnet-5"), &["high"], &no_opts, PermissionMode::Bypass),
             Vec::new()
         );
         assert_eq!(
-            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts),
+            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts, PermissionMode::Bypass),
             Vec::new()
         );
         // No configOptions advertised → nothing to set.
         assert_eq!(
-            config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
+            config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts, PermissionMode::Auto),
             Vec::new()
         );
     }
@@ -3553,7 +3597,7 @@ mod tests {
         });
         let no_opts = serde_json::Map::new();
         assert_eq!(
-            config_option_sets(&codex, None, &[], &no_opts),
+            config_option_sets(&codex, None, &[], &no_opts, PermissionMode::Bypass),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
     }
@@ -3574,5 +3618,108 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
+    }
+
+    #[test]
+    fn permission_modes_pick_the_agents_own_mode_option() {
+        // claude-agent-acp
+        let claude = json!({
+            "sessionId": "s",
+            "configOptions": [{
+                "id": "mode", "type": "select", "category": "mode",
+                "currentValue": "default",
+                "options": [
+                    {"value": "default"}, {"value": "acceptEdits"},
+                    {"value": "plan"}, {"value": "bypassPermissions"}
+                ]
+            }]
+        });
+        let no_opts = serde_json::Map::new();
+        assert_eq!(
+            config_option_sets(&claude, None, &[], &no_opts, PermissionMode::Bypass),
+            vec![(
+                "mode".to_string(),
+                json!({ "value": "bypassPermissions" })
+            )]
+        );
+        assert_eq!(
+            config_option_sets(&claude, None, &[], &no_opts, PermissionMode::AutoEdits),
+            vec![("mode".to_string(), json!({ "value": "acceptEdits" }))]
+        );
+        // claude-agent-acp advertises no plain `auto`: it lands on acceptEdits.
+        assert_eq!(
+            config_option_sets(&claude, None, &[], &no_opts, PermissionMode::Auto),
+            vec![("mode".to_string(), json!({ "value": "acceptEdits" }))]
+        );
+        // Ask leaves the option untouched — asking is the agent default.
+        assert!(
+            config_option_sets(&claude, None, &[], &no_opts, PermissionMode::Ask).is_empty()
+        );
+
+        // Kimi: default/plan/auto/yolo.
+        let kimi = json!({
+            "sessionId": "s",
+            "configOptions": [{
+                "id": "mode", "type": "select", "category": "mode",
+                "currentValue": "default",
+                "options": [
+                    {"value": "default"}, {"value": "plan"},
+                    {"value": "auto"}, {"value": "yolo"}
+                ]
+            }]
+        });
+        assert_eq!(
+            config_option_sets(&kimi, None, &[], &no_opts, PermissionMode::Bypass),
+            vec![("mode".to_string(), json!({ "value": "yolo" }))]
+        );
+        // Kimi's own auto mode, not its yolo mode.
+        assert_eq!(
+            config_option_sets(&kimi, None, &[], &no_opts, PermissionMode::Auto),
+            vec![("mode".to_string(), json!({ "value": "auto" }))]
+        );
+        // Kimi advertises no accept-edits mode: left on its default.
+        assert!(
+            config_option_sets(&kimi, None, &[], &no_opts, PermissionMode::AutoEdits).is_empty()
+        );
+
+        // An agent with no accept-edits mode is LEFT ALONE rather than
+        // widened to its no-prompts mode.
+        let no_middle = json!({
+            "sessionId": "s",
+            "configOptions": [{
+                "id": "mode", "type": "select", "category": "mode",
+                "currentValue": "default",
+                "options": [{"value": "default"}, {"value": "bypass"}]
+            }]
+        });
+        assert!(
+            config_option_sets(&no_middle, None, &[], &no_opts, PermissionMode::AutoEdits)
+                .is_empty()
+        );
+        assert!(
+            config_option_sets(&no_middle, None, &[], &no_opts, PermissionMode::Auto).is_empty()
+        );
+        assert_eq!(
+            config_option_sets(&no_middle, None, &[], &no_opts, PermissionMode::Bypass),
+            vec![("mode".to_string(), json!({ "value": "bypass" }))]
+        );
+    }
+
+    #[test]
+    fn an_explicit_mode_option_pick_beats_the_permission_mode() {
+        let cursor = json!({
+            "sessionId": "s",
+            "configOptions": [{
+                "id": "mode", "type": "select", "category": "mode",
+                "currentValue": "agent",
+                "options": [{"value": "agent"}, {"value": "plan"}, {"value": "ask"}]
+            }]
+        });
+        let mut opts = serde_json::Map::new();
+        opts.insert("mode".into(), json!("plan"));
+        assert_eq!(
+            config_option_sets(&cursor, None, &[], &opts, PermissionMode::Bypass),
+            vec![("mode".to_string(), json!({ "value": "plan" }))]
+        );
     }
 }

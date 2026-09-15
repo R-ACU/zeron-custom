@@ -62,6 +62,7 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
         cwd: std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        permission: Default::default(),
         attachments: Vec::new(),
         worktree: None,
         resume: None,

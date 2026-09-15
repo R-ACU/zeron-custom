@@ -41,6 +41,7 @@ mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
 pub mod notify;
+pub mod permission_picker;
 pub mod pickers;
 pub mod popover;
 pub mod queue;

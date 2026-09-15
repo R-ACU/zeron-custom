@@ -37,10 +37,15 @@ const FOOTER_CHIP_RADIUS: f32 = 6.0;
 /// its tabbed layout).
 const MODEL_POPOVER_WIDTH: f32 = 304.0;
 
-/// The effort slider's painted track width: the popover minus its 1px border,
-/// the tray's 6px inset and the card's 12px padding on each side. Fixed rather
-/// than measured so the first painted frame is already correct.
-const EFFORT_TRACK_WIDTH: f32 = MODEL_POPOVER_WIDTH - 2.0 * (1.0 + 6.0 + 12.0);
+/// The effort slider's painted track width: the popover minus its 1px border
+/// and [`EFFORT_ROW_PAD`] on each side. Fixed rather than measured
+/// so the first painted frame is already correct.
+const EFFORT_TRACK_WIDTH: f32 = MODEL_POPOVER_WIDTH - 2.0 * (1.0 + EFFORT_ROW_PAD);
+
+/// Horizontal padding of the effort row. 14px lines its EFFORT label up with
+/// the tray's option headings (6px tray inset + 8px heading padding) and with
+/// the model rows above (6px list inset + 8px row padding).
+const EFFORT_ROW_PAD: f32 = 14.0;
 
 /// Both sides of the composer handoff share one leading-aligned workspace
 /// cluster. Available width belongs after the pair, never between its labels.
@@ -502,6 +507,118 @@ struct ModelRowData {
     model: Model,
 }
 
+/// The picker's flattened model rows plus the position of the "OTHER"
+/// divider inside them. Keyboard nav, the mod-N badges and Enter all index
+/// the ROWS; the divider is a render-only item the list re-inserts, so it
+/// can never be highlighted or activated (see [`row_for_list_ix`]).
+#[derive(Debug, Default)]
+struct ModelRows {
+    rows: Vec<ModelRowData>,
+    /// Index in `rows` the divider is drawn ABOVE, i.e. the number of
+    /// flagship rows. `None` on a filtered list, the favorites tab, or when
+    /// one of the two groups would be empty.
+    divider: Option<usize>,
+}
+
+impl std::ops::Deref for ModelRows {
+    type Target = Vec<ModelRowData>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+impl ModelRows {
+    /// Item count of the `uniform_list` backing these rows (the divider
+    /// occupies one item of its own).
+    fn list_len(&self) -> usize {
+        self.rows.len() + usize::from(self.divider.is_some())
+    }
+}
+
+/// Small-caps label of the divider parting the flagship models from the rest.
+const OTHER_GROUP_LABEL: &str = "Other";
+
+/// How many leading catalog rows count as flagship for a harness with no
+/// curated flagship ids. Catalogs are served newest-first, so this is "the
+/// newest two" (plus the `default` alias row, which every such catalog
+/// points at its own pick).
+const FALLBACK_FLAGSHIP_ROWS: usize = 2;
+
+/// The model ids a harness leads its list with, as id PREFIXES so the `[1m]`
+/// context-window variants and dated point releases come along. Defined in
+/// ONE place (user request: "the best models first"); everything else falls
+/// under the OTHER divider in catalog order.
+///
+/// Claude Code leads with the three current flagships, Codex with the
+/// top-generation GPT family; a harness with no curated set uses its
+/// `default` row plus [`FALLBACK_FLAGSHIP_ROWS`] newest catalog rows.
+fn flagship_models(harness: HarnessId) -> &'static [&'static str] {
+    match harness {
+        // The mock harness scripts Claude-flavoured runs and wears the
+        // Claude catalog everywhere else.
+        HarnessId::ClaudeCode | HarnessId::Mock => {
+            &["claude-fable-5-1", "claude-opus-5", "claude-sonnet-5"]
+        }
+        HarnessId::Codex => &["gpt-6"],
+        _ => &["default"],
+    }
+}
+
+/// Whether `id` is one of the harness's flagship models.
+fn is_flagship_model(harness: HarnessId, id: &str) -> bool {
+    flagship_models(harness)
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+/// Leading catalog rows a harness takes on TOP of [`flagship_models`]
+/// (catalogs are served newest-first). Zero where the ids above are curated
+/// and complete.
+fn flagship_lead_rows(harness: HarnessId) -> usize {
+    match harness {
+        HarnessId::ClaudeCode | HarnessId::Mock | HarnessId::Codex => 0,
+        _ => FALLBACK_FLAGSHIP_ROWS,
+    }
+}
+
+/// Split a harness's catalog rows into (flagships, the rest), each in its
+/// original order.
+fn split_flagships<'a>(
+    harness: HarnessId,
+    models: &[&'a Model],
+) -> (Vec<&'a Model>, Vec<&'a Model>) {
+    let lead = flagship_lead_rows(harness);
+    let mut taken = 0usize;
+    models.iter().copied().partition(|model| {
+        if is_flagship_model(harness, &model.id) {
+            return true;
+        }
+        if taken < lead {
+            taken += 1;
+            return true;
+        }
+        false
+    })
+}
+
+/// The row a list item maps to, or `None` for the divider item itself.
+fn row_for_list_ix(list_ix: usize, divider: Option<usize>) -> Option<usize> {
+    match divider {
+        Some(at) if list_ix == at => None,
+        Some(at) if list_ix > at => Some(list_ix - 1),
+        _ => Some(list_ix),
+    }
+}
+
+/// The list item a row sits at (the inverse of [`row_for_list_ix`]).
+fn list_ix_for_row(row_ix: usize, divider: Option<usize>) -> usize {
+    match divider {
+        Some(at) if row_ix >= at => row_ix + 1,
+        _ => row_ix,
+    }
+}
+
 /// Which picker popover is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -562,7 +679,7 @@ pub struct Pickers {
     /// Flattened rows the list/keyboard/⌘N all walk, cached per
     /// [`ModelRowsKey`]: a 7k-model catalog rebuilt+ranked on every
     /// keystroke, arrow press AND render was the picker's open/scroll lag.
-    model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelRowData>>)>>,
+    model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<ModelRows>)>>,
     /// Bumped on every catalog/favorites mutation; invalidates the cache.
     catalog_rev: u64,
     /// Hover/drag state of the floating model-list scrollbar.
@@ -1041,8 +1158,7 @@ impl Pickers {
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll_base().set_offset(gpui::Point::default());
-            self.model_scroll
-                .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
+            self.scroll_model_row_into_view(self.active, cx);
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -1747,7 +1863,7 @@ impl Pickers {
     /// restricts every view to its own harness.
     /// Cached [`Self::visible_model_rows`]: selection/highlight changes and
     /// re-renders share one flattened list until an input actually changes.
-    fn model_rows(&self, cx: &App) -> std::sync::Arc<Vec<ModelRowData>> {
+    fn model_rows(&self, cx: &App) -> std::sync::Arc<ModelRows> {
         let key = ModelRowsKey {
             query: self.search.read(cx).text().trim().to_string(),
             rail: self.model_rail,
@@ -1765,7 +1881,7 @@ impl Pickers {
         rows
     }
 
-    fn visible_model_rows(&self, cx: &App) -> Vec<ModelRowData> {
+    fn visible_model_rows(&self, cx: &App) -> ModelRows {
         let effective = self.effective_harness(cx);
         let mut descriptors = self.rail_descriptors(cx);
         if self.harness_locked(cx) {
@@ -1809,9 +1925,20 @@ impl Pickers {
             .unwrap_or(0)
     }
 
-    /// The picker's visible row count (keyboard nav bounds).
+    /// The picker's visible row count (keyboard nav bounds). The OTHER
+    /// divider is NOT one of them: keyboard nav walks models only.
     fn model_rows_len(&self, cx: &App) -> usize {
         self.model_rows(cx).len()
+    }
+
+    /// Scroll the highlighted ROW into view, translating its index past the
+    /// divider item the list inserts.
+    fn scroll_model_row_into_view(&self, row_ix: usize, cx: &App) {
+        let divider = self.model_rows(cx).divider;
+        self.model_scroll.scroll_to_item(
+            list_ix_for_row(row_ix, divider),
+            gpui::ScrollStrategy::Nearest,
+        );
     }
 
     /// Enter on the harness/model popover: pick the highlighted model.
@@ -2380,8 +2507,7 @@ impl Pickers {
                 if self.open_kind() == Some(PickerKind::HarnessModel)
                     && self.active < self.model_rows_len(cx)
                 {
-                    self.model_scroll
-                        .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
+                    self.scroll_model_row_into_view(self.active, cx);
                 }
                 cx.notify();
             }
@@ -3439,8 +3565,7 @@ impl Pickers {
                     // the top — never a stray second highlight.
                     this.active = this.selected_model_index(cx);
                     this.model_scroll_base().set_offset(gpui::Point::default());
-                    this.model_scroll
-                        .scroll_to_item(this.active, gpui::ScrollStrategy::Nearest);
+                    this.scroll_model_row_into_view(this.active, cx);
                     cx.notify();
                 }))
                 .child(
@@ -3526,17 +3651,23 @@ impl Pickers {
         let model_list: Option<AnyElement> = if !rows.is_empty() {
             let entity = cx.entity();
             let row_data = rows.clone();
+            let divider = rows.divider;
             Some(
                 gpui::uniform_list(
                     "model-menu-scroll",
-                    rows.len(),
+                    rows.list_len(),
                     move |range, _window, app| {
                         entity.update(app, |this, cx| {
                             range
-                                .filter_map(|ix| {
-                                    row_data
+                                .map(|list_ix| match row_for_list_ix(list_ix, divider) {
+                                    // The divider is a render-only item: no
+                                    // id, no listeners, so keyboard nav and
+                                    // the mod-N badges never see it.
+                                    None => render_model_divider(cx),
+                                    Some(ix) => row_data
                                         .get(ix)
                                         .map(|row| this.render_model_row(ix, row, cx))
+                                        .unwrap_or_else(|| div().into_any_element()),
                                 })
                                 .collect::<Vec<AnyElement>>()
                         })
@@ -3863,47 +3994,29 @@ impl Pickers {
         div().pb(px(2.0)).child(el).into_any_element()
     }
 
-    /// The EFFORT card pinned under the model list (user request, modeled on
-    /// ChatGPT's model sheet): the selected model's name with its tier word in
-    /// the provider color, the current level named right-aligned above a
-    /// horizontal slider, and the ladder's rungs as ticks beneath it. Models
+    /// The EFFORT row pinned under the model list: a small-caps "EFFORT" label
+    /// on the left, the current level name on the right, and the hairline
+    /// slider beneath them with the ladder's rungs as ticks. No boxed card and
+    /// no model name (the selected model is already ringed in the list above)
+    /// - user feedback called that "too fat, thick and cluttered", so the row
+    /// now carries the same weight as the CONTEXT WINDOW rows below it. Models
     /// without a ladder (Claude Haiku) get a one-line note instead.
     fn render_effort_card(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
-        let model = self.selected_model(cx).cloned()?;
+        // The row only appears once a model resolves; the model itself is NOT
+        // repeated inside it (it is the ringed row in the list above).
+        self.selected_model(cx)?;
         let harness = self.effective_harness(cx);
         let levels = self.trait_ladder(cx);
         let current = self.effective_reasoning(cx);
         let current_ix = current
             .and_then(|level| levels.iter().position(|l| *l == level))
             .unwrap_or(0);
-        let (tier, rest) = crate::reasoning_slider::split_tier(&model.label);
-        let tier: SharedString = tier.to_string().into();
-        let rest: SharedString = rest.to_string().into();
-
-        // Name row: centered, the tier word in the provider color.
-        let name = div()
-            .w_full()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
-            .text_size(crate::typography::ui_rems(15.0))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .child(
-                div()
-                    .text_color(crate::reasoning_slider::provider_ink(harness, &theme))
-                    .child(tier),
-            )
-            .child(div().text_color(theme.text).child(rest));
-
         let body: AnyElement = if levels.is_empty() {
             div()
                 .w_full()
-                .pt(px(8.0))
-                .text_size(crate::typography::ui_rems(11.5))
+                .text_size(crate::typography::ui_rems(11.0))
                 .text_color(theme.text_muted.opacity(0.7))
-                .text_center()
                 .child(SharedString::from(crate::reasoning_slider::NO_EFFORT_HINT))
                 .into_any_element()
         } else {
@@ -3923,13 +4036,15 @@ impl Pickers {
                 bounds: self.effort_bounds.clone(),
             }
             .render(&theme, cx);
+            // One calm header line: the section label left, the level right in
+            // NORMAL weight (a bold level name read as a second title).
             let caption = div()
                 .w_full()
                 .flex()
                 .flex_row()
                 .items_baseline()
                 .justify_between()
-                .pb(px(6.0))
+                .pb(px(3.0))
                 .child(
                     div()
                         .text_size(crate::typography::ui_rems(10.0))
@@ -3941,16 +4056,15 @@ impl Pickers {
                 )
                 .child(
                     div()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(theme.text.opacity(0.85))
                         .child(SharedString::from(
                             current.map(reasoning_label).unwrap_or(""),
                         )),
                 );
             div()
                 .w_full()
-                .pt(px(10.0))
                 .flex()
                 .flex_col()
                 .child(caption)
@@ -3972,18 +4086,19 @@ impl Pickers {
                 .into_any_element()
         };
 
+        // A flat section, not a card: no wash, no rounded box, only the
+        // tray's own hairline above and one below to part it from the
+        // option rows.
         Some(
             div()
-                .m(px(6.0))
-                .p(px(12.0))
-                .rounded(px(10.0))
-                .bg(crate::theme::ink(0.04))
-                .border_1()
-                .border_color(crate::theme::hairline(0.07))
+                .w_full()
+                .px(px(EFFORT_ROW_PAD))
+                .pt(px(6.0))
+                .pb(px(7.0))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.06))
                 .flex()
                 .flex_col()
-                .items_center()
-                .child(name)
                 .child(body)
                 .into_any_element(),
         )
@@ -4139,7 +4254,7 @@ fn scoped_model_rows<'a>(
     descriptors: &[HarnessDescriptor],
     models_for: impl Fn(HarnessId) -> Option<&'a [Model]>,
     is_favorite: impl Fn(HarnessId, &str) -> bool,
-) -> Vec<ModelRowData> {
+) -> ModelRows {
     let row = |descriptor: &HarnessDescriptor, model: &Model| ModelRowData {
         harness: descriptor.id,
         harness_name: SharedString::from(descriptor.name.clone()),
@@ -4183,10 +4298,17 @@ fn scoped_model_rows<'a>(
             }
         }
         ranked.sort_by_key(|(rank, unstarred, ix, _)| (*rank, *unstarred, *ix));
-        return ranked.into_iter().map(|(_, _, _, row)| row).collect();
+        // A filtered list is one ranked run: no flagship/OTHER split (user
+        // request), because rank already decided what leads.
+        return ModelRows {
+            rows: ranked.into_iter().map(|(_, _, _, row)| row).collect(),
+            divider: None,
+        };
     }
     match rail {
         ModelRail::Favorites => {
+            // The starred mix is the user's own order of merit; nothing to
+            // re-rank and nothing to divide.
             let mut rows = Vec::new();
             for descriptor in descriptors {
                 let Some(models) = models_for(descriptor.id) else {
@@ -4198,25 +4320,66 @@ fn scoped_model_rows<'a>(
                     }
                 }
             }
-            rows
+            ModelRows {
+                rows,
+                divider: None,
+            }
         }
         ModelRail::Harness => {
             let Some(descriptor) = descriptors.iter().find(|d| Some(d.id) == effective) else {
-                return Vec::new();
+                return ModelRows::default();
             };
             let Some(models) = models_for(descriptor.id) else {
-                return Vec::new();
+                return ModelRows::default();
             };
+            // Stars float first (unchanged), then the harness's flagships,
+            // then the OTHER divider, then the rest of the catalog in its
+            // served order.
             let (starred, rest): (Vec<&Model>, Vec<&Model>) = models
                 .iter()
                 .partition(|m| is_favorite(descriptor.id, &m.id));
-            starred
+            let (flagship, other) = split_flagships(descriptor.id, &rest);
+            // A divider needs something on BOTH sides of it.
+            let divider =
+                (!flagship.is_empty() && !other.is_empty()).then(|| starred.len() + flagship.len());
+            let rows = starred
                 .into_iter()
-                .chain(rest)
+                .chain(flagship)
+                .chain(other)
                 .map(|model| row(descriptor, model))
-                .collect()
+                .collect();
+            ModelRows { rows, divider }
         }
     }
+}
+
+/// The non-selectable row parting a harness's flagship models from the rest:
+/// a small-caps "OTHER" caption trailed by a hairline. It lives inside the
+/// same `uniform_list` (so it scrolls with the models) but carries no id and
+/// no listener, and keyboard nav indexes the model rows only - so it can
+/// neither be highlighted nor activated.
+fn render_model_divider(cx: &mut Context<Pickers>) -> AnyElement {
+    let theme = Theme::of(cx).clone();
+    div()
+        .w_full()
+        .h_full()
+        .px(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex_none()
+                .text_size(crate::typography::ui_rems(10.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted.opacity(0.55))
+                .child(SharedString::from(popover::tracked_upper(
+                    OTHER_GROUP_LABEL,
+                ))),
+        )
+        .child(div().flex_1().h(px(1.0)).bg(crate::theme::hairline(0.10)))
+        .into_any_element()
 }
 
 /// Centered muted note filling an empty model list ("No models found").
@@ -5129,6 +5292,240 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model.id, "glm-5.2-b");
+    }
+
+    #[test]
+    fn the_claude_tab_leads_with_its_flagships_then_an_other_group() {
+        let descriptors = vec![descriptor(HarnessId::ClaudeCode, "Claude Code")];
+        // Catalog order as the harness serves it (fable-5 sits between the
+        // two flagship Fables, so a plain "top three" rule would be wrong).
+        let models: Vec<Model> = [
+            ("claude-fable-5-1", "Fable 5.1"),
+            ("claude-fable-5", "Fable 5"),
+            ("claude-opus-5", "Opus 5"),
+            ("claude-opus-4-8", "Opus 4.8"),
+            ("claude-sonnet-5", "Sonnet 5"),
+            ("claude-haiku-4-5", "Haiku 4.5"),
+        ]
+        .into_iter()
+        .map(|(id, label)| bare_model(id, label))
+        .collect();
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::ClaudeCode).then_some(models.as_slice())
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::ClaudeCode),
+            &descriptors,
+            models_for,
+            |_, _| false,
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r.model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "claude-fable-5-1",
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-fable-5",
+                "claude-opus-4-8",
+                "claude-haiku-4-5",
+            ]
+        );
+        assert_eq!(
+            rows.divider,
+            Some(3),
+            "OTHER opens under the three flagships"
+        );
+        assert_eq!(rows.list_len(), rows.len() + 1);
+    }
+
+    #[test]
+    fn the_1m_context_variants_ride_with_their_flagship() {
+        assert!(is_flagship_model(HarnessId::ClaudeCode, "claude-opus-5[1m]"));
+        assert!(is_flagship_model(HarnessId::Mock, "claude-sonnet-5"));
+        // A previous generation is not a flagship, and the prefixes never
+        // swallow the older point releases.
+        assert!(!is_flagship_model(HarnessId::ClaudeCode, "claude-fable-5"));
+        assert!(!is_flagship_model(HarnessId::ClaudeCode, "claude-opus-4-8"));
+    }
+
+    #[test]
+    fn the_codex_tab_leads_with_the_newest_gpt_generation() {
+        let descriptors = vec![descriptor(HarnessId::Codex, "Codex")];
+        let models: Vec<Model> = [
+            ("gpt-6-astra", "GPT-6-Astra"),
+            ("gpt-5.6-sol", "GPT-5.6-Sol"),
+            ("gpt-5.5", "GPT-5.5"),
+        ]
+        .into_iter()
+        .map(|(id, label)| bare_model(id, label))
+        .collect();
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::Codex).then_some(models.as_slice())
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::Codex),
+            &descriptors,
+            models_for,
+            |_, _| false,
+        );
+        assert_eq!(rows[0].model.id, "gpt-6-astra");
+        assert_eq!(rows.divider, Some(1));
+        // The rest keeps the catalog's newest-first order.
+        assert_eq!(rows[1].model.id, "gpt-5.6-sol");
+        assert_eq!(rows[2].model.id, "gpt-5.5");
+    }
+
+    #[test]
+    fn an_uncurated_harness_leads_with_default_plus_the_two_newest() {
+        let descriptors = vec![descriptor(HarnessId::Opencode, "opencode")];
+        let models: Vec<Model> = [
+            ("glm-5.2", "GLM-5.2"),
+            ("qwen-4", "Qwen 4"),
+            ("kimi-3", "Kimi 3"),
+            ("default", "Default"),
+        ]
+        .into_iter()
+        .map(|(id, label)| bare_model(id, label))
+        .collect();
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::Opencode).then_some(models.as_slice())
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::Opencode),
+            &descriptors,
+            models_for,
+            |_, _| false,
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r.model.id.as_str()).collect();
+        assert_eq!(ids, vec!["glm-5.2", "qwen-4", "default", "kimi-3"]);
+        assert_eq!(rows.divider, Some(3));
+    }
+
+    #[test]
+    fn stars_stay_above_the_flagships_and_a_query_drops_the_divider() {
+        let descriptors = vec![descriptor(HarnessId::ClaudeCode, "Claude Code")];
+        let models: Vec<Model> = [
+            ("claude-fable-5-1", "Fable 5.1"),
+            ("claude-opus-5", "Opus 5"),
+            ("claude-haiku-4-5", "Haiku 4.5"),
+        ]
+        .into_iter()
+        .map(|(id, label)| bare_model(id, label))
+        .collect();
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::ClaudeCode).then_some(models.as_slice())
+        };
+        let starred = |harness: HarnessId, model: &str| {
+            harness == HarnessId::ClaudeCode && model == "claude-haiku-4-5"
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::ClaudeCode),
+            &descriptors,
+            models_for,
+            starred,
+        );
+        // Favorites behaviour is untouched: the star still floats to the top,
+        // and the divider counts from below it.
+        assert_eq!(rows[0].model.id, "claude-haiku-4-5");
+        assert_eq!(rows.divider, None, "nothing left for OTHER");
+
+        // A filtered list is one ranked run, no divider (every label carries
+        // a version digit, so "5" keeps all three rows).
+        let rows = scoped_model_rows(
+            "5",
+            ModelRail::Harness,
+            Some(HarnessId::ClaudeCode),
+            &descriptors,
+            models_for,
+            starred,
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.divider, None);
+        assert_eq!(rows.list_len(), 3);
+    }
+
+    #[test]
+    fn the_favorites_tab_never_grows_a_divider() {
+        let descriptors = vec![descriptor(HarnessId::ClaudeCode, "Claude Code")];
+        let models = vec![
+            bare_model("claude-opus-5", "Opus 5"),
+            bare_model("claude-haiku-4-5", "Haiku 4.5"),
+        ];
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::ClaudeCode).then_some(models.as_slice())
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Favorites,
+            Some(HarnessId::ClaudeCode),
+            &descriptors,
+            models_for,
+            |_, _| true,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.divider, None);
+    }
+
+    #[test]
+    fn keyboard_navigation_steps_over_the_divider_item() {
+        // Three flagships, divider, three others: the list has seven items
+        // but only six navigable rows.
+        let divider = Some(3);
+        assert_eq!(row_for_list_ix(0, divider), Some(0));
+        assert_eq!(row_for_list_ix(2, divider), Some(2));
+        assert_eq!(row_for_list_ix(3, divider), None, "the divider itself");
+        assert_eq!(row_for_list_ix(4, divider), Some(3));
+        assert_eq!(row_for_list_ix(6, divider), Some(5));
+        // Every row round-trips, and no row ever maps onto the divider item.
+        for row_ix in 0..6 {
+            let list_ix = list_ix_for_row(row_ix, divider);
+            assert_ne!(list_ix, 3, "row {row_ix} would land on the divider");
+            assert_eq!(row_for_list_ix(list_ix, divider), Some(row_ix));
+        }
+        // Without a divider the two indices are the same thing.
+        for ix in 0..6 {
+            assert_eq!(row_for_list_ix(ix, None), Some(ix));
+            assert_eq!(list_ix_for_row(ix, None), ix);
+        }
+    }
+
+    #[test]
+    fn the_mod_n_badges_follow_the_new_visual_order() {
+        let descriptors = vec![descriptor(HarnessId::ClaudeCode, "Claude Code")];
+        let models: Vec<Model> = [
+            ("claude-fable-5", "Fable 5"),
+            ("claude-opus-5", "Opus 5"),
+            ("claude-haiku-4-5", "Haiku 4.5"),
+        ]
+        .into_iter()
+        .map(|(id, label)| bare_model(id, label))
+        .collect();
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::ClaudeCode).then_some(models.as_slice())
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::ClaudeCode),
+            &descriptors,
+            models_for,
+            |_, _| false,
+        );
+        // The badge printed on row `ix` is mod-(ix+1) and `activate_model_index`
+        // takes the SAME ix, so the flagship that now leads the list is what
+        // mod-1 selects.
+        assert_eq!(rows[0].model.id, "claude-opus-5");
+        assert_eq!(rows.divider, Some(1));
+        assert_eq!(rows[1].model.id, "claude-fable-5");
     }
 
     #[test]

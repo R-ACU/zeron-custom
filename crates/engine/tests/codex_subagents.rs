@@ -61,6 +61,7 @@ async fn check_persistence(
         cwd: dir.path().display().to_string(),
         sandbox: SandboxLevel::ReadOnly,
         auto_approve: true,
+        permission: Default::default(),
         attachments: vec![],
         worktree: None,
         resume: None,

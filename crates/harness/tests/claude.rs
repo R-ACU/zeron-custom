@@ -44,6 +44,7 @@ fn request(prompt: &str) -> RunRequest {
         cwd: String::new(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
+        permission: Default::default(),
         attachments: Vec::new(),
         worktree: None,
         resume: None,

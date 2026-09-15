@@ -14,12 +14,13 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
-//!   the sandbox is forced to `danger-full-access` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs). Stray
-//!   `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//! - Approvals + sandbox follow the run's [`PermissionMode`]: `bypass` is
+//!   yolo mode (policy `"never"`, sandbox forced to `danger-full-access`),
+//!   `auto` is `"never"` INSIDE the picked sandbox, and `ask`/`auto-edits`
+//!   are `"on-request"` there. `item/commandExecution/requestApproval`
+//!   and `item/fileChange/requestApproval` round-trip through
+//!   [`RunControls::request_input`] as a synthesized yes/no question unless
+//!   the mode already answers them.
 //! - Subagents are full child app-server threads. Parent spawn items establish
 //!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
@@ -54,8 +55,9 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, PermissionMode,
+    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -570,7 +572,7 @@ impl Harness for CodexHarness {
         request.worktree = None;
         request.attachments.clear();
         request.model_options.clear();
-        request.auto_approve = false;
+        request.set_permission_mode(PermissionMode::Ask);
         self.run_with_mode(request, controls, true).await
     }
 }
@@ -583,17 +585,17 @@ impl CodexHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
-        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
-        // Parity with the Claude adapter, which auto-approves every
-        // can_use_tool and so effectively grants full access. This also
-        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
-        // worktree on a slash-named branch derives a malformed mount that
-        // kills every command.
+        // Title runs read only. Otherwise the picked permission mode decides:
+        // `auto` is yolo (danger-full-access + approvalPolicy "never" below —
+        // codex's --dangerously-bypass-approvals-and-sandbox equivalent),
+        // which also sidesteps codex ≤0.144.x's workspace-write bug where a
+        // linked worktree on a slash-named branch derives a malformed mount
+        // that kills every command. The other modes run at the sandbox the
+        // user picked.
         request.sandbox = if title_only {
-            zeron_proto::SandboxLevel::ReadOnly
+            SandboxLevel::ReadOnly
         } else {
-            zeron_proto::SandboxLevel::DangerFullAccess
+            effective_sandbox(request.permission_mode(), request.sandbox)
         };
         let mut cmd = crate::child_command(&exe);
         cmd.arg("app-server");
@@ -769,14 +771,16 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (zeron sessions run unattended; combined
-    // with the danger-full-access override above this is codex's yolo mode):
-    // never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // The run's permission mode IS the setting the older "always never"
+    // comment anticipated: "on-request" used to turn every command into a
+    // yes/no question (user report: "asking me for approval at every step"),
+    // so it is only reached when the user asked for it. Title runs never ask.
+    let permission = request.permission_mode();
+    let approval_policy = if title_only {
+        "never"
+    } else {
+        approval_policy(permission)
+    };
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -1254,7 +1258,7 @@ async fn run_session(session: Session) {
                         id,
                         &method,
                         &params,
-                        request.auto_approve,
+                        permission,
                         &request_input,
                     );
                 }
@@ -1464,17 +1468,52 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
+/// The wire `approvalPolicy` one permission mode maps to. `ask` and
+/// `auto-edits` both ride "on-request" — codex asks when it wants to leave
+/// the sandbox, and inside the sandbox an edit needs no approval, which IS
+/// accept-edits; the difference between the two is what we answer those
+/// requests with ([`approval_decision`]). Pure so the mapping is testable
+/// without spawning the app server.
+pub(crate) fn approval_policy(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask | PermissionMode::AutoEdits => "on-request",
+        PermissionMode::Auto | PermissionMode::Bypass => "never",
+    }
+}
+
+/// The sandbox a run actually gets: `bypass` forces full access (codex's
+/// yolo), every other mode keeps the level the user picked — `auto` runs
+/// unattended but still INSIDE that sandbox.
+pub(crate) fn effective_sandbox(mode: PermissionMode, picked: SandboxLevel) -> SandboxLevel {
+    match mode {
+        PermissionMode::Bypass => SandboxLevel::DangerFullAccess,
+        _ => picked,
+    }
+}
+
+/// What a permission mode answers an approval request with on its own, if
+/// anything: `auto` and `bypass` accept outright (belt to the wire-level
+/// `approvalPolicy: "never"`), `auto-edits` accepts file changes and leaves
+/// commands to the user, `ask` answers nothing itself.
+pub(crate) fn approval_decision(mode: PermissionMode, method: &str) -> Option<&'static str> {
+    match mode {
+        PermissionMode::Auto | PermissionMode::Bypass => Some("accept"),
+        PermissionMode::AutoEdits if method.contains("fileChange") => Some("accept"),
+        _ => None,
+    }
+}
+
 /// Serve one server→client request. Approval requests round-trip through
 /// `request_input` as a synthesized yes/no question (in a subtask so the
-/// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// message loop keeps flowing) unless the run's permission mode already
+/// answers them ([`approval_decision`]). Anything else is rejected as
+/// unsupported so the server never wedges awaiting a reply.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
-    auto_approve: bool,
+    permission: PermissionMode,
     request_input: &Arc<RequestInputFn>,
 ) {
     // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
@@ -1516,8 +1555,8 @@ fn handle_server_request(
         client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
         return;
     }
-    if auto_approve {
-        client.respond(&id, json!({ "decision": "accept" }));
+    if let Some(decision) = approval_decision(permission, method) {
+        client.respond(&id, json!({ "decision": decision }));
         return;
     }
 
@@ -1742,5 +1781,49 @@ mod tests {
         r.note_started("t-3".into());
         assert_eq!(r.active.as_deref(), Some("t-3"));
         assert!(r.is_completed("t-2"));
+    }
+
+    #[test]
+    fn permission_modes_map_to_approval_policy_and_sandbox() {
+        assert_eq!(approval_policy(PermissionMode::Ask), "on-request");
+        assert_eq!(approval_policy(PermissionMode::AutoEdits), "on-request");
+        assert_eq!(approval_policy(PermissionMode::Auto), "never");
+        assert_eq!(approval_policy(PermissionMode::Bypass), "never");
+        // Only `bypass` overrides the picked sandbox (yolo); `auto` runs
+        // unattended but stays inside it.
+        assert_eq!(
+            effective_sandbox(PermissionMode::Bypass, SandboxLevel::ReadOnly),
+            SandboxLevel::DangerFullAccess
+        );
+        assert_eq!(
+            effective_sandbox(PermissionMode::Auto, SandboxLevel::WorkspaceWrite),
+            SandboxLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            effective_sandbox(PermissionMode::AutoEdits, SandboxLevel::WorkspaceWrite),
+            SandboxLevel::WorkspaceWrite
+        );
+        assert_eq!(
+            effective_sandbox(PermissionMode::Ask, SandboxLevel::ReadOnly),
+            SandboxLevel::ReadOnly
+        );
+    }
+
+    #[test]
+    fn only_the_unattended_modes_answer_every_approval_themselves() {
+        let cmd = "item/commandExecution/requestApproval";
+        let file = "item/fileChange/requestApproval";
+        assert_eq!(approval_decision(PermissionMode::Bypass, cmd), Some("accept"));
+        assert_eq!(approval_decision(PermissionMode::Bypass, file), Some("accept"));
+        assert_eq!(approval_decision(PermissionMode::Auto, cmd), Some("accept"));
+        assert_eq!(approval_decision(PermissionMode::Auto, file), Some("accept"));
+        // Auto edits accepts the edit and still asks about the command.
+        assert_eq!(
+            approval_decision(PermissionMode::AutoEdits, file),
+            Some("accept")
+        );
+        assert_eq!(approval_decision(PermissionMode::AutoEdits, cmd), None);
+        assert_eq!(approval_decision(PermissionMode::Ask, file), None);
+        assert_eq!(approval_decision(PermissionMode::Ask, cmd), None);
     }
 }

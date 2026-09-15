@@ -80,6 +80,7 @@ struct RuntimeConfig {
     cwd: String,
     sandbox: zeron_proto::SandboxLevel,
     auto_approve: bool,
+    permission: zeron_proto::PermissionMode,
     worktree: Option<zeron_proto::WorktreeSpec>,
 }
 
@@ -93,6 +94,7 @@ impl RuntimeConfig {
             cwd: request.cwd.clone(),
             sandbox: request.sandbox,
             auto_approve: request.auto_approve,
+            permission: request.permission_mode(),
             worktree: request.worktree.clone(),
         }
     }
@@ -746,6 +748,7 @@ impl SessionsEngine {
                             cwd,
                             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
+                            permission: Default::default(),
                             attachments: Vec::new(),
                             resume: None,
                             worktree: None,
@@ -2277,6 +2280,7 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
+            permission: Default::default(),
             resume: None,
             attachments: Vec::new(),
             worktree: None,

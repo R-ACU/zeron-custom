@@ -311,6 +311,7 @@ mod tests {
             cwd: "/tmp".into(),
             sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             auto_approve: false,
+            permission: Default::default(),
             attachments: Vec::new(),
             worktree: None,
             resume: None,

@@ -45,6 +45,7 @@ async fn main() {
         cwd,
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        permission: Default::default(),
         attachments: Vec::new(),
         worktree: None,
         resume: None,

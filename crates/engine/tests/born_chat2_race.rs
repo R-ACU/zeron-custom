@@ -160,6 +160,7 @@ async fn transcript_survives_open_racing_create_chat() {
                         cwd: "~".into(),
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: true,
+                        permission: Default::default(),
                         attachments: Vec::new(),
                         worktree: None,
                         resume: None,

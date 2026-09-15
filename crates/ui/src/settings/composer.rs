@@ -8,6 +8,10 @@
 //! last reasoning level, and last model option picks per harness. Written
 //! synchronously on every pick (picks are rare); corrupt or missing files fall
 //! back to defaults.
+//!
+//! [`PermissionDefaults`] follows the same rules in its own file
+//! (`composer-permissions.json`) for the footer's permission picker: the last
+//! pick is the next chat's default, and a chat that was changed keeps its own.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -15,9 +19,34 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{HarnessId, ReasoningLevel};
+use zeron_proto::{HarnessId, PermissionMode, ReasoningLevel, SandboxLevel};
 
 const FILE_NAME: &str = "composer-defaults.json";
+const PERMISSIONS_FILE_NAME: &str = "composer-permissions.json";
+
+/// Temp file + rename, so a crash mid-write never leaves a half file behind.
+/// Each writer owns its temporary file; overlapping windows must not truncate
+/// or rename one another's in-progress writes.
+fn write_atomic(path: &Path, data_dir: &Path, json: &[u8]) -> io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(json)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(data_dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
 
 /// Model option picks: option id → choice id (the `ChatConfig` shape).
 pub type ModelOptions = serde_json::Map<String, serde_json::Value>;
@@ -39,6 +68,39 @@ pub struct RememberedModel {
 pub struct FavoriteModel {
     pub harness: HarnessId,
     pub model: String,
+}
+
+/// One chat's permission pick: how much the agent may do unasked, and the
+/// sandbox the harnesses that understand one should run in.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionChoice {
+    #[serde(default)]
+    pub mode: PermissionMode,
+    #[serde(default = "default_sandbox")]
+    pub sandbox: SandboxLevel,
+}
+
+fn default_sandbox() -> SandboxLevel {
+    SandboxLevel::WorkspaceWrite
+}
+
+impl Default for PermissionChoice {
+    fn default() -> Self {
+        Self {
+            mode: PermissionMode::Ask,
+            sandbox: default_sandbox(),
+        }
+    }
+}
+
+impl PermissionChoice {
+    /// Whether this is the shipped default (Ask + workspace write). Picks
+    /// that ARE the default are never stored per chat, so the map stays
+    /// small however many chats exist.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +140,84 @@ pub struct ComposerDefaults {
     pub favorites: Vec<FavoriteModel>,
 }
 
+/// The permission picker's sticky store — same shape and same rules as
+/// [`ComposerDefaults`] (last pick becomes the new-chat default), in its own
+/// file. Separate because [`ComposerDefaults`] has a single long-lived owner
+/// that saves its whole in-memory copy: a second writer sharing that file
+/// would have its fields overwritten by the first owner's next save.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PermissionDefaults {
+    /// Last permission pick, the default every NEW chat starts on (harness +
+    /// model parity: the last pick is the next chat's starting point).
+    pub permission: Option<PermissionChoice>,
+    /// Per-chat permission picks, keyed by chat id. Only NON-default picks
+    /// are stored, so the map stays proportional to the chats the user
+    /// actually changed rather than to every chat ever opened.
+    pub permission_by_chat: HashMap<String, PermissionChoice>,
+}
+
+impl PermissionDefaults {
+    /// Load from `{data_dir}/composer-permissions.json`; defaults on any failure.
+    pub fn load(data_dir: &Path) -> Self {
+        match std::fs::read_to_string(Self::path(data_dir)) {
+            Ok(text) => serde_json::from_str::<Self>(&text).unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "composer-permissions corrupt; using defaults");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Write atomically (temp file + rename), like [`ComposerDefaults::save`].
+    pub fn save(&self, data_dir: &Path) -> io::Result<()> {
+        write_atomic(
+            &Self::path(data_dir),
+            data_dir,
+            &serde_json::to_vec_pretty(self)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )
+    }
+
+    pub fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join(PERMISSIONS_FILE_NAME)
+    }
+
+    /// The permission pick in force for a chat: its own stored pick, else
+    /// the sticky default, else Ask + workspace write. `None` = the new-chat
+    /// canvas, which always reads the sticky default.
+    pub fn permission_for(&self, chat_id: Option<&str>) -> PermissionChoice {
+        chat_id
+            .and_then(|id| self.permission_by_chat.get(id))
+            .copied()
+            .or(self.permission)
+            .unwrap_or_default()
+    }
+
+    /// Record a pick. It becomes the sticky default for new chats either way;
+    /// with a chat id it is also pinned to that chat (a pick that IS the
+    /// default drops the chat's row instead of storing it).
+    pub fn remember_permission(&mut self, chat_id: Option<&str>, choice: PermissionChoice) {
+        self.permission = Some(choice);
+        if let Some(id) = chat_id {
+            if choice.is_default() {
+                self.permission_by_chat.remove(id);
+            } else {
+                self.permission_by_chat.insert(id.to_string(), choice);
+            }
+        }
+    }
+
+    /// Carry the new-chat canvas's pick onto the chat id the composer just
+    /// minted, so the chat keeps what it was sent with.
+    pub fn adopt_permission(&mut self, chat_id: &str) {
+        let choice = self.permission_for(None);
+        if !choice.is_default() {
+            self.permission_by_chat.insert(chat_id.to_string(), choice);
+        }
+    }
+}
+
 /// The `effortByModel` key for one model: the harness's wire name and the
 /// model id, e.g. `"claude-code/claude-haiku-4-5"`. Derived from the serde
 /// representation so a newly added harness needs no change here.
@@ -106,29 +246,12 @@ impl ComposerDefaults {
 
     /// Write atomically (temp file + rename) so a crash mid-write never corrupts.
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(data_dir)?;
-        let path = Self::path(data_dir);
-        // Each writer owns its temporary file; overlapping windows must not
-        // truncate or rename one another's in-progress writes.
-        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-        let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            #[cfg(unix)]
-            std::fs::File::open(data_dir)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        write_atomic(
+            &Self::path(data_dir),
+            data_dir,
+            &serde_json::to_vec_pretty(self)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        )
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -339,6 +462,83 @@ mod tests {
         assert!(!defaults.toggle_favorite(HarnessId::ClaudeCode, "claude-opus-5"));
         assert!(!defaults.is_favorite(HarnessId::ClaudeCode, "claude-opus-5"));
         assert!(defaults.is_favorite(HarnessId::Codex, "gpt-5.2-codex"));
+    }
+
+    #[test]
+    fn permission_is_remembered_per_chat_and_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults = PermissionDefaults::default();
+        // Nothing picked yet: Ask + workspace write, for any chat.
+        assert_eq!(defaults.permission_for(None), PermissionChoice::default());
+        assert_eq!(
+            defaults.permission_for(Some("chat-1")).mode,
+            PermissionMode::Ask
+        );
+
+        let auto = PermissionChoice {
+            mode: PermissionMode::Auto,
+            sandbox: SandboxLevel::DangerFullAccess,
+        };
+        defaults.remember_permission(Some("chat-1"), auto);
+        assert_eq!(defaults.permission_for(Some("chat-1")), auto);
+        // …and the same pick is now the default a NEW chat starts on.
+        assert_eq!(defaults.permission_for(None), auto);
+        // A chat that never got its own pick follows the sticky default.
+        assert_eq!(defaults.permission_for(Some("chat-2")), auto);
+
+        let edits = PermissionChoice {
+            mode: PermissionMode::AutoEdits,
+            sandbox: SandboxLevel::ReadOnly,
+        };
+        defaults.remember_permission(Some("chat-2"), edits);
+        assert_eq!(defaults.permission_for(Some("chat-1")), auto);
+        assert_eq!(defaults.permission_for(Some("chat-2")), edits);
+
+        defaults.save(dir.path()).unwrap();
+        let loaded = PermissionDefaults::load(dir.path());
+        assert_eq!(loaded, defaults);
+        assert_eq!(loaded.permission_for(Some("chat-1")), auto);
+        assert_eq!(loaded.permission_for(Some("chat-2")), edits);
+    }
+
+    #[test]
+    fn a_default_permission_pick_stores_no_chat_row() {
+        let mut defaults = PermissionDefaults::default();
+        let auto = PermissionChoice {
+            mode: PermissionMode::Auto,
+            sandbox: SandboxLevel::WorkspaceWrite,
+        };
+        defaults.remember_permission(Some("chat-1"), auto);
+        assert!(defaults.permission_by_chat.contains_key("chat-1"));
+        // Back to Ask + workspace write: the row goes away rather than
+        // accumulating one entry per chat ever opened.
+        defaults.remember_permission(Some("chat-1"), PermissionChoice::default());
+        assert!(defaults.permission_by_chat.is_empty());
+        assert_eq!(defaults.permission_for(Some("chat-1")).mode, PermissionMode::Ask);
+    }
+
+    #[test]
+    fn a_new_chat_adopts_the_pick_it_was_sent_with() {
+        let mut defaults = PermissionDefaults::default();
+        // Picked on the new-chat canvas, before any chat id exists.
+        defaults.remember_permission(
+            None,
+            PermissionChoice {
+                mode: PermissionMode::Auto,
+                sandbox: SandboxLevel::WorkspaceWrite,
+            },
+        );
+        defaults.adopt_permission("minted-chat");
+        assert_eq!(
+            defaults.permission_for(Some("minted-chat")).mode,
+            PermissionMode::Auto
+        );
+        // The sticky default then changing must not rewrite that chat.
+        defaults.remember_permission(None, PermissionChoice::default());
+        assert_eq!(
+            defaults.permission_for(Some("minted-chat")).mode,
+            PermissionMode::Auto
+        );
     }
 
     #[test]
