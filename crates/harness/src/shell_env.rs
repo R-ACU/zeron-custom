@@ -35,7 +35,11 @@ pub fn login_shell_path() -> Option<&'static OsStr> {
     {
         CACHE.get_or_init(unix::capture).as_deref()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        CACHE.get_or_init(windows::capture).as_deref()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
@@ -44,13 +48,164 @@ pub fn login_shell_path() -> Option<&'static OsStr> {
 /// Kick off the snapshot on a background thread so the first harness resolve
 /// doesn't pay the shell-startup latency inline. Call at daemon startup.
 pub fn prewarm() {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let _ = std::thread::Builder::new()
             .name("zeron-shell-env".into())
             .spawn(|| {
                 let _ = login_shell_path();
             });
+    }
+}
+
+/// The Windows counterpart of the login-shell snapshot: the PATH Windows
+/// itself composes at logon, read straight out of the registry.
+///
+/// Same problem, different mechanism. A daemon started from a Scheduled Task
+/// (or any service) inherits the PATH that existed when the task was
+/// registered, which is regularly a minimal one — and every npm-installed CLI
+/// lives in `%APPDATA%\npm`, a USER PATH entry the task never sees. Windows
+/// builds the logon PATH as machine PATH + user PATH, both stored unexpanded
+/// (`%SystemRoot%\system32`), so we read both raw values, join them and
+/// expand once.
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ,
+        RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    const MACHINE_ENV: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    const USER_ENV: &str = "Environment";
+
+    pub(super) fn capture() -> Option<OsString> {
+        if std::env::var_os("ZERON_NO_LOGIN_SHELL").is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+        let machine = read_value(HKEY_LOCAL_MACHINE, MACHINE_ENV, "Path");
+        let user = read_value(HKEY_CURRENT_USER, USER_ENV, "Path");
+        let joined = join_paths(machine.as_deref(), user.as_deref())?;
+        Some(expand(&joined))
+    }
+
+    /// Machine PATH first, then user PATH — the order Windows itself uses.
+    pub(super) fn join_paths(machine: Option<&str>, user: Option<&str>) -> Option<String> {
+        let parts: Vec<&str> = [machine, user]
+            .into_iter()
+            .flatten()
+            .map(|p| p.trim_matches(';'))
+            .filter(|p| !p.is_empty())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(";"))
+    }
+
+    /// A REG_SZ/REG_EXPAND_SZ value, read UNEXPANDED so the `%VAR%` tokens
+    /// survive to a single expansion pass over the whole PATH.
+    fn read_value(root: HKEY, subkey: &str, name: &str) -> Option<String> {
+        let subkey = wide(subkey);
+        let name = wide(name);
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        let mut bytes: u32 = 0;
+        // SAFETY: both strings are NUL-terminated; the first call only sizes
+        // the buffer (null data pointer is the documented probe form).
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                name.as_ptr(),
+                flags,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if status != 0 || bytes == 0 {
+            return None;
+        }
+        let mut buffer: Vec<u16> = vec![0; bytes as usize / 2 + 1];
+        let mut size = (buffer.len() * 2) as u32;
+        // SAFETY: the buffer is sized by the probe above and passed with its
+        // own byte length.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                name.as_ptr(),
+                flags,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..len]))
+    }
+
+    /// `%SystemRoot%\system32` and friends, as the shell would see them.
+    fn expand(value: &str) -> OsString {
+        let source = wide(value);
+        // SAFETY: a sizing call (documented: returns the needed length in
+        // characters) followed by a write into a buffer of that length.
+        let needed = unsafe { ExpandEnvironmentStringsW(source.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed == 0 {
+            return OsString::from(value);
+        }
+        let mut buffer: Vec<u16> = vec![0; needed as usize];
+        let written =
+            unsafe { ExpandEnvironmentStringsW(source.as_ptr(), buffer.as_mut_ptr(), needed) };
+        if written == 0 {
+            return OsString::from(value);
+        }
+        let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+        OsString::from_wide(&buffer[..len])
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn machine_path_comes_before_user_path() {
+            assert_eq!(
+                join_paths(Some(r"C:\Windows;"), Some(r"C:\Users\x\AppData\Roaming\npm")),
+                Some(r"C:\Windows;C:\Users\x\AppData\Roaming\npm".to_owned())
+            );
+            assert_eq!(join_paths(None, Some(r"C:\tools")), Some(r"C:\tools".to_owned()));
+            assert_eq!(join_paths(Some(""), None), None);
+            assert_eq!(join_paths(None, None), None);
+        }
+
+        #[test]
+        fn variables_expand_like_the_shell_sees_them() {
+            let expanded = expand(r"%SystemRoot%\system32");
+            let expanded = expanded.to_string_lossy().to_lowercase();
+            assert!(expanded.ends_with(r"\system32"), "got: {expanded}");
+            assert!(!expanded.contains('%'), "got: {expanded}");
+        }
+
+        #[test]
+        fn the_logon_path_contains_the_system_directory() {
+            // The real registry read: every Windows machine has system32 in
+            // the machine PATH, so an empty or unexpanded result is a bug.
+            let path = capture().expect("a logon PATH");
+            let path = path.to_string_lossy().to_lowercase();
+            assert!(path.contains(r"\system32"), "got: {path}");
+            assert!(!path.contains('%'), "unexpanded variable in: {path}");
+        }
     }
 }
 

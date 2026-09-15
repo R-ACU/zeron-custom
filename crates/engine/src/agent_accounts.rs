@@ -1969,6 +1969,11 @@ fn urlencode(input: &str) -> String {
 }
 
 /// Atomic write via a same-dir temp file + rename; `secret` = 0600 from birth.
+///
+/// Windows has no mode bit. The secret is protected there by the per-user ACL the
+/// file inherits from `%USERPROFILE%`; `restrict_to_current_user` narrows that to
+/// a single ACE afterwards, best effort. See `crate::exec` for why that is the
+/// ceiling without a new dependency.
 fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), EngineError> {
     let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
     {
@@ -1980,12 +1985,18 @@ fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), Engi
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let _ = secret;
         let mut handle = options.open(&tmp)?;
         handle.write_all(bytes)?;
     }
     std::fs::rename(&tmp, file)?;
+    // After the rename, so the ACE lands on the published path and never on a
+    // temp file that a failed write leaves behind.
+    #[cfg(windows)]
+    if secret {
+        crate::exec::restrict_to_current_user(file);
+    }
     Ok(())
 }
 

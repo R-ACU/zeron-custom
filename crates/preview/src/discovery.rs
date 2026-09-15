@@ -44,8 +44,11 @@ pub fn framework(args: &[String]) -> (&'static str, u8) {
         }
     }
     if args.first().is_some_and(|s| {
+        // `file_stem` (not `file_name`) so a Windows `node.exe` matches the
+        // same way `node` does on unix; identical to `file_name` there since
+        // extensionless unix binaries have no stem/name difference.
         Path::new(s)
-            .file_name()
+            .file_stem()
             .is_some_and(|n| n == "node" || n == "bun" || n == "deno")
     }) {
         ("Node HTTP server", 50)
@@ -419,11 +422,394 @@ pub fn listeners() -> Vec<Listener> {
     result
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows: owning pid per listening socket comes from `GetExtendedTcpTable`
+/// (iphlpapi), the parent chain from a Toolhelp32 process snapshot, and
+/// process identity (start time, cwd, command line) from `OpenProcess` plus
+/// a `NtQueryInformationProcess`/`ReadProcessMemory` walk of the target's PEB
+/// (the same technique Task Manager and Process Explorer use — there is no
+/// documented API for another process's command line or working directory).
+/// `OpenProcess` with only `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`
+/// fails for processes this user cannot access (elevated processes, other
+/// users, most system processes) without requiring an explicit uid check as
+/// Linux/macOS do — failure to open, or to read the PEB, is treated the same
+/// as "not ours" and the listener is skipped.
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use super::*;
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        MIB_TCP_STATE_LISTEN, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    // `ntdll!NtQueryInformationProcess`, `ProcessBasicInformation` (class 0) —
+    // documented by Microsoft (`winternl.h`) for exactly this purpose, and
+    // stable across every NT release. Declared by hand rather than pulled
+    // from a crate feature: the signature is small and the ABI has not moved
+    // in decades.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process_handle: HANDLE,
+            process_information_class: i32,
+            process_information: *mut c_void,
+            process_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    /// Mirrors `ntdll`'s `PROCESS_BASIC_INFORMATION` (documented layout).
+    #[repr(C)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        peb_base_address: usize,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    /// 100ns ticks between the Windows epoch (1601-01-01) and the Unix epoch.
+    const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
+
+    fn filetime_to_unix_ms(time: FILETIME) -> u64 {
+        let ticks = ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
+        ticks.saturating_sub(EPOCH_DIFF_100NS) / 10_000
+    }
+
+    fn open_process(pid: u32) -> Option<HANDLE> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                0,
+                pid,
+            )
+        };
+        (!handle.is_null()).then_some(handle)
+    }
+
+    pub(super) fn process_started_at(process: HANDLE) -> Option<u64> {
+        let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+        let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+        let mut user: FILETIME = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+        (ok != 0).then(|| filetime_to_unix_ms(creation))
+    }
+
+    unsafe fn read_value<T: Copy>(process: HANDLE, address: usize) -> Option<T> {
+        let mut value = std::mem::MaybeUninit::<T>::uninit();
+        let mut read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                process,
+                address as *const c_void,
+                value.as_mut_ptr() as *mut c_void,
+                size_of::<T>(),
+                &mut read,
+            )
+        };
+        (ok != 0 && read == size_of::<T>()).then(|| unsafe { value.assume_init() })
+    }
+
+    fn read_wide_string(process: HANDLE, address: usize, length_bytes: u16) -> Option<String> {
+        if address == 0 || length_bytes == 0 {
+            return Some(String::new());
+        }
+        let mut buffer = vec![0u16; length_bytes as usize / 2];
+        let mut read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                process,
+                address as *const c_void,
+                buffer.as_mut_ptr() as *mut c_void,
+                length_bytes as usize,
+                &mut read,
+            )
+        };
+        (ok != 0 && read == length_bytes as usize).then(|| String::from_utf16_lossy(&buffer))
+    }
+
+    /// Best-effort split of a raw Windows command line into argv-like tokens
+    /// (double-quote runs treated as one token). Not a full
+    /// `CommandLineToArgvW`-compatible parser (no backslash-escape handling),
+    /// but [`framework`]/[`command_identity`] only need approximate tokens.
+    fn split_command_line(command_line: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        for c in command_line.chars() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                c if c.is_whitespace() && !in_quotes => {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            }
+        }
+        if !current.is_empty() {
+            args.push(current);
+        }
+        args
+    }
+
+    /// Only 64-bit target processes are supported: the `RTL_USER_PROCESS_PARAMETERS`
+    /// offsets below are the x64 layout. This build only ever targets
+    /// `x86_64-pc-windows-msvc`, and a foreign-bitness target process (rare,
+    /// and unreadable without WOW64 gymnastics) simply yields `None` here,
+    /// which callers treat as "not ours".
+    fn process_cwd_and_args(process: HANDLE) -> Option<(PathBuf, Vec<String>)> {
+        let mut info: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+        let mut returned = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process,
+                0, // ProcessBasicInformation
+                &mut info as *mut _ as *mut c_void,
+                size_of::<ProcessBasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        if status != 0 || info.peb_base_address == 0 {
+            return None;
+        }
+        // PEB.ProcessParameters (offset 0x20 on x64).
+        let params: usize = unsafe { read_value(process, info.peb_base_address + 0x20)? };
+        if params == 0 {
+            return None;
+        }
+        // RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath (UNICODE_STRING at 0x38).
+        let cwd_len: u16 = unsafe { read_value(process, params + 0x38)? };
+        let cwd_buf: usize = unsafe { read_value(process, params + 0x40)? };
+        // RTL_USER_PROCESS_PARAMETERS.CommandLine (UNICODE_STRING at 0x70).
+        let cmd_len: u16 = unsafe { read_value(process, params + 0x70)? };
+        let cmd_buf: usize = unsafe { read_value(process, params + 0x78)? };
+        let cwd = read_wide_string(process, cwd_buf, cwd_len)?;
+        if cwd.is_empty() {
+            return None;
+        }
+        // The PEB's `CurrentDirectory` is a plain `C:\...` path; project roots
+        // are matched via `Listener::belongs_to` (a `starts_with` check)
+        // against canonicalized roots, which on Windows carry the `\\?\`
+        // verbatim prefix. Canonicalize here too — exactly what the macOS
+        // `listeners()` does with its `lsof`-reported cwd — so the two sides
+        // of that comparison agree. A path that no longer canonicalizes
+        // (deleted, or a stale/inaccessible mount) is treated as unreadable.
+        let cwd = std::fs::canonicalize(cwd).ok()?;
+        let command_line = read_wide_string(process, cmd_buf, cmd_len).unwrap_or_default();
+        Some((cwd, split_command_line(&command_line)))
+    }
+
+    fn ipv4_listeners() -> Vec<(SocketAddr, u32)> {
+        let mut size: u32 = 0;
+        unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+        }
+        if size == 0 {
+            return Vec::new();
+        }
+        let mut buffer = vec![0u8; size as usize];
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr() as *mut c_void,
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        let table = unsafe { &*(buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
+        let rows = unsafe {
+            std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize)
+        };
+        rows.iter()
+            .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32)
+            .map(|row| {
+                let ip = Ipv4Addr::from(u32::from_be(row.dwLocalAddr));
+                let ip = if ip.is_unspecified() { Ipv4Addr::LOCALHOST } else { ip };
+                let port = u16::from_be(row.dwLocalPort as u16);
+                (ip, port, row.dwOwningPid)
+            })
+            .filter(|(ip, _, _)| ip.is_loopback())
+            .map(|(ip, port, pid)| (SocketAddr::new(IpAddr::V4(ip), port), pid))
+            .collect()
+    }
+
+    fn ipv6_listeners() -> Vec<(SocketAddr, u32)> {
+        let mut size: u32 = 0;
+        unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET6 as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+        }
+        if size == 0 {
+            return Vec::new();
+        }
+        let mut buffer = vec![0u8; size as usize];
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr() as *mut c_void,
+                &mut size,
+                0,
+                AF_INET6 as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        let table = unsafe { &*(buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID) };
+        let rows = unsafe {
+            std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize)
+        };
+        rows.iter()
+            .filter(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32)
+            .map(|row| {
+                let ip = Ipv6Addr::from(row.ucLocalAddr);
+                let ip = if ip.is_unspecified() { Ipv6Addr::LOCALHOST } else { ip };
+                let port = u16::from_be(row.dwLocalPort as u16);
+                (ip, port, row.dwOwningPid)
+            })
+            .filter(|(ip, _, _)| ip.is_loopback())
+            .map(|(ip, port, pid)| (SocketAddr::new(IpAddr::V6(ip), port), pid))
+            .collect()
+    }
+
+    /// pid → parent pid, via a Toolhelp32 process snapshot (the documented,
+    /// no-admin-required way to enumerate every process's parent on Windows).
+    pub(super) fn parent_snapshot() -> HashMap<u32, u32> {
+        let mut parents = HashMap::new();
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return parents;
+        }
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+            loop {
+                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe { CloseHandle(snapshot) };
+        parents
+    }
+
+    pub(super) fn open_and_started_at(pid: u32) -> Option<(HANDLE, u64)> {
+        let process = open_process(pid)?;
+        match process_started_at(process) {
+            Some(started_at) => Some((process, started_at)),
+            None => {
+                unsafe { CloseHandle(process) };
+                None
+            }
+        }
+    }
+
+    pub(super) fn cwd_and_args(process: HANDLE) -> Option<(PathBuf, Vec<String>)> {
+        process_cwd_and_args(process)
+    }
+
+    pub(super) fn close(process: HANDLE) {
+        unsafe { CloseHandle(process) };
+    }
+
+    pub(super) fn tcp_listeners() -> Vec<(SocketAddr, u32)> {
+        let mut sockets = ipv4_listeners();
+        sockets.extend(ipv6_listeners());
+        sockets
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn same_process(pid: u32, started_at: u64) -> bool {
+    let Some((process, actual)) = windows_impl::open_and_started_at(pid) else {
+        return false;
+    };
+    windows_impl::close(process);
+    actual == started_at
+}
+
+#[cfg(target_os = "windows")]
+pub fn listeners() -> Vec<Listener> {
+    let sockets = windows_impl::tcp_listeners();
+    if sockets.is_empty() {
+        return Vec::new();
+    }
+    let mut by_pid: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
+    for (address, pid) in sockets {
+        by_pid.entry(pid).or_default().push(address);
+    }
+    let parents = windows_impl::parent_snapshot();
+    let mut result = Vec::new();
+    for (pid, addresses) in by_pid {
+        // Failure to open the process, or to walk its PEB, means it belongs
+        // to another user or is otherwise inaccessible without elevation —
+        // treated the same as the uid check Linux/macOS use: not ours.
+        let Some((process, started_at)) = windows_impl::open_and_started_at(pid) else {
+            continue;
+        };
+        let identity = windows_impl::cwd_and_args(process);
+        windows_impl::close(process);
+        let Some((cwd, args)) = identity else {
+            continue;
+        };
+        let parent = parents.get(&pid).copied().unwrap_or(0);
+        for address in addresses {
+            result.push(Listener {
+                pid,
+                parent,
+                cwd: cwd.clone(),
+                args: args.clone(),
+                started_at,
+                address,
+                zeron_owned: false,
+            });
+        }
+    }
+    mark_descendants(&mut result, &parents, std::process::id());
+    result.sort_by_key(|l| (l.address, l.pid));
+    result.dedup_by_key(|l| (l.address, l.pid));
+    result
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn listeners() -> Vec<Listener> {
     Vec::new()
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn same_process(_pid: u32, _started_at: u64) -> bool {
     false
 }
@@ -502,6 +888,43 @@ mod tests {
         assert!(!same_process(pid, started_at + 1000));
         assert!(!same_process(pid, 0));
         drop(_guard);
+        assert!(
+            !same_process(pid, started_at),
+            "a reaped pid no longer matches"
+        );
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn same_process_matches_the_scanner_start_time() {
+        // A plain, non-interactive sleep: deterministic (no console/stdin
+        // quirks like `pause` or `timeout` have when their stdio is
+        // redirected), and killed well before its 30s budget elapses.
+        let child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _guard = Kill(child);
+        let (process, started_at) =
+            windows_impl::open_and_started_at(pid).expect("open freshly spawned child process");
+        windows_impl::close(process);
+        assert!(started_at > 0);
+        assert!(same_process(pid, started_at));
+        assert!(!same_process(pid, started_at + 1000));
+        assert!(!same_process(pid, 0));
+        drop(_guard);
+        // Give the OS a moment to retire the process table entry.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
             !same_process(pid, started_at),
             "a reaped pid no longer matches"

@@ -135,7 +135,10 @@ impl BrowserSurface {
             };
             content = content.child(
                 div()
-                    .id(gpui::SharedString::from(format!("preview-row-{}", service.id)))
+                    .id(gpui::SharedString::from(format!(
+                        "preview-row-{}",
+                        service.id
+                    )))
                     .w_full()
                     .h(px(56.0))
                     .px(px(14.0))
@@ -281,7 +284,11 @@ impl BrowserSurface {
         if self.page.url.is_none() && self.previews_task.is_some() {
             return self.preview_body(theme, cx);
         }
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ));
         let has_error = self.page.error.is_some();
         let title = if has_error {
             "Couldn’t load this page"
@@ -400,7 +407,11 @@ impl Render for BrowserSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let focused = self.address.focus_handle(cx).is_focused(window);
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ));
         let has_page = self.page.url.is_some();
         let back = button(
             "browser-back",
@@ -443,11 +454,11 @@ impl Render for BrowserSurface {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Some(native) = &this.native {
                         native.focus_chrome();
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     let _ = this;
                 }),
             )
@@ -543,6 +554,73 @@ impl Render for BrowserSurface {
         } else {
             body.child(self.empty_body(&theme, cx))
         };
+        #[cfg(target_os = "windows")]
+        let body = if let Some(native) = &self.native {
+            if self.page.error.is_some() {
+                body.child(self.empty_body(&theme, cx))
+            } else {
+                // The hole only helps once the controller exists; until then
+                // the theme background stays and the tab looks like it is
+                // loading instead of showing a transparent rectangle.
+                let ready = native.is_ready();
+                let native = native.handle();
+                let resize_inset = self.resize_inset;
+                body.child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, cx| {
+                            if ready {
+                                // The shell divider overlaps the pane's left
+                                // edge and stays GPUI's to hit test, so the
+                                // hole has to end where the clip window does.
+                                window.paint_native_child(gpui::Bounds {
+                                    origin: gpui::point(
+                                        bounds.origin.x + resize_inset,
+                                        bounds.origin.y,
+                                    ),
+                                    size: gpui::size(
+                                        (bounds.size.width - resize_inset).max(px(0.0)),
+                                        bounds.size.height,
+                                    ),
+                                });
+                            }
+                            let native = std::rc::Rc::downgrade(&native);
+                            let mask = window.content_mask().bounds;
+                            let dragging = cx.has_active_drag();
+                            let scale = window.scale_factor();
+                            window.on_present(move || {
+                                if let Some(native) = native.upgrade() {
+                                    native.borrow_mut().sync(
+                                        bounds,
+                                        mask,
+                                        dragging,
+                                        resize_inset,
+                                        scale,
+                                    );
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        // Reached only while the native child does not cover
+                        // the hole yet; hand the page its keyboard focus.
+                        if this.presentation == super::model::Presentation::Live {
+                            window.focus(&this.focus, cx);
+                            if let Some(native) = &this.native {
+                                native.focus_page();
+                            }
+                        }
+                    }),
+                )
+            }
+        } else {
+            body.child(self.empty_body(&theme, cx))
+        };
         #[cfg(target_os = "linux")]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
@@ -605,7 +683,7 @@ impl Render for BrowserSurface {
         } else {
             body.child(self.empty_body(&theme, cx))
         };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let body = body.child(self.empty_body(&theme, cx));
 
         #[cfg(target_os = "linux")]

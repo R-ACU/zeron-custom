@@ -220,7 +220,7 @@ pub fn run_app(config: UiConfig) {
             boot: config.boot(),
         });
         open_main_window(state, config.boot(), cx);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         start_appshot_service(config.boot().data_dir, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
@@ -347,7 +347,7 @@ fn open_main_window(
     handle
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn start_appshot_service(activation_dir: std::path::PathBuf, cx: &mut App) {
     let mut shortcuts = appshots::start_global_shortcut(activation_dir);
     cx.spawn(async move |cx| {
@@ -372,7 +372,7 @@ fn start_appshot_service(activation_dir: std::path::PathBuf, cx: &mut App) {
 /// Check viewer focus on the UI thread before any native capture or portal
 /// request. Portals do not identify the source window, so their backends cannot
 /// reject Zeron after the picker or capture has already started.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn start_appshot_capture(
     cx: &mut App,
 ) -> Option<gpui::Task<Result<appshots::CapturedAppshot, appshots::CaptureError>>> {
@@ -385,7 +385,10 @@ fn start_appshot_capture(
     )
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod appshot_activation_tests {
     use super::*;
 
@@ -418,7 +421,7 @@ mod appshot_activation_tests {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn deliver_appshot(
     result: Result<appshots::CapturedAppshot, appshots::CaptureError>,
     cx: &mut App,

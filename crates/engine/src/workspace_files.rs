@@ -780,6 +780,9 @@ fn normalize_watch_events(
     use notify::EventKind;
     use notify::event::{ModifyKind, RenameMode};
 
+    #[cfg(windows)]
+    let events = pair_windows_renames(events);
+
     let mut resync_required = false;
     let mut changes: HashMap<String, WorkspaceFileChange> = HashMap::new();
     for event in events {
@@ -865,6 +868,61 @@ fn normalize_watch_events(
     let mut changes: Vec<_> = changes.into_values().collect();
     changes.sort_by(|left, right| left.path.cmp(&right.path));
     (resync_required, changes)
+}
+
+/// Fold the Windows two-event rename back into the one-event shape the rest of
+/// this function expects.
+///
+/// ReadDirectoryChangesW reports a rename as two adjacent records,
+/// RENAMED_OLD_NAME immediately followed by RENAMED_NEW_NAME, and notify
+/// forwards them as two separate single-path events (`RenameMode::From`, then
+/// `RenameMode::To`). inotify and FSEvents instead deliver one two-path
+/// `RenameMode::Both`. Without pairing, every rename on Windows reaches the UI
+/// as an unrelated Removed plus Created, so a rename loses its `old_path` and
+/// the engine's own save-by-rename reports the saved file as newly created
+/// instead of modified.
+///
+/// An unpaired `From` (moved out of the tree) or `To` (moved in) is passed
+/// through untouched and keeps reading as Removed resp. Created.
+#[cfg(windows)]
+fn pair_windows_renames(
+    events: Vec<Result<notify::Event, notify::Error>>,
+) -> Vec<Result<notify::Event, notify::Error>> {
+    use notify::EventKind;
+    use notify::event::{ModifyKind, RenameMode};
+
+    let mut paired = Vec::with_capacity(events.len());
+    let mut pending: Option<notify::Event> = None;
+    for event in events {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                paired.extend(pending.take().map(Ok));
+                paired.push(Err(error));
+                continue;
+            }
+        };
+        match event.kind {
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                // Two `From` in a row means the first one never got its partner.
+                paired.extend(pending.replace(event).map(Ok));
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => match pending.take() {
+                Some(mut from) => {
+                    from.kind = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+                    from.paths.extend(event.paths);
+                    paired.push(Ok(from));
+                }
+                None => paired.push(Ok(event)),
+            },
+            _ => {
+                paired.extend(pending.take().map(Ok));
+                paired.push(Ok(event));
+            }
+        }
+    }
+    paired.extend(pending.map(Ok));
+    paired
 }
 
 fn watch_change_priority(kind: WorkspaceFileChangeKind) -> u8 {
@@ -1227,9 +1285,8 @@ fn read_image_blocking(
     }
     let mut file = std::fs::File::open(root.join(relative.as_path()))
         .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
-    let opened = file
-        .metadata()
-        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
+    let opened =
+        FileRevision::from_open_file(&file).map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
     if !same_file_revision(&before, &opened) {
         return Err(WorkspaceFilesError::Io("Image changed before open".into()));
     }
@@ -1239,9 +1296,8 @@ fn read_image_blocking(
         .read_to_end(&mut bytes)
         .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
     let after = checked_file_metadata(root, relative)?;
-    let handle_after = file
-        .metadata()
-        .map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
+    let handle_after =
+        FileRevision::from_open_file(&file).map_err(|e| WorkspaceFilesError::Io(e.to_string()))?;
     if bytes.len() > MAX_WORKSPACE_IMAGE_BYTES
         || !same_file_revision(&before, &after)
         || !same_file_revision(&opened, &handle_after)
@@ -1348,7 +1404,7 @@ fn read_file_blocking(
 fn checked_file_metadata(
     root: &Path,
     relative: &WorkspaceRelativePath,
-) -> Result<std::fs::Metadata, WorkspaceFilesError> {
+) -> Result<FileRevision, WorkspaceFilesError> {
     let mut current = root.to_path_buf();
     let components: Vec<_> = relative.as_path().components().collect();
     for (index, component) in components.iter().enumerate() {
@@ -1389,7 +1445,9 @@ fn checked_file_metadata(
             "file escaped workspace".into(),
         ));
     }
-    std::fs::symlink_metadata(canonical).map_err(|error| WorkspaceFilesError::Io(error.to_string()))
+    let metadata = std::fs::symlink_metadata(&canonical)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    Ok(FileRevision::from_path(&canonical, metadata))
 }
 
 fn non_text_file(
@@ -1513,16 +1571,135 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-fn same_file_revision(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+/// One sample of a file: its metadata plus, where the platform can supply it,
+/// the identity of the object that metadata came from. Size and mtime alone
+/// cannot tell "unchanged" from "replaced by a same-sized file in the same mtime
+/// tick", which is exactly what an editor's save-by-rename does, so every
+/// revision check needs the identity sampled at the SAME moment as the metadata.
+struct FileRevision {
+    metadata: std::fs::Metadata,
+    #[cfg(windows)]
+    identity: Option<FileIdentity>,
+}
+
+impl std::ops::Deref for FileRevision {
+    type Target = std::fs::Metadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+impl FileRevision {
+    /// Sample from a path. On unix the identity already rides along in the
+    /// metadata (`dev`/`ino`); on Windows it needs a handle, so take a cheap
+    /// attributes-only one that cannot disturb a writer.
+    fn from_path(path: &Path, metadata: std::fs::Metadata) -> Self {
+        #[cfg(windows)]
+        let identity = windows_identity::of_path(path);
+        #[cfg(not(windows))]
+        let _ = path;
+        Self {
+            metadata,
+            #[cfg(windows)]
+            identity,
+        }
+    }
+
+    /// Sample from an already open handle, so the identity is the identity of the
+    /// object the caller is actually reading rather than of whatever now sits at
+    /// the path.
+    fn from_open_file(file: &std::fs::File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        #[cfg(windows)]
+        let identity = windows_identity::of_handle(file);
+        Ok(Self {
+            metadata,
+            #[cfg(windows)]
+            identity,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume_serial: u32,
+    index: u64,
+}
+
+#[cfg(windows)]
+mod windows_identity {
+    use super::FileIdentity;
+    use std::path::Path;
+
+    /// `FILE_READ_ATTRIBUTES` only: enough for `GetFileInformationByHandle` and
+    /// little enough that the open succeeds while another process holds the file
+    /// open for writing.
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`: never make a
+    /// writer fail because the watcher happened to be sampling.
+    const FILE_SHARE_ALL: u32 = 0x0000_0007;
+
+    pub(super) fn of_path(path: &Path) -> Option<FileIdentity> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .open(path)
+            .ok()?;
+        of_handle(&file)
+    }
+
+    pub(super) fn of_handle(file: &std::fs::File) -> Option<FileIdentity> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid out-param;
+        // the handle is owned by `file` and outlives the call.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        // ReFS and some redirectors report a zero 64-bit index because their real
+        // file id is 128 bits wide. Report "unknown" rather than claiming every
+        // file on the volume is the same one.
+        if index == 0 {
+            return None;
+        }
+        Some(FileIdentity {
+            volume_serial: info.dwVolumeSerialNumber,
+            index,
+        })
+    }
+}
+
+fn same_file_revision(before: &FileRevision, after: &FileRevision) -> bool {
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
         return false;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        before.dev() == after.dev() && before.ino() == after.ino()
+        before.metadata.dev() == after.metadata.dev() && before.metadata.ino() == after.metadata.ino()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match (before.identity, after.identity) {
+            (Some(before), Some(after)) => before == after,
+            // No identity on one side (ReFS, a network redirector, a handle we
+            // could not open): size + mtime is all there is, which is what this
+            // check did on Windows before.
+            _ => true,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         true
     }
@@ -1722,7 +1899,7 @@ fn write_file_blocking(
 fn current_write_revision(
     root: &Path,
     relative: &WorkspaceRelativePath,
-) -> Result<(std::fs::Metadata, Vec<u8>), WorkspaceFilesError> {
+) -> Result<(FileRevision, Vec<u8>), WorkspaceFilesError> {
     let metadata = checked_file_metadata(root, relative)?;
     if metadata.len() > MAX_EDITABLE_FILE_BYTES {
         return Err(WorkspaceFilesError::Unsupported(
@@ -1816,6 +1993,11 @@ fn sync_parent_directory(parent: &Path) {
     if let Ok(directory) = std::fs::File::open(parent) {
         let _ = directory.sync_all();
     }
+    // Nothing to do on Windows: there is no directory fsync, and
+    // `atomic_replace` already passes MOVEFILE_WRITE_THROUGH so the rename is on
+    // disk before it returns.
+    #[cfg(not(unix))]
+    let _ = parent;
 }
 
 fn checked_directory(
@@ -2496,6 +2678,103 @@ mod tests {
                 && change.old_path.is_none()
                 && change.kind == WorkspaceFileChangeKind::Modified
         }));
+    }
+
+    /// The Windows backend never emits `RenameMode::Both`; it emits the adjacent
+    /// From + To pair this test feeds in. Synthetic events rather than a real
+    /// watcher, so the assertion is about the normalization and not about how
+    /// fast the OS delivers a notification.
+    #[cfg(windows)]
+    #[test]
+    fn watch_pairs_the_windows_two_event_rename() {
+        use notify::EventKind;
+        use notify::event::{ModifyKind, RenameMode};
+
+        let root = Path::new("/workspace");
+        let events = vec![
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                    .add_path(root.join("old.rs")),
+            ),
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                    .add_path(root.join("new.rs")),
+            ),
+            // The engine's own save: temp file renamed onto the target. The temp
+            // side is internal, so this has to read as a plain modification.
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                    .add_path(root.join(".zeron-save-dead.tmp")),
+            ),
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                    .add_path(root.join("saved.rs")),
+            ),
+            // Moved out of the watched tree: no partner, still a removal.
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                    .add_path(root.join("gone.rs")),
+            ),
+        ];
+
+        let (resync, changes) = normalize_watch_events(root, events);
+        assert!(!resync);
+        assert_eq!(changes.len(), 3, "unexpected changes: {changes:?}");
+        assert!(changes.iter().any(|change| {
+            change.path == "new.rs"
+                && change.old_path.as_deref() == Some("old.rs")
+                && change.kind == WorkspaceFileChangeKind::Renamed
+        }));
+        assert!(changes.iter().any(|change| {
+            change.path == "saved.rs"
+                && change.old_path.is_none()
+                && change.kind == WorkspaceFileChangeKind::Modified
+        }));
+        assert!(changes.iter().any(|change| {
+            change.path == "gone.rs" && change.kind == WorkspaceFileChangeKind::Removed
+        }));
+    }
+
+    /// End-to-end counterpart to the pairing unit test: a real `notify` watcher
+    /// over a real tempdir, renaming a real file. Bounded wait, and it only
+    /// asserts that the rename reaches a subscriber at all, so it stays
+    /// deterministic on a slow machine.
+    #[tokio::test]
+    async fn watch_reports_a_plain_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let before = canonical.join("before.txt");
+        let after = canonical.join("after.txt");
+        std::fs::write(&before, b"renamed").unwrap();
+        let watch = CheckoutWatch::start(
+            "checkout".into(),
+            canonical,
+            false,
+            CancellationToken::new(),
+        );
+        let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
+        subscription.recv().await.unwrap();
+
+        std::fs::rename(&before, &after).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut reported = false;
+        while tokio::time::Instant::now() < deadline {
+            let batch = tokio::time::timeout_at(deadline, subscription.recv())
+                .await
+                .expect("watch event timeout")
+                .expect("watch closed");
+            if batch
+                .changes
+                .iter()
+                .any(|change| change.path == "after.txt")
+            {
+                reported = true;
+                break;
+            }
+        }
+
+        assert!(reported, "rename was not reported");
+        assert!(after.exists() && !before.exists());
     }
 
     #[test]

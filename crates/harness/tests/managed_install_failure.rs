@@ -7,10 +7,6 @@
 //!
 //! Single-test binary: it mutates PATH/SHELL/ZERON_* env process-wide.
 
-#![cfg(unix)]
-
-use std::os::unix::fs::PermissionsExt;
-
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeron_harness::{AcpHarness, Harness, HarnessError, RunControls};
@@ -22,9 +18,15 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     // npm as issue #95 saw it: dies with 254 and says nothing.
-    let npm = bin.join("npm");
-    std::fs::write(&npm, "#!/bin/sh\nexit 254\n").unwrap();
-    std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let npm = bin.join("npm");
+        std::fs::write(&npm, "#!/bin/sh\nexit 254\n").unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    std::fs::write(bin.join("npm.cmd"), "@echo off\r\nexit /b 254\r\n").unwrap();
 
     // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
@@ -32,6 +34,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         std::env::set_var("ZERON_NO_LOGIN_SHELL", "1");
         std::env::set_var("PATH", &bin);
         std::env::set_var("HOME", dir.path());
+        std::env::set_var("USERPROFILE", dir.path());
         std::env::remove_var("PI_ACP_EXECUTABLE");
     }
 
@@ -48,7 +51,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
-        cwd: "/tmp".into(),
+        cwd: std::env::temp_dir().display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),

@@ -223,7 +223,7 @@ fn request(prompt: &str) -> RunRequest {
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
-        cwd: "/tmp".into(),
+        cwd: tmp_dir(),
         sandbox: SandboxLevel::DangerFullAccess,
         auto_approve: true,
         attachments: Vec::new(),
@@ -321,6 +321,14 @@ async fn drain_to_done(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A cwd that exists on every platform (`/tmp` does not on Windows).
+fn tmp_dir() -> String {
+    std::env::temp_dir()
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
 
 #[tokio::test]
 async fn thinking_streams_and_the_turn_settles_only_on_idle() {

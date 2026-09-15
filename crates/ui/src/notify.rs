@@ -17,8 +17,14 @@
 //!   `osascript`, attributed to Script Editor (cosmetics only).
 //! - Linux: `notify-send` (libnotify's CLI, present on every mainstream
 //!   desktop).
-//! - Windows: no-op for now — toasts require a registered AppUserModelID
-//!   (an installer concern); the chime still covers it.
+//! - Windows: WinRT toasts via `tauri-winrt-notification`, posted from a
+//!   background thread (the crate's `Toast::show` blocks briefly). Every
+//!   AppUserModelID Windows can resolve without an installer is
+//!   [`Toast::POWERSHELL_APP_ID`] — a real installer's Start Menu shortcut can
+//!   instead carry [`WINDOWS_AUMID`] and set `ZERON_TOAST_APP_ID` to it, which
+//!   [`windows_app_id`] then picks up; until that shortcut exists, toasts show
+//!   the PowerShell name/icon (cosmetic only, matching the osascript/
+//!   notify-send fallback cosmetics on the other platforms).
 //! - `ZERON_DISABLE_NOTIFICATIONS` env kill-switch + the
 //!   `notificationsEnabled` ui-setting (checked by the caller);
 //! - failures are logged and swallowed — a missing notifier must never
@@ -38,12 +44,24 @@ pub fn post(title: &str, body: &str, chat_id: Option<&str>) {
 }
 
 /// Route banner clicks: `handler` receives the clicked banner's chat id.
-/// Main thread only; replaces any previous handler. Only the native macOS
-/// path reports clicks (osascript and notify-send banners can't).
+/// Replaces any previous handler. Only the native macOS path and the Windows
+/// WinRT toast path report clicks (osascript and notify-send banners can't).
+#[cfg(target_os = "macos")]
 pub fn on_click(handler: impl Fn(String) + 'static) {
-    #[cfg(target_os = "macos")]
     delegate::CLICK.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
-    #[cfg(not(target_os = "macos"))]
+}
+
+/// Windows toast activation fires on a WinRT callback thread, not necessarily
+/// the thread that registered the handler (unlike the macOS delegate, which
+/// AppKit always calls on the main thread) — so the handler is stored behind
+/// a `Mutex` rather than the macOS path's thread-local, and must be `Send`.
+#[cfg(target_os = "windows")]
+pub fn on_click(handler: impl Fn(String) + Send + 'static) {
+    *windows_click::slot().lock().unwrap() = Some(Box::new(handler));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn on_click(handler: impl Fn(String) + 'static) {
     drop(handler);
 }
 
@@ -330,7 +348,80 @@ fn post_impl(title: &str, body: &str, _chat_id: Option<&str>) {
     });
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// The AppUserModelID an installed Zeron carries once the installer's Start
+/// Menu shortcut is stamped with it (`Toast::new` needs an id Windows already
+/// recognizes; a bare unregistered id would make the toast silently vanish).
+/// Not wired into the installer yet — see the module doc.
+#[cfg(target_os = "windows")]
+const WINDOWS_AUMID: &str = "Zeron.Desktop";
+
+/// Env var that opts a build into [`WINDOWS_AUMID`] once it is actually
+/// registered; anything else (including unset) keeps the PowerShell id, which
+/// every Windows install already has.
+#[cfg(target_os = "windows")]
+const WINDOWS_APP_ID_ENV: &str = "ZERON_TOAST_APP_ID";
+
+/// The AppUserModelID to post toasts under. Pure function over the env value
+/// so the selection is unit-testable without touching the process
+/// environment.
+#[cfg(target_os = "windows")]
+fn windows_app_id() -> String {
+    windows_app_id_for(std::env::var(WINDOWS_APP_ID_ENV).ok().as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_app_id_for(env_value: Option<&str>) -> String {
+    if env_value == Some(WINDOWS_AUMID) {
+        WINDOWS_AUMID.to_string()
+    } else {
+        tauri_winrt_notification::Toast::POWERSHELL_APP_ID.to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn post_impl(title: &str, body: &str, chat_id: Option<&str>) {
+    let title = title.to_string();
+    let body = body.to_string();
+    let chat_id = chat_id.map(str::to_owned);
+    std::thread::spawn(move || {
+        use tauri_winrt_notification::Toast;
+        let mut toast = Toast::new(&windows_app_id()).title(&title).text1(&body);
+        if let Some(chat_id) = chat_id {
+            toast = toast.on_activated(move |_arguments| {
+                windows_click::dispatch(chat_id.clone());
+                Ok(())
+            });
+        }
+        if let Err(err) = toast.show() {
+            tracing::debug!(error = %err, "windows toast notification failed");
+        }
+    });
+}
+
+/// Windows click routing: [`on_click`] stores the handler here; the toast's
+/// `on_activated` callback (registered per-toast in [`post_impl`], closed
+/// over that toast's own chat id) calls [`dispatch`] on activation.
+#[cfg(target_os = "windows")]
+mod windows_click {
+    use std::sync::{Mutex, OnceLock};
+
+    type Handler = Box<dyn Fn(String) + Send>;
+    static CLICK: OnceLock<Mutex<Option<Handler>>> = OnceLock::new();
+
+    pub(super) fn slot() -> &'static Mutex<Option<Handler>> {
+        CLICK.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn dispatch(chat_id: String) {
+        if let Ok(guard) = slot().lock()
+            && let Some(handler) = guard.as_ref()
+        {
+            handler(chat_id);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn post_impl(_title: &str, _body: &str, _chat_id: Option<&str>) {}
 
 #[cfg(test)]
@@ -346,6 +437,26 @@ mod tests {
         );
         // Raw newlines would end the AppleScript statement mid-literal.
         assert_eq!(applescript_escape("two\nlines\r\n"), "two lines  ");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_app_id_only_switches_on_exact_match() {
+        assert_eq!(
+            windows_app_id_for(Some(WINDOWS_AUMID)),
+            WINDOWS_AUMID,
+            "the installer's exact AUMID opts in"
+        );
+        assert_eq!(
+            windows_app_id_for(None),
+            tauri_winrt_notification::Toast::POWERSHELL_APP_ID,
+            "unset stays on the id every Windows install already has"
+        );
+        assert_eq!(
+            windows_app_id_for(Some("Zeron.Desktop.Typo")),
+            tauri_winrt_notification::Toast::POWERSHELL_APP_ID,
+            "a near-miss must not be treated as a registered AUMID"
+        );
     }
 
     #[cfg(target_os = "macos")]

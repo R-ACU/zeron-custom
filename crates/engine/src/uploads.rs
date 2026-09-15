@@ -459,6 +459,32 @@ mod tests {
         assert_eq!(sanitize(""), "upload");
     }
 
+    /// Open a DIRECTORY handle that `set_modified` accepts. A plain
+    /// `File::open` is enough on unix; on Windows `CreateFile` refuses a
+    /// directory without FILE_FLAG_BACKUP_SEMANTICS, and setting the timestamp
+    /// additionally needs FILE_WRITE_ATTRIBUTES.
+    #[cfg(unix)]
+    fn open_directory_for_mtime(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).unwrap()
+    }
+
+    #[cfg(windows)]
+    fn open_directory_for_mtime(path: &std::path::Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+        const FILE_SHARE_ALL: u32 = 0x0000_0007;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+    }
+
     #[test]
     fn sweep_spares_a_fresh_empty_staging_dir() {
         // The parallel-chunk race: uploader A has created its staging dir but
@@ -473,10 +499,7 @@ mod tests {
         assert!(racing.exists(), "fresh empty staging dir was reclaimed");
 
         let stale = std::time::SystemTime::now() - (STAGING_TTL + Duration::from_secs(60));
-        std::fs::File::open(&racing)
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
+        open_directory_for_mtime(&racing).set_modified(stale).unwrap();
         uploads.append("upload-other", "aGk=", Some(0)).unwrap();
         assert!(!racing.exists(), "abandoned empty staging dir must be swept");
     }

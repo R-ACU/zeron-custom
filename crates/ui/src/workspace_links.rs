@@ -61,7 +61,10 @@ pub(crate) fn resolve_workspace_file_link(
     let line = fragment_line.or(suffix_line);
 
     let root = Path::new(workspace_root);
-    let relative = if Path::new(target).is_absolute() {
+    // A leading `/` counts as absolute on every platform: agents on Windows
+    // still print POSIX-style paths (Git Bash, WSL, tool output), and
+    // `Path::is_absolute` alone would treat those as relative.
+    let relative = if Path::new(target).is_absolute() || target.starts_with('/') {
         Path::new(target).strip_prefix(root).ok()?
     } else {
         Path::new(target)

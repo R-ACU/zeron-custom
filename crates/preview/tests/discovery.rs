@@ -15,8 +15,16 @@ impl Drop for Child {
         let _ = self.0.wait();
     }
 }
+/// The `python3` name is a unix (and macOS Homebrew) convention; a Windows
+/// install (python.org, or the `py` launcher's default) exposes `python`.
+/// `python3` on Windows commonly resolves to the Microsoft Store's app
+/// execution alias stub, which prints a message and exits instead of
+/// launching an interpreter.
+fn python() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
 fn launch(cwd: &std::path::Path, http: bool) -> Child {
-    let mut command = std::process::Command::new("python3");
+    let mut command = std::process::Command::new(python());
     if http {
         // HTTPServer.server_bind does a reverse DNS lookup before listen(),
         // which can stall on isolated macOS runners. TCPServer exercises the
@@ -125,7 +133,7 @@ async fn a_discovered_server_is_probed_once_not_every_cycle() {
         log = log.display().to_string()
     );
     let server = Child(
-        std::process::Command::new("python3")
+        std::process::Command::new(python())
             .args(["-c", &script])
             .current_dir(&app)
             .stdout(std::process::Stdio::null())

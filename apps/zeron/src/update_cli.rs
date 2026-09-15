@@ -57,6 +57,13 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
             Ok(())
         }
+        InstallKind::Unmanaged if cfg!(windows) => {
+            bail!(
+                "this binary is not update-managed (source build or hand-copied).\n\
+                 Windows build: rebuild from the local repo (`cargo build --release -p zeron`) \
+                 and re-run scripts/install.ps1."
+            )
+        }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\

@@ -108,6 +108,14 @@ impl EngineBackend for InProcessEngine {
         // drain and queue work against stores that are closing.
         if let Some(ipc) = &self.ipc_task {
             ipc.abort();
+            // Abort only schedules the cancellation; the listener socket is
+            // released when the task is actually dropped. Wait for that so a
+            // caller (or a retry) sees the port free the moment we return.
+            let mut spins = 0;
+            while !ipc.is_finished() && spins < 200 {
+                tokio::task::yield_now().await;
+                spins += 1;
+            }
         }
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;

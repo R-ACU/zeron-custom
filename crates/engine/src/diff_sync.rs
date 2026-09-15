@@ -766,7 +766,7 @@ struct Capture {
 /// Run git capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
 async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = tokio::process::Command::new(crate::exec::resolve_tool("git"));
     cmd.arg("-C").arg(cwd).args(args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -1375,7 +1375,7 @@ pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
         chrono::Utc::now().timestamp_micros()
     ));
     let run = |args: &[&str]| {
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = tokio::process::Command::new(crate::exec::resolve_tool("git"));
         cmd.arg("-C").arg(root).args(args);
         cmd.env("GIT_INDEX_FILE", &index);
         cmd.stdin(std::process::Stdio::null());

@@ -2197,6 +2197,21 @@ impl Shell {
             _ => None,
         };
 
+        // The primary modifier of a key-cap chip: the command glyph on macOS,
+        // plain "Ctrl" text everywhere else (the glyph means nothing there).
+        let mod_key_glyph = |color: gpui::Hsla| -> gpui::AnyElement {
+            if cfg!(target_os = "macos") {
+                icon(icons::COMMAND)
+                    .size(px(11.0))
+                    .text_color(color)
+                    .into_any_element()
+            } else {
+                div()
+                    .text_color(color)
+                    .child(SharedString::from("Ctrl"))
+                    .into_any_element()
+            }
+        };
         // A quiet mono key-cap chip ("⌘K" / "esc") for the search bar ends.
         let key_chip = |theme: &Theme| {
             div()
@@ -2234,12 +2249,8 @@ impl Shell {
             .when(submit_busy || listing.is_none(), |el| el.opacity(0.6))
             .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
             .when(!submit_busy, |el| {
-                el.child(
-                    icon(icons::COMMAND)
-                        .size(px(11.0))
-                        .text_color(theme.on_solid.opacity(0.8)),
-                )
-                .child(SharedString::from("Enter"))
+                el.child(mod_key_glyph(theme.on_solid.opacity(0.8)))
+                    .child(SharedString::from("Enter"))
             })
             .when(submit_busy, |el| el.child(SharedString::from("Adding…")));
         // Header and footer sit a shade DEEPER than the body (the shared
@@ -2262,11 +2273,7 @@ impl Shell {
             .border_color(hairline)
             .child(
                 key_chip(&theme)
-                    .child(
-                        icon(icons::COMMAND)
-                            .size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
-                    )
+                    .child(mod_key_glyph(theme.text_muted.opacity(0.7)))
                     .child(SharedString::from("K")),
             )
             .child(

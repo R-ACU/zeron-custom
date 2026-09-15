@@ -120,12 +120,81 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 pub mod shell_env;
+#[cfg(windows)]
+pub(crate) mod win;
+
+/// The user's home directory. `HOME` everywhere; on Windows a GUI or service
+/// launch has no `HOME` at all, so `USERPROFILE` — the variable Windows
+/// itself sets — stands in for it.
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return Some(std::path::PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()) {
+        return Some(std::path::PathBuf::from(profile));
+    }
+    None
+}
+
+/// File names to try for an executable name. One name on unix; on Windows a
+/// bare `claude` may be `claude.exe`, `claude.cmd` or `claude.bat` — see
+/// [`win::candidate_names`].
+pub(crate) fn candidate_names(exe: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        win::candidate_names(exe)
+    }
+    #[cfg(not(windows))]
+    {
+        vec![exe.to_owned()]
+    }
+}
+
+/// Resolve an executable: our own PATH, then the login-shell/logon PATH
+/// snapshot ([`shell_env`]), then the caller's extra install dirs, then the
+/// Node version managers' bin dirs — each tried with every name
+/// [`candidate_names`] allows. The single resolver every adapter uses, so a
+/// CLI that resolves for one of them resolves for all of them.
+pub(crate) fn find_executable(exe: &str, extra_dirs: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(shell_path) = shell_env::login_shell_path() {
+        dirs.extend(std::env::split_paths(shell_path));
+    }
+    dirs.extend(extra_dirs);
+    #[cfg(windows)]
+    dirs.extend(win::install_dirs(exe));
+    dirs.extend(node_version_manager_bins());
+    let names = candidate_names(exe);
+    dirs.into_iter()
+        .filter(|d| !d.as_os_str().is_empty())
+        .find_map(|dir| {
+            names
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.exists())
+        })
+}
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
 /// init (fnm's per-shell multishells, nvm's shell function), which a
 /// Dock/Finder-launched app never runs.
 pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        win::node_version_manager_bins()
+    }
+    #[cfg(not(windows))]
+    {
+        unix_node_version_manager_bins()
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_node_version_manager_bins() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -176,6 +245,27 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
 /// (git, rg, node) that a GUI/service launch's own PATH may lack.
 pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
     compose_path(cmd, exe.parent().filter(|d| !d.as_os_str().is_empty()));
+    #[cfg(windows)]
+    cmd.creation_flags(win::creation_flags());
+}
+
+/// A [`tokio::process::Command`] for an agent child: the program to spawn for
+/// `exe`, with the child's PATH composed by [`compose_child_path`]. On unix
+/// that is `exe` itself; on Windows a `.cmd` shim or shebang script resolves
+/// to the program it wraps (see [`win::launch_spec`]) so no cmd.exe sits
+/// between us and the agent. Callers add their own arguments AFTER this.
+pub(crate) fn child_command(exe: &std::path::Path) -> tokio::process::Command {
+    #[cfg(windows)]
+    let mut cmd = {
+        let (program, args) = win::launch_spec(exe);
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut cmd = tokio::process::Command::new(exe);
+    compose_child_path(&mut cmd, exe);
+    cmd
 }
 
 fn compose_path<'a>(
@@ -247,6 +337,12 @@ pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String 
         return "still running".into();
     };
     if let Some(code) = status.code() {
+        // Windows reports fatal exceptions (STATUS_*) as huge unsigned codes;
+        // the hex is what the user can actually look up.
+        #[cfg(windows)]
+        if code < 0 {
+            return format!("exit code {code} (0x{:08X})", code as u32);
+        }
         return format!("exit code {code}");
     }
     #[cfg(unix)]
@@ -319,7 +415,15 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows has no signals: the graceful stop is a console CTRL_BREAK to the
+/// child's own process group (children are spawned with
+/// CREATE_NEW_PROCESS_GROUP for exactly this), the kill is TerminateProcess.
+#[cfg(windows)]
+pub(crate) fn send_signal(pid: u32, signal: Signal) {
+    win::send_signal(pid, signal);
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
 }

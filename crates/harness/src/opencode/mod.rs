@@ -46,7 +46,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -113,13 +113,13 @@ fn stall_bound() -> Option<Duration> {
 
 fn opencode_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".opencode").join("bin").join("opencode"));
-        dirs.push(home.join(".local").join("bin").join("opencode"));
-        dirs.push(home.join(".npm-global").join("bin").join("opencode"));
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".opencode").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/opencode"));
-    dirs.push(PathBuf::from("/usr/local/bin/opencode"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
     dirs
 }
 
@@ -415,7 +415,7 @@ impl Server {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
         })?;
         let password = uuid::Uuid::new_v4().to_string();
-        let mut cmd = Command::new(exe);
+        let mut cmd = crate::child_command(exe);
         cmd.arg("serve")
             .arg("--port")
             .arg(port.to_string())
@@ -423,7 +423,6 @@ impl Server {
             .arg("127.0.0.1")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
-        crate::compose_child_path(&mut cmd, exe);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }

@@ -7,7 +7,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -86,9 +85,8 @@ impl Catalog {
         {
             return Ok(models.clone());
         }
-        let mut cmd = Command::new(exe);
+        let mut cmd = crate::child_command(exe);
         cmd.args(["models", "list", "--format", "json"]);
-        crate::compose_child_path(&mut cmd, exe);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -3626,7 +3626,10 @@ impl Pickers {
             }))
             .child(body);
         if ix < 9 {
-            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+            el = el.child(popover::kbd_hint(
+                &theme,
+                &crate::settings::badge_combo(&format!("mod-{}", ix + 1)),
+            ));
         }
         el = el.child(
             div()

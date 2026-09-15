@@ -1075,7 +1075,8 @@ fn url_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Write a file readable only by the owner (0600). On non-unix targets a plain write.
+/// Write a file readable only by the owner: mode 0600 on unix, a single-ACE DACL
+/// on Windows, a plain write anywhere else.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1091,7 +1092,16 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         file.write_all(bytes)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // No mode bit on Windows. The file is already restricted by the per-user
+        // ACL it inherits from `%USERPROFILE%`; narrow that to a single ACE,
+        // best effort. See `crate::exec::restrict_to_current_user`.
+        std::fs::write(path, bytes)?;
+        crate::exec::restrict_to_current_user(path);
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::write(path, bytes)
     }

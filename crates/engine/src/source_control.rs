@@ -785,7 +785,12 @@ struct SystemProcessRunner;
 #[async_trait]
 impl ProcessRunner for SystemProcessRunner {
     async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
-        let mut command = tokio::process::Command::new(&request.program);
+        // `compose_login_shell_path` exports the login shell's PATH, which is
+        // what makes a bare `gh` resolve for a GUI-launched engine on unix. It is
+        // a no-op on Windows (there is no login shell to ask), so the resolver
+        // has to find the executable itself there.
+        let program = crate::exec::resolve_tool(&request.program);
+        let mut command = tokio::process::Command::new(&program);
         if request.program == "gh" {
             zeron_harness::compose_login_shell_path(&mut command);
         }
@@ -852,7 +857,6 @@ async fn read_capped(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     use super::*;
@@ -904,8 +908,49 @@ mod tests {
         }
     }
 
+    /// The one pull request the fake `gh` prints for `pr list`.
+    const FAKE_GH_JSON: &str = r#"[{"number":90,"title":"Host-resolved pull request","url":"https://github.com/acme/zeron/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]"#;
+
+    /// A `gh` stand-in that fails unless interactive auth was disabled, then
+    /// prints one pull request. Written in the platform's own script language:
+    /// the point of the test is that the real `SystemProcessRunner` spawns and
+    /// captures a real executable.
+    #[cfg(unix)]
+    fn write_fake_gh(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_gh = dir.join("gh");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$GH_PROMPT_DISABLED\" != \"1\" ]; then\n  \
+             echo \"interactive auth was not disabled\" >&2\n  exit 2\nfi\n\
+             printf '%s\\n' '{FAKE_GH_JSON}'\n"
+        );
+        std::fs::write(&fake_gh, script).expect("write fake gh");
+        let mut permissions = std::fs::metadata(&fake_gh)
+            .expect("fake gh metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions).expect("make fake gh executable");
+        fake_gh
+    }
+
+    /// A `.cmd` rather than a shebang script: Windows has no POSIX shell, and
+    /// std spawns batch files through the command processor, so this needs no
+    /// executable bit and no interpreter on PATH.
+    #[cfg(windows)]
+    fn write_fake_gh(dir: &Path) -> PathBuf {
+        let fake_gh = dir.join("gh.cmd");
+        let script = format!(
+            "@echo off\r\nif not \"%GH_PROMPT_DISABLED%\"==\"1\" (\r\n  \
+             echo interactive auth was not disabled 1>&2\r\n  exit /b 2\r\n)\r\n\
+             echo {FAKE_GH_JSON}\r\n"
+        );
+        std::fs::write(&fake_gh, script).expect("write fake gh");
+        fake_gh
+    }
+
     fn run_git(cwd: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        let output = std::process::Command::new(crate::exec::resolve_tool("git"))
             .args(args)
             .current_dir(cwd)
             .output()
@@ -1039,23 +1084,7 @@ mod tests {
             ],
         );
 
-        let fake_gh = temp.path().join("gh");
-        std::fs::write(
-            &fake_gh,
-            r##"#!/bin/sh
-if [ "$GH_PROMPT_DISABLED" != "1" ]; then
-  echo "interactive auth was not disabled" >&2
-  exit 2
-fi
-printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https://github.com/acme/zeron/pull/90","state":"OPEN","baseRefName":"main","headRefName":"feature/status","updatedAt":"2026-08-15T12:00:00Z","isCrossRepository":false,"headRepositoryOwner":{"login":"acme"}}]'
-"##,
-        )
-        .expect("write fake gh");
-        let mut permissions = std::fs::metadata(&fake_gh)
-            .expect("fake gh metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_gh, permissions).expect("make fake gh executable");
+        let fake_gh = write_fake_gh(temp.path());
 
         let runner: Arc<dyn ProcessRunner> = Arc::new(ExecutableGhRunner {
             executable: fake_gh,

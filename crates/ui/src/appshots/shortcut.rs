@@ -114,7 +114,7 @@ pub(crate) fn current() -> Option<Shortcut> {
     preferences().lock().unwrap().active()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn subscribe() -> mpsc::UnboundedReceiver<Option<Shortcut>> {
     let (tx, rx) = mpsc::unbounded();
     let mut preferences = preferences().lock().unwrap();

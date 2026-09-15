@@ -21,6 +21,7 @@ pub mod change_requests;
 pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
+pub(crate) mod exec;
 pub mod instance_lock;
 pub mod local_import;
 pub mod profile;
@@ -909,6 +910,13 @@ async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>
 /// Ctrl-C or SIGTERM. systemd/launchd stop (and the auto-updater's service
 /// restart) deliver SIGTERM — without catching it the daemon dies mid-write
 /// and every stop takes the crash-recovery path instead of the graceful drain.
+///
+/// Windows has no SIGTERM. The equivalents are the console control events, and
+/// Ctrl-C alone covers almost none of the ways this daemon actually stops: a
+/// Scheduled Task stop, a service shutdown, a `taskkill` on the console window
+/// and a user logoff each deliver CTRL_CLOSE, CTRL_SHUTDOWN, CTRL_BREAK or
+/// CTRL_LOGOFF instead. Select all of them so a stop drains cleanly rather than
+/// leaving the next start to run crash recovery.
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -919,7 +927,23 @@ async fn shutdown_signal() -> std::io::Result<()> {
             _ = sigterm.recv() => Ok(()),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let mut interrupt = ctrl_c()?;
+        let mut close = ctrl_close()?;
+        let mut shutdown = ctrl_shutdown()?;
+        let mut logoff = ctrl_logoff()?;
+        let mut brk = ctrl_break()?;
+        tokio::select! {
+            _ = interrupt.recv() => Ok(()),
+            _ = close.recv() => Ok(()),
+            _ = shutdown.recv() => Ok(()),
+            _ = logoff.recv() => Ok(()),
+            _ = brk.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         tokio::signal::ctrl_c().await
     }

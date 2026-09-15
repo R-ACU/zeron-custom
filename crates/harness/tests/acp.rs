@@ -30,6 +30,14 @@ fn harness() -> AcpHarness {
     AcpHarness::grok().with_executable(fixture_path())
 }
 
+/// A cwd that exists on every platform (`/tmp` does not on Windows).
+fn tmp_dir() -> String {
+    std::env::temp_dir()
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
@@ -37,7 +45,7 @@ fn request(prompt: &str) -> RunRequest {
         model: Some("grok-4.5".into()),
         reasoning: None,
         model_options: serde_json::Map::new(),
-        cwd: "/tmp".into(),
+        cwd: tmp_dir(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
@@ -102,7 +110,7 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         events.iter().any(|e| matches!(
             e,
             AgentEvent::SessionStarted { harness, session_id, cwd, .. }
-                if *harness == HarnessId::Grok && session_id == "s-1" && cwd == "/tmp"
+                if *harness == HarnessId::Grok && session_id == "s-1" && *cwd == tmp_dir()
         )),
         "{events:?}"
     );

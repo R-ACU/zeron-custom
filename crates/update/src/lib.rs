@@ -64,10 +64,12 @@ pub struct FileMeta {
 }
 
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
-/// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`.
+/// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `windows-x86_64`.
 pub fn platform_key() -> (&'static str, &'static str) {
     let os = if cfg!(target_os = "macos") {
         "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
     } else {
         "linux"
     };
@@ -78,10 +80,17 @@ pub fn platform_key() -> (&'static str, &'static str) {
     (os, arch)
 }
 
-/// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
+/// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI
+/// builds). Windows artifacts ship as a zip (see `.github/workflows/release.yml`);
+/// there is currently no Windows CI target, so this name is aspirational until
+/// that lands, but `zeron update` must already report Windows accurately.
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
-    format!("zeron-{version}-{os}-{arch}.tar.gz")
+    if os == "windows" {
+        format!("zeron-{version}-windows-{arch}.zip")
+    } else {
+        format!("zeron-{version}-{os}-{arch}.tar.gz")
+    }
 }
 
 /// `zeron-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
@@ -173,12 +182,20 @@ pub enum InstallKind {
     Unmanaged,
 }
 
+/// The user's home directory for the `~/.zeron/app` managed-install layout.
+/// Windows has no `HOME` by convention; `USERPROFILE` is its equivalent. No
+/// Windows installer creates that layout yet, so this naturally resolves to
+/// [`InstallKind::Unmanaged`] there — see `detect_install`.
+fn install_home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var).map(PathBuf::from)
+}
+
 pub fn detect_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    detect_install_from(&exe, home.as_deref())
+    detect_install_from(&exe, install_home_dir().as_deref())
 }
 
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
@@ -341,10 +358,18 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         std::fs::rename(&tmp, app_root.join("current")).context("swapping current symlink")?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = (app_root, version);
-        bail!("managed installs are unix-only");
+        bail!(
+            "self-update is not available on Windows yet — rebuild with \
+             `cargo build --release -p zeron` to update"
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (app_root, version);
+        bail!("managed installs are not supported on this platform");
     }
 }
 
@@ -359,6 +384,8 @@ pub fn restart_service() -> anyhow::Result<()> {
             "launchctl",
             &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.app")],
         )
+    } else if cfg!(windows) {
+        bail!("service restart is not available on Windows yet")
     } else {
         run("systemctl", &["--user", "restart", "zeron.service"])
     }
@@ -454,7 +481,14 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
             tracing::error!(error = %err, "failed to spawn the relauncher");
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = bundle;
+        tracing::debug!(
+            "relaunch_app_after_exit: no-op on Windows (macOS app-bundle path only)"
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = bundle;
 }
 
@@ -672,6 +706,12 @@ impl Updater {
     /// flushes before systemd/launchd kills this process.
     pub async fn apply(&self) -> anyhow::Result<String> {
         let InstallKind::Managed { app_root } = detect_install() else {
+            if cfg!(windows) {
+                bail!(
+                    "self-update is not available on Windows yet — rebuild with \
+                     `cargo build --release -p zeron` to update"
+                );
+            }
             bail!(
                 "this install is not update-managed — the desktop app updates from its UI; \
                  source builds update via git"
@@ -756,11 +796,41 @@ mod tests {
     fn artifact_names_match_packaging() {
         let (os, arch) = platform_key();
         assert!(headless_artifact("0.2.0").starts_with("zeron-0.2.0-"));
-        assert_eq!(
-            headless_artifact("0.2.0"),
-            format!("zeron-0.2.0-{os}-{arch}.tar.gz")
-        );
+        if cfg!(windows) {
+            assert_eq!(os, "windows");
+            assert!(matches!(arch, "x86_64" | "aarch64"));
+            assert_eq!(
+                headless_artifact("0.2.0"),
+                format!("zeron-0.2.0-windows-{arch}.zip")
+            );
+        } else {
+            assert_eq!(
+                headless_artifact("0.2.0"),
+                format!("zeron-0.2.0-{os}-{arch}.tar.gz")
+            );
+        }
         assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
+    }
+
+    #[test]
+    fn platform_key_reports_windows_correctly() {
+        // This assertion only bites on a Windows build; on unix it just
+        // confirms platform_key never claims to be windows there.
+        let (os, _) = platform_key();
+        assert_eq!(os == "windows", cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn windows_install_is_never_managed() {
+        // No Windows installer creates `%USERPROFILE%\.zeron\app` yet, so a
+        // Windows build must always detect Unmanaged and `apply()` must bail
+        // with a Windows-specific message rather than attempting a symlink
+        // swap that doesn't exist on this platform.
+        if cfg!(windows) {
+            assert_eq!(detect_install(), InstallKind::Unmanaged);
+            let err = apply_headless(Path::new("C:/nope"), "0.0.0").unwrap_err();
+            assert!(err.to_string().contains("Windows"));
+        }
     }
 
     #[test]

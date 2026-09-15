@@ -19,13 +19,19 @@ use crate::attachments::StagedAttachment;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 mod shortcut;
 pub(crate) use shortcut::capture_allowed;
 pub use shortcut::{set_recording, set_shortcut, validate_shortcut};
 
 pub const fn is_desktop() -> bool {
-    cfg!(any(target_os = "macos", target_os = "linux"))
+    cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    ))
 }
 
 static CAPTURE_SOUND_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -67,6 +73,7 @@ pub enum AppshotPlatform {
     MacOs,
     LinuxWayland,
     LinuxX11,
+    Windows,
     Unsupported,
 }
 
@@ -124,6 +131,9 @@ impl AppshotCapabilities {
             AppshotPlatform::LinuxX11 => {
                 "X11 normally needs no capture permission. Zeron prefers an active-window screenshot portal when available and otherwise uses native X11 capture."
             }
+            AppshotPlatform::Windows => {
+                "Windows needs no capture permission. Zeron captures the frontmost window with PrintWindow and reads its text through UI Automation."
+            }
             AppshotPlatform::Unsupported => {
                 "This platform does not currently provide an Appshot capture backend."
             }
@@ -132,12 +142,12 @@ impl AppshotCapabilities {
 
     pub fn shortcut_description(self) -> &'static str {
         match self.platform {
-            AppshotPlatform::MacOs | AppshotPlatform::LinuxX11
+            AppshotPlatform::MacOs | AppshotPlatform::LinuxX11 | AppshotPlatform::Windows
                 if self.global_shortcut != CapabilityState::Ready =>
             {
                 "This shortcut is unavailable. Choose a different key combination."
             }
-            AppshotPlatform::MacOs | AppshotPlatform::LinuxX11 => {
+            AppshotPlatform::MacOs | AppshotPlatform::LinuxX11 | AppshotPlatform::Windows => {
                 "The shortcut works while another application has focus."
             }
             AppshotPlatform::LinuxWayland if self.global_shortcut == CapabilityState::Ready => {
@@ -164,6 +174,9 @@ impl AppshotCapabilities {
             (AppshotPlatform::LinuxWayland, CaptureTarget::PortalWindowPicker) => {
                 "Your portal requires choosing a window for each capture."
             }
+            (AppshotPlatform::Windows, _) => {
+                "Captures the frontmost window with PrintWindow, and reads the screen behind it when an application refuses to render itself."
+            }
             (AppshotPlatform::Unsupported, _) => {
                 "Active-window capture is unavailable on this platform."
             }
@@ -180,6 +193,9 @@ impl AppshotCapabilities {
             }
             AppshotPlatform::LinuxX11 => {
                 "Native X11 captures can include AT-SPI text when the process and window can be matched uniquely. Portal captures include the screenshot only."
+            }
+            AppshotPlatform::Windows => {
+                "UI Automation adds visible and off-screen application text. Screenshots work without it, and password fields are never read."
             }
             AppshotPlatform::Unsupported => {
                 "Semantic application text is unavailable on this platform."
@@ -210,11 +226,13 @@ pub trait AppshotBackend: Sync {
 static BACKEND: macos::MacOsBackend = macos::MacOsBackend;
 #[cfg(target_os = "linux")]
 static BACKEND: linux::LinuxBackend = linux::LinuxBackend;
+#[cfg(target_os = "windows")]
+static BACKEND: windows::WindowsBackend = windows::WindowsBackend;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 struct UnsupportedBackend;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[async_trait::async_trait]
 impl AppshotBackend for UnsupportedBackend {
     fn capabilities(&self) -> AppshotCapabilities {
@@ -241,7 +259,7 @@ impl AppshotBackend for UnsupportedBackend {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 static BACKEND: UnsupportedBackend = UnsupportedBackend;
 
 fn backend() -> &'static dyn AppshotBackend {
@@ -503,7 +521,7 @@ impl Write for AttachmentBudgetWriter {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn encode_rgba_png(
     width: u32,
     height: u32,
@@ -598,6 +616,8 @@ pub fn start_global_shortcut(
 
 pub async fn capture_active_window() -> Result<CapturedAppshot, CaptureError> {
     let result = backend().capture_active_window().await;
+    // The macOS backend plays the cue itself, as soon as pixels are saved and
+    // before optional semantic enrichment finishes.
     #[cfg(target_os = "linux")]
     if result.is_ok() {
         capture_ready();

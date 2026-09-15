@@ -270,7 +270,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Exclusivity comes from `flock` on unix and `LockFileEx` on Windows.
+    #[cfg(any(unix, windows))]
     #[test]
     fn login_and_logout_lock_out_a_running_engine() {
         let dir = tempfile::tempdir().unwrap();

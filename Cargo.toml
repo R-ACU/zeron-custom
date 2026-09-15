@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Windows port: the vendored GPUI fork is its own workspace.
+exclude = ["vendor"]
 members = [
     "crates/theme",
     "crates/proto",
@@ -138,3 +140,12 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Windows port: the GPUI fork is vendored (vendor/zui, branch `windows`) so the
+# D3D11 renderer can gain BackdropBlur, the native-child alpha punch, the
+# Porter-Duff dst-alpha fix and WM_COPYDATA deep links. Same rev as the git
+# pins above; rebase the vendored branch when bumping them.
+[patch."https://github.com/zeronsh/zui"]
+gpui = { path = "vendor/zui/crates/gpui" }
+gpui_platform = { path = "vendor/zui/crates/gpui_platform" }
+gpui_tokio = { path = "vendor/zui/crates/gpui_tokio" }

@@ -64,9 +64,7 @@ fn adapters_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".zeron").join("adapters"))
+    crate::home_dir().map(|h| h.join(".zeron").join("adapters"))
 }
 
 fn install_dir(pin: &NpmPin) -> Option<PathBuf> {
@@ -107,7 +105,8 @@ pub(crate) fn find_npm() -> Option<PathBuf> {
 
 /// How to spawn an installed entry: JS entries (the overwhelming npm norm,
 /// shebang or not) run via `node`; a native binary published as a bin entry
-/// runs directly.
+/// runs directly. `MZ` is the Windows half of the magic-number check: a PE
+/// adapter handed to node would die on its first byte.
 pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), HarnessError> {
     let head = std::fs::read(entry)
         .ok()
@@ -115,14 +114,15 @@ pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), H
         .unwrap_or_default();
     let native = head.starts_with(b"\x7fELF")
         || head.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
-        || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe]);
+        || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+        || head.starts_with(b"MZ");
     if native {
         return Ok((entry.to_path_buf(), Vec::new()));
     }
     // Prefer node beside npm (version managers keep them together); PATH and
     // the login-shell snapshot cover the rest.
     let extra = find_npm()
-        .and_then(|npm| npm.parent().map(|d| d.join("node")))
+        .and_then(|npm| npm.parent().map(Path::to_path_buf))
         .into_iter()
         .collect();
     let node = crate::acp::find_on_paths("node", extra).ok_or_else(|| {
@@ -329,7 +329,7 @@ async fn install_into(
         dir = %tmp_dir.display(),
         "installing ACP adapter"
     );
-    let mut cmd = tokio::process::Command::new(npm);
+    let mut cmd = crate::child_command(npm);
     cmd.args([
         "install",
         "--no-audit",
@@ -348,7 +348,6 @@ async fn install_into(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
-    crate::compose_child_path(&mut cmd, npm);
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -427,10 +426,22 @@ mod tests {
         assert_eq!(pin.dir_name(), "pi-acp");
     }
 
+    /// An `ExitStatus` carrying `code`, however the platform encodes one.
+    fn status(code: i32) -> Option<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            Some(std::process::ExitStatus::from_raw(code << 8))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            Some(std::process::ExitStatus::from_raw(code as u32))
+        }
+    }
+
     #[test]
     fn npm_errno_exits_are_decoded() {
-        use std::os::unix::process::ExitStatusExt;
-        let status = |code: i32| Some(std::process::ExitStatus::from_raw(code << 8));
         assert!(describe_npm_exit(status(254)).contains("ENOENT"));
         assert!(describe_npm_exit(status(243)).contains("EACCES"));
         assert!(describe_npm_exit(status(226)).contains("EROFS"));
@@ -466,9 +477,6 @@ mod tests {
         );
 
         // Marker gating: entry present but no marker → not installed.
-        assert_eq!(
-            install_dir(&pin).is_some(),
-            std::env::var_os("HOME").is_some()
-        );
+        assert_eq!(install_dir(&pin).is_some(), crate::home_dir().is_some());
     }
 }

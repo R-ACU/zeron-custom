@@ -69,39 +69,26 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    let exe = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".claude").join("local"));
+        dirs.push(home.join(".local").join("bin"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    crate::find_executable("claude", dirs)
 }
+
+/// Search summary + install hint for the NotInstalled error. The Windows
+/// wording names the places a Windows user's claude actually lives: npm
+/// writes `claude.cmd` into the npm prefix, the native installer drops
+/// `claude.exe` into `%USERPROFILE%\.local\bin`.
+#[cfg(not(windows))]
+const INSTALL_HINT: &str = "claude (searched PATH, the login shell's PATH, ~/.claude/local, \
+     ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun \
+     install dirs; set CLAUDE_CODE_EXECUTABLE to override)";
+#[cfg(windows)]
+const INSTALL_HINT: &str = r"claude (searched PATH, the logon PATH from the registry, %APPDATA%\npm, %USERPROFILE%\.local\bin, %USERPROFILE%\.claude\local, %LOCALAPPDATA%\Programs\claude, and the nvm/volta/fnm/bun bin dirs; install with `npm install -g @anthropic-ai/claude-code`; set CLAUDE_CODE_EXECUTABLE to override)";
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     match options.get(key) {
@@ -157,20 +144,11 @@ impl ClaudeHarness {
         if let Some(p) = &self.executable {
             return Ok(p.clone());
         }
-        resolve_claude_executable().ok_or_else(|| {
-            HarnessError::NotInstalled(
-                "claude (searched PATH, the login shell's PATH, ~/.claude/local, \
-                 ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and \
-                 fnm/nvm/volta/pnpm/bun install dirs; set CLAUDE_CODE_EXECUTABLE \
-                 to override)"
-                    .into(),
-            )
-        })
+        resolve_claude_executable().ok_or_else(|| HarnessError::NotInstalled(INSTALL_HINT.into()))
     }
 
     fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
-        let mut cmd = Command::new(exe);
-        crate::compose_child_path(&mut cmd, exe);
+        let mut cmd = crate::child_command(exe);
         cmd.args([
             "--print",
             "--input-format",
@@ -252,8 +230,7 @@ impl ClaudeHarness {
     /// lands.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = Command::new(&exe);
-        crate::compose_child_path(&mut cmd, &exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.args([
             "--print",
             "--input-format",

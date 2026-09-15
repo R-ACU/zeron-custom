@@ -16,6 +16,8 @@ const LAUNCHD_LABEL: &str = "sh.zeron.app";
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
 /// `zeron daemon …` manages that installation rather than a competing copy.
 const SYSTEMD_UNIT: &str = "zeron.service";
+/// Per-user Scheduled Task name on Windows (`schtasks /TN`).
+const SCHEDULED_TASK_NAME: &str = "Zeron";
 
 /// Environment captured into the unit file. `PATH` is always included (the
 /// engine spawns harness CLIs like `claude`, which service managers' minimal
@@ -66,8 +68,35 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         println!(
             "For start-at-boot without an active login session (VPS): loginctl enable-linger $USER"
         );
+    } else if cfg!(target_os = "windows") {
+        std::fs::create_dir_all(data_dir)?;
+        std::fs::write(env_file_path(data_dir), render_env_file(&env))?;
+        // `conhost.exe --headless` runs the console app without a visible
+        // window (Windows 10 1809+ / 11); a Scheduled Task's own action has
+        // no "no window" flag of its own. Quote the exe path: schtasks parses
+        // `/TR` itself and needs the quotes preserved for a path with spaces.
+        let action = format!("conhost.exe --headless \"{}\" headless", exe.display());
+        // Reinstall-friendly: end any previous run before rewriting the task.
+        let _ = run_quiet("schtasks", &["/End", "/TN", SCHEDULED_TASK_NAME]);
+        run(
+            "schtasks",
+            &[
+                "/Create",
+                "/F",
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "LIMITED",
+                "/TN",
+                SCHEDULED_TASK_NAME,
+                "/TR",
+                &action,
+            ],
+        )?;
+        run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
+        println!("Installed and started the '{SCHEDULED_TASK_NAME}' scheduled task.");
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
     println!(
         "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
@@ -76,11 +105,65 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         "Logs: {}",
         if cfg!(target_os = "macos") {
             format!("{}", data_dir.join("daemon.log").display())
+        } else if cfg!(target_os = "windows") {
+            // No service manager captures stdout/stderr for a Scheduled Task
+            // (unlike launchd's StandardOutPath or systemd's journald), so
+            // this points at the internal rotating log `main::open_log_file`
+            // already writes for every long-running mode regardless of
+            // console attachment; no separate `daemon.log` redirection needed.
+            format!(
+                "{}",
+                data_dir.join("logs").join("zeron-headless.log").display()
+            )
         } else {
             format!("journalctl --user -u {SYSTEMD_UNIT}")
         }
     );
     Ok(())
+}
+
+/// `<data_dir>\env`: a plain `KEY=VALUE` per line file, the Scheduled Task
+/// equivalent of systemd's `EnvironmentFile=`. Windows only (macOS/Linux use
+/// their service manager's native environment mechanism), but kept
+/// unconditional here since it is pure `std::fs`/`String` handling. `main`'s
+/// `apply_env_file_from_data_dir` reads it back before `zeron headless`
+/// builds its engine config.
+pub(crate) fn env_file_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("env")
+}
+
+fn render_env_file(env: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (key, value) in env {
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parses the `env_file_path` format: `KEY=VALUE` per line, blank lines and
+/// `#`-prefixed comment lines skipped, everything after the first `=` kept
+/// verbatim as the value (no quoting/escaping needed: values are written by
+/// `render_env_file` from `std::env::var`, which never contains a newline).
+pub(crate) fn parse_env_file(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
@@ -107,8 +190,18 @@ pub fn uninstall() -> anyhow::Result<()> {
             }
             Err(err) => return Err(err.into()),
         }
+    } else if cfg!(target_os = "windows") {
+        let _ = run_quiet("schtasks", &["/End", "/TN", SCHEDULED_TASK_NAME]);
+        match run_quiet("schtasks", &["/Delete", "/F", "/TN", SCHEDULED_TASK_NAME]) {
+            Ok(()) => println!("Removed the '{SCHEDULED_TASK_NAME}' scheduled task."),
+            Err(_) => println!("Not installed."),
+        }
+        if let Ok(data_dir) = windows_data_dir() {
+            // Best-effort: absent is fine, and a locked/in-use file isn't worth failing over.
+            let _ = std::fs::remove_file(env_file_path(&data_dir));
+        }
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
     Ok(())
 }
@@ -128,8 +221,13 @@ pub fn start() -> anyhow::Result<()> {
         run("launchctl", &["kickstart", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "start", SYSTEMD_UNIT])?;
+    } else if cfg!(target_os = "windows") {
+        if !windows_task_installed() {
+            bail!("not installed, run `zeron daemon install` first");
+        }
+        run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
     println!("Started.");
     Ok(())
@@ -141,8 +239,10 @@ pub fn stop() -> anyhow::Result<()> {
         run("launchctl", &["bootout", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "stop", SYSTEMD_UNIT])?;
+    } else if cfg!(target_os = "windows") {
+        run("schtasks", &["/End", "/TN", SCHEDULED_TASK_NAME])?;
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
     println!("Stopped.");
     Ok(())
@@ -165,8 +265,16 @@ pub fn restart() -> anyhow::Result<()> {
         run("systemctl", &["--user", "restart", SYSTEMD_UNIT])?;
         println!("Restarted.");
         Ok(())
+    } else if cfg!(target_os = "windows") {
+        if !windows_task_installed() {
+            bail!("not installed, run `zeron daemon install` first");
+        }
+        let _ = run_quiet("schtasks", &["/End", "/TN", SCHEDULED_TASK_NAME]);
+        run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
+        println!("Restarted.");
+        Ok(())
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
 }
 
@@ -208,9 +316,94 @@ pub fn status() -> anyhow::Result<()> {
             .status()
             .context("running systemctl")?;
         Ok(())
+    } else if cfg!(target_os = "windows") {
+        let output = Command::new("schtasks")
+            .args(["/Query", "/TN", SCHEDULED_TASK_NAME, "/FO", "LIST", "/V"])
+            .output()
+            .context("running schtasks")?;
+        if !output.status.success() {
+            println!("{SCHEDULED_TASK_NAME}: not installed (run `zeron daemon install`)");
+        } else {
+            // `schtasks` output is localized (German here); field names are
+            // matched case-insensitively for display only. A locale where
+            // neither field matches falls back to the whole (short) block
+            // rather than silently showing nothing.
+            let text = String::from_utf8_lossy(&output.stdout);
+            println!("{SCHEDULED_TASK_NAME}: installed");
+            let status_line = schtasks_field(&text, "status");
+            let last_result = schtasks_field(&text, "last result");
+            if status_line.is_none() && last_result.is_none() {
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        println!("  {trimmed}");
+                    }
+                }
+            } else {
+                if let Some(status) = status_line {
+                    println!("  Status: {status}");
+                }
+                if let Some(last_result) = last_result {
+                    println!("  Last Result: {last_result}");
+                }
+            }
+        }
+        // Engine liveness beyond "the task ran": reuses the same probe
+        // `zeron status` (auth_cli.rs) uses for the running engine's IPC port.
+        let ipc_port = std::env::var("ZERON_IPC_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(27654u16);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ipc_port));
+        let reachable =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+                .is_ok();
+        println!(
+            "IPC:      {} 127.0.0.1:{ipc_port}",
+            if reachable {
+                "listening on"
+            } else {
+                "not listening on"
+            }
+        );
+        Ok(())
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
+}
+
+/// Extracts a `Field:   value` line from `schtasks /FO LIST /V` output,
+/// matching the field name (e.g. "status", "last result") case-insensitively
+/// so this never depends on English wording for control flow, only for
+/// which lines `status()` chooses to surface.
+fn schtasks_field<'a>(text: &'a str, field_lower: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().to_lowercase() == field_lower {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether the Scheduled Task exists, checked by exit status alone (`0` =
+/// found), never by matching schtasks's localized text.
+fn windows_task_installed() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", SCHEDULED_TASK_NAME])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `<data_dir>` resolution used by `uninstall` to find the env file to
+/// remove. Mirrors `main::dirs_data_dir`'s `ZERON_DATA_DIR` override without
+/// its one-shot `.comet-native` migration, which is irrelevant to a delete.
+fn windows_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(std::env::var_os("ZERON_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(home_dir()?.join(".zeron")))
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +505,21 @@ fn xml_escape(input: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn home_dir() -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() {
+                return Ok(PathBuf::from(profile));
+            }
+        }
+        let drive = std::env::var("HOMEDRIVE").unwrap_or_default();
+        let path = std::env::var("HOMEPATH").unwrap_or_default();
+        if !drive.is_empty() && !path.is_empty() {
+            return Ok(PathBuf::from(format!("{drive}{path}")));
+        }
+        bail!("USERPROFILE not set and HOMEDRIVE/HOMEPATH not set");
+    }
+    #[cfg(not(windows))]
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME not set")
@@ -403,7 +611,11 @@ mod tests {
 
     #[test]
     fn curl_installer_always_starts_the_local_capable_service() {
-        let installer = include_str!("../../../edge/src/install.sh");
+        // Normalize line endings: a Windows checkout of this Linux-only shell
+        // script commonly comes through with CRLF (core.autocrlf), which
+        // would otherwise break every "...\n" substring check below without
+        // saying anything about the installer's actual content.
+        let installer = include_str!("../../../edge/src/install.sh").replace("\r\n", "\n");
         assert!(!installer.contains("session.json"));
         assert!(installer.contains("StartLimitIntervalSec=60\n"));
         assert!(installer.contains("StartLimitBurst=5\n"));
@@ -448,5 +660,48 @@ mod tests {
         assert!(
             plist.contains("<key>StandardOutPath</key><string>/Users/x/.zeron/daemon.log</string>")
         );
+    }
+
+    #[test]
+    fn env_file_round_trips() {
+        let env = vec![
+            ("PATH".to_string(), "C:\\Windows\\system32".to_string()),
+            ("ZERON_EDGE_URL".to_string(), "https://edge.example".to_string()),
+        ];
+        let rendered = render_env_file(&env);
+        assert_eq!(rendered, "PATH=C:\\Windows\\system32\nZERON_EDGE_URL=https://edge.example\n");
+        assert_eq!(parse_env_file(&rendered), env);
+    }
+
+    #[test]
+    fn env_file_parsing_skips_blank_and_comment_lines() {
+        let content = "\r\n# a comment\r\nPATH=C:\\a;C:\\b\r\n\r\nZERON_ORG_ID=org-1\n";
+        assert_eq!(
+            parse_env_file(content),
+            vec![
+                ("PATH".to_string(), "C:\\a;C:\\b".to_string()),
+                ("ZERON_ORG_ID".to_string(), "org-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_parsing_keeps_everything_after_the_first_equals() {
+        // A value containing '=' (e.g. a query string) must not be truncated.
+        assert_eq!(
+            parse_env_file("ZERON_EDGE_URL=https://e.example?a=1&b=2"),
+            vec![(
+                "ZERON_EDGE_URL".to_string(),
+                "https://e.example?a=1&b=2".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn schtasks_field_matches_case_insensitively() {
+        let text = "HostName:                             DESKTOP\r\nTaskName:                             \\Zeron\r\nStatus:                               Wird ausgef\u{fc}hrt\r\nLast Result:                          0\r\n";
+        assert_eq!(schtasks_field(text, "status"), Some("Wird ausgef\u{fc}hrt"));
+        assert_eq!(schtasks_field(text, "last result"), Some("0"));
+        assert_eq!(schtasks_field(text, "nonexistent"), None);
     }
 }

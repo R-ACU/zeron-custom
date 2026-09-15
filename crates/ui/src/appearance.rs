@@ -213,6 +213,13 @@ pub fn observe_window(window: &mut Window, cx: &mut App) -> Subscription {
     // fire the appearance notification, which reads as "it booted dark and fixed
     // itself when I clicked something". The window knows for certain, so ask it.
     sync(Appearance::from_window(window.appearance()), cx);
+    // `sync` only re-applies (and so only reaches `reapply_window_background`,
+    // which is what sets the DWM caption) when the resolved appearance moved —
+    // a no-op for a window whose caption never got the initial write in the
+    // first place, so this window needs its own catch-up call here.
+    if let Some(theme) = cx.try_global::<Theme>() {
+        sync_windows_caption(window, theme.appearance == Appearance::Dark);
+    }
     window.observe_window_appearance(|window, cx| {
         sync(Appearance::from_window(window.appearance()), cx);
     })
@@ -329,20 +336,55 @@ fn sync_ns_appearance(_mode: AppearanceMode) {}
 
 /// Push the theme's window background appearance onto every open window.
 pub fn reapply_window_background(cx: &mut App) {
-    let Some(wanted) = cx
-        .try_global::<Theme>()
-        .map(|theme| theme.window_background_appearance())
-    else {
+    let Some(theme) = cx.try_global::<Theme>() else {
         return;
     };
+    let wanted = theme.window_background_appearance();
+    let dark = theme.appearance == Appearance::Dark;
     for window in cx.windows() {
         window
             .update(cx, |_, window, _| {
                 window.set_background_appearance(wanted);
+                sync_windows_caption(window, dark);
             })
             .ok();
     }
 }
+
+/// Tell DWM whether this window's caption (the titlebar chrome Windows itself
+/// draws — minimize/maximize/close, the system menu) should use light or dark
+/// glyphs. gpui never sets this on Windows, so before this a dark app theme
+/// left a light caption bar: same mismatch the macOS `NSAppearance` sync
+/// above exists to prevent. `window_appearance()`/`window.appearance()`
+/// already read `AppsUseLightTheme` and fire on the `ImmersiveColorSet`
+/// setting-change notification (`gpui_windows`'s `system_appearance` +
+/// `WM_SETTINGCHANGE` handling), so unlike macOS this only needs the DWM
+/// write, not a registry read of its own.
+#[cfg(target_os = "windows")]
+fn sync_windows_caption(window: &mut Window, dark: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = handle.hwnd.get() as *mut std::ffi::c_void;
+    let enabled: i32 = dark as i32;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            (&enabled as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_windows_caption(_window: &mut Window, _dark: bool) {}
 
 #[cfg(test)]
 mod tests {

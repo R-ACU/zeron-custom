@@ -50,7 +50,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -77,36 +77,24 @@ fn resolve_codex_executable() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".codex").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local").join("bin").join("codex"));
-        candidates.push(home.join(".codex").join("bin").join("codex"));
-        candidates.push(home.join(".npm-global").join("bin").join("codex"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
-    candidates.push(PathBuf::from("/usr/local/bin/codex"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    crate::find_executable("codex", dirs)
 }
+
+/// Search summary + install hint for the NotInstalled error.
+#[cfg(not(windows))]
+const INSTALL_HINT: &str = "codex (searched PATH, the login shell's PATH, ~/.local/bin, \
+     ~/.codex/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+     fnm/nvm/volta/pnpm/bun install dirs; set CODEX_EXECUTABLE to override)";
+#[cfg(windows)]
+const INSTALL_HINT: &str = r"codex (searched PATH, the logon PATH from the registry, %APPDATA%\npm, %USERPROFILE%\.local\bin, %USERPROFILE%\.codex\bin, and the nvm/volta/fnm/bun bin dirs; install with `npm install -g @openai/codex`; set CODEX_EXECUTABLE to override)";
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
@@ -154,15 +142,7 @@ impl CodexHarness {
         if let Some(p) = &self.executable {
             return Ok(p.clone());
         }
-        resolve_codex_executable().ok_or_else(|| {
-            HarnessError::NotInstalled(
-                "codex (searched PATH, the login shell's PATH, ~/.local/bin, \
-                 ~/.codex/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, \
-                 and fnm/nvm/volta/pnpm/bun install dirs; set CODEX_EXECUTABLE to \
-                 override)"
-                    .into(),
-            )
-        })
+        resolve_codex_executable().ok_or_else(|| HarnessError::NotInstalled(INSTALL_HINT.into()))
     }
 
     /// Short-lived discovery probe: a `codex app-server` handshake followed by
@@ -172,9 +152,8 @@ impl CodexHarness {
     /// slash-invocables, listed per-cwd and deduped by name here.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -225,9 +204,8 @@ impl CodexHarness {
     /// successful picker response.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -617,9 +595,8 @@ impl CodexHarness {
         } else {
             zeron_proto::SandboxLevel::DangerFullAccess
         };
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.arg("app-server");
-        crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

@@ -2,24 +2,31 @@
 //! played through the platform's own audio CLI, zero Rust audio deps):
 //!
 //! - embedded completion, input-request, attention and Appshot chimes;
-//! - macOS Appshots use a preloaded native player; other cues write to a
-//!   temp file and use the system player on a
-//!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
-//!   (Windows), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux —
-//!   WAV, so even bare ALSA `aplay` decodes it);
+//! - macOS Appshots use a preloaded native player; other cues play on a
+//!   background thread, from a temp file through the system player: `afplay`
+//!   (macOS), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux — WAV,
+//!   so even bare ALSA `aplay` decodes it) — except Windows, which plays
+//!   straight from the embedded bytes via `winmm`'s `PlaySoundW` (no temp
+//!   file, no process spawn);
 //! - `ZERON_DISABLE_SOUND` env kill-switch + the `soundEnabled` ui-setting;
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
 
+#[cfg(not(windows))]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
+#[cfg(not(windows))]
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 static SOUND_APPSHOT: &[u8] = include_bytes!("../assets/sounds/appshot.wav");
 
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
@@ -58,7 +65,7 @@ pub fn play_appshot() {
     if macos_appshot::play() {
         return;
     }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     play_in_background(SOUND_APPSHOT);
 }
 
@@ -171,12 +178,41 @@ fn play_in_background(data: &'static [u8]) {
         return;
     }
     std::thread::spawn(move || {
-        if let Err(err) = play_bytes(data) {
+        #[cfg(windows)]
+        let result = play_bytes_windows(data);
+        #[cfg(not(windows))]
+        let result = play_bytes(data);
+        if let Err(err) = result {
             tracing::debug!(error = %err, "sound playback failed");
         }
     });
 }
 
+/// `winmm`'s `PlaySoundW` plays straight from the embedded bytes — no temp
+/// file, no process spawn — so chimes land with much less latency than the
+/// PowerShell `Media.SoundPlayer` this replaces. `SND_MEMORY` treats
+/// `pszSound` as a pointer to in-memory WAV data rather than a file path;
+/// `SND_ASYNC` returns immediately, matching every other platform's
+/// fire-and-forget playback (the calling thread need not outlive the call —
+/// the buffer is `'static`, so it stays valid for as long as the async
+/// playback needs it, independent of this thread).
+#[cfg(windows)]
+fn play_bytes_windows(data: &'static [u8]) -> Result<(), String> {
+    use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+    let played = unsafe {
+        PlaySoundW(
+            data.as_ptr().cast(),
+            std::ptr::null_mut(),
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        )
+    };
+    if played == 0 {
+        return Err("PlaySoundW failed".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn play_bytes(data: &[u8]) -> Result<(), String> {
     // The system players want a file path. Exclusive creation prevents a
     // predictable-name collision (including a pre-planted symlink) from
@@ -189,16 +225,19 @@ fn play_bytes(data: &[u8]) -> Result<(), String> {
     result
 }
 
+#[cfg(not(windows))]
 struct TempSoundFile {
     path: PathBuf,
 }
 
+#[cfg(not(windows))]
 impl Drop for TempSoundFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
+#[cfg(not(windows))]
 fn create_temp_file() -> std::io::Result<(std::fs::File, TempSoundFile)> {
     for _ in 0..128 {
         let id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -225,30 +264,6 @@ fn run_player(path: &Path) -> Result<(), String> {
     run_checked("afplay", &[], path)
 }
 
-#[cfg(windows)]
-fn run_player(path: &Path) -> Result<(), String> {
-    // SoundPlayer handles WAV natively; PlaySync keeps the process alive for
-    // the chime's duration. Pass the path through the child environment rather
-    // than interpolating it into PowerShell source (paths may contain quotes).
-    let script = "(New-Object Media.SoundPlayer $env:ZERON_SOUND_PATH).PlaySync()";
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .env("ZERON_SOUND_PATH", path)
-        .output()
-        .map_err(|e| format!("powershell failed: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!("powershell exited with {}", output.status))
-    }
-}
-
 #[cfg(not(any(windows, target_os = "macos")))]
 fn run_player(path: &Path) -> Result<(), String> {
     // WAV everywhere, so even bare ALSA aplay decodes it (herdr must exclude
@@ -270,6 +285,7 @@ fn run_player(path: &Path) -> Result<(), String> {
     Err(format!("no audio player available: {}", errors.join("; ")))
 }
 
+#[cfg(not(windows))]
 fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> {
     // Bounded wait: a wedged audio daemon must not accumulate zombie threads.
     let mut child = std::process::Command::new(program)
@@ -516,6 +532,7 @@ mod tests {
         assert_eq!(refreshed.sound_since(&stale, false), None);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn temp_files_are_exclusive_and_cleaned_up() {
         let (first_file, first) = create_temp_file().expect("reserve first temp file");
@@ -539,7 +556,7 @@ mod tests {
             SOUND_DONE,
             SOUND_REQUEST,
             SOUND_ATTENTION,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             SOUND_APPSHOT,
         ] {
             assert!(data.len() > 1000);

@@ -9343,7 +9343,7 @@ impl Render for Shell {
         // Native clipping follows the animated GPUI mask. Drags only transfer
         // pointer ownership; the browser continues rendering and reflowing.
         let browser_dragging = cx.has_active_drag();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let browser_resize_inset = if self.right_pane_open(cx)
             && !self.right_pane_expanded
             && !self.tween_active(self.right_tween)
@@ -9360,7 +9360,7 @@ impl Render for Shell {
                 browser_dragging,
             );
             browser.update(cx, |browser, cx| {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 browser.set_resize_inset(browser_resize_inset, cx);
                 browser.set_shortcuts(&self.settings.keymap);
                 browser.set_presentation(presentation, cx);

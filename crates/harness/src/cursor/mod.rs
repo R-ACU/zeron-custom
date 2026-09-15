@@ -61,12 +61,12 @@ const SHIM_SOURCE: &str = include_str!("shim.mjs");
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".local").join("bin").join("cursor-agent"));
-        dirs.push(home.join(".cursor").join("bin").join("cursor-agent"));
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".cursor").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/cursor-agent"));
-    dirs.push(PathBuf::from("/usr/local/bin/cursor-agent"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
     dirs
 }
 
@@ -112,9 +112,8 @@ impl CursorHarness {
     /// Spawn the shim in models mode and map its one catalog frame.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.args(&args);
-        crate::compose_child_path(&mut cmd, &exe);
         cmd.arg("models")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -168,9 +167,8 @@ impl CursorHarness {
 /// `{"ev":"fatal"}` JSONL on stdout; kill to cancel.
 pub async fn login_command(store_path: &std::path::Path) -> Result<Command, HarnessError> {
     let (exe, args) = CursorHarness::default().resolve_shim().await?;
-    let mut cmd = Command::new(&exe);
+    let mut cmd = crate::child_command(&exe);
     cmd.args(&args);
-    crate::compose_child_path(&mut cmd, &exe);
     cmd.arg("login").arg(store_path);
     Ok(cmd)
 }
@@ -232,9 +230,8 @@ impl Harness for CursorHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.args(&args);
-        crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

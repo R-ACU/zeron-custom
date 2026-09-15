@@ -69,16 +69,34 @@ pub struct CheckoutIdentity {
 }
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
+///
+/// On Windows there is no `/`: falling back to it would put the worktrees root at
+/// `\.zeron\worktrees`, which resolves against the current drive and silently
+/// scatters checkouts. `HOMEDRIVE` + `HOMEPATH` is the documented last resort
+/// there, and if even that is unset the caller is better off seeing the failure.
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| PathBuf::from("/"))
+    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(home);
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()) {
+        return PathBuf::from(profile);
+    }
+    #[cfg(windows)]
+    {
+        let drive = std::env::var_os("HOMEDRIVE").filter(|s| !s.is_empty());
+        let path = std::env::var_os("HOMEPATH").filter(|s| !s.is_empty());
+        if let (Some(drive), Some(path)) = (drive, path) {
+            let mut home = std::ffi::OsString::from(drive);
+            home.push(path);
+            return PathBuf::from(home);
+        }
+        panic!(
+            "no home directory: none of HOME, USERPROFILE or HOMEDRIVE+HOMEPATH is set; \
+             set USERPROFILE (or ZERON_WORKTREES_DIR) and restart the engine"
+        );
+    }
+    #[cfg(not(windows))]
+    PathBuf::from("/")
 }
 
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
@@ -180,7 +198,7 @@ impl Repos {
 
     /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
     async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = tokio::process::Command::new(crate::exec::resolve_tool("git"));
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);

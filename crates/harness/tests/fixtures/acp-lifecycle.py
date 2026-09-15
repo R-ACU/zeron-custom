@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Stateful ACP peer: reject overlapping prompts and expose real error.data."""
 import json
-import select
+import os
+import queue
 import sys
+import threading
 import time
 
 
@@ -22,8 +24,23 @@ def error(request, data):
     emit({"id": request["id"], "error": {"code": -32600, "message": "Invalid request", "data": data}})
 
 
-# Unbuffered reads keep select honest, including multiple queued frames.
+# A reader thread feeds raw chunks into a queue: select() only works on
+# sockets on Windows, and the queue timeout gives read() the same deadline
+# semantics on every platform.
 buffer = b""
+_chunks = queue.Queue()
+
+
+def _pump():
+    fd = sys.stdin.fileno()
+    while True:
+        data = os.read(fd, 65536)
+        _chunks.put(data)
+        if not data:
+            return
+
+
+threading.Thread(target=_pump, daemon=True).start()
 
 
 def read(timeout=None):
@@ -31,10 +48,10 @@ def read(timeout=None):
     deadline = None if timeout is None else time.monotonic() + timeout
     while b"\n" not in buffer:
         left = None if deadline is None else max(0, deadline - time.monotonic())
-        if not select.select([sys.stdin], [], [], left)[0]:
+        try:
+            data = _chunks.get(timeout=left)
+        except queue.Empty:
             return None
-        import os
-        data = os.read(sys.stdin.fileno(), 65536)
         if not data:
             sys.exit(0)
         buffer += data

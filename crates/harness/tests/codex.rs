@@ -88,6 +88,14 @@ async fn run_to_end(
     .expect("run finished in time")
 }
 
+/// A cwd that exists on every platform (`/tmp` does not on Windows).
+fn tmp_dir() -> String {
+    std::env::temp_dir()
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
 #[tokio::test]
 async fn reasoning_preserves_summary_parts_and_item_boundaries_per_thread() {
     let (controls, _steer, _token) = controls("Yes");
@@ -116,7 +124,7 @@ async fn reasoning_preserves_summary_parts_and_item_boundaries_per_thread() {
 async fn happy_path_maps_deltas_items_usage_and_done() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:happy");
-    req.cwd = "/tmp".into();
+    req.cwd = tmp_dir();
     req.model_options.insert(
         "serviceTier".into(),
         serde_json::Value::String("fast".into()),
@@ -141,7 +149,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
     let (h, model, cwd, session_id) = starts[0];
     assert_eq!(*h, HarnessId::Codex);
     assert_eq!(model, "gpt-5.6-sol");
-    assert_eq!(cwd, "/tmp");
+    assert_eq!(*cwd, tmp_dir());
     assert_eq!(session_id, "th-1");
 
     // Deltas — both wire spellings accepted.

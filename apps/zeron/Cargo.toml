@@ -17,7 +17,6 @@ zeron-update.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
-libc.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -26,6 +25,28 @@ tracing-subscriber.workspace = true
 # same streaming/scroll workloads, so Linux keeps the system allocator.
 [target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
+
+# Only the unix branch of main.rs's log-file locking uses libc::flock; Windows
+# uses std::os::windows::fs::OpenOptionsExt::share_mode instead.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# single_instance.rs: named mutex, top-level window enumeration/matching, and
+# WM_COPYDATA forwarding for the `zeron://` deep-link handoff into a running
+# instance. Same windows-sys version already used by crates/engine,
+# crates/harness, and crates/preview.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_DataExchange",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# build.rs: exe icon + version resource (Windows only, see build.rs).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

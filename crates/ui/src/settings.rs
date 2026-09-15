@@ -565,13 +565,22 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
-    /// macOS viewer-side Appshot capture. Device-local because the shortcut
-    /// and TCC permissions belong to this desktop.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
+    /// Viewer-side Appshot capture. Device-local because the shortcut and any
+    /// capture permissions belong to this desktop.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        serde(skip)
+    )]
     pub appshots_enabled: bool,
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        serde(skip)
+    )]
     pub appshot_sound_enabled: bool,
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        serde(skip)
+    )]
     pub appshot_destination: crate::appshots::AppshotDestination,
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
@@ -825,7 +834,10 @@ impl ShortcutId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+        serde(skip)
+    )]
     pub capture_appshot: String,
     pub save_file: String,
     pub browser_reload: String,
@@ -1312,7 +1324,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn appshot_shortcut_defaults_round_trip_and_reset() {
         assert_eq!(
@@ -1372,7 +1384,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn appshot_sound_migrates_mute_and_persists_independently() {
         let dir = tempfile::tempdir().unwrap();

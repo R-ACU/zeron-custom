@@ -4,6 +4,8 @@
 
 mod auth_cli;
 mod daemon;
+#[cfg(windows)]
+mod single_instance;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -13,9 +15,14 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Open a Zeron conversation URL.
+    /// Open a Zeron conversation URL (also accepted as `--open-url`, which
+    /// is how a registered `zeron://` deep link invokes the exe).
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    /// Same as the bare `[URL]` positional; the registered `zeron://`
+    /// scheme handler invokes the exe with this flag.
+    #[arg(long = "open-url", value_name = "URL")]
+    open_url_flag: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -105,6 +112,17 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Windows only: a Scheduled Task (`zeron daemon install`'s equivalent of
+    // launchd's EnvironmentVariables / systemd's EnvironmentFile=) has no way
+    // to bake in an environment block itself, so `daemon::install` writes
+    // `<data_dir>\env` and headless applies it here, before anything below
+    // reads `ZERON_*` or `PATH`.
+    #[cfg(windows)]
+    if matches!(cli.command, Some(Command::Headless)) {
+        apply_env_file_from_data_dir();
+    }
+
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     // loro's internal block-encode diagnostics log at info and flood
@@ -206,6 +224,22 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Status => daemon::status(),
         },
         None => {
+            // Either form of the deep link wins: a registered `zeron://`
+            // handler always uses `--open-url`, a manual/shortcut launch may
+            // pass the bare positional instead.
+            let open_url = cli.open_url.or(cli.open_url_flag);
+
+            // Windows only: a second headed launch hands its URL (if any) to
+            // the already-running instance's window and exits instead of
+            // opening a second UI. `zeron headless`/`status`/`daemon`/etc.
+            // never reach this branch, so they are unaffected.
+            #[cfg(windows)]
+            if single_instance::guard(open_url.as_deref())
+                == single_instance::SingleInstance::ForwardedToRunningInstance
+            {
+                return Ok(());
+            }
+
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
@@ -222,7 +256,7 @@ fn main() -> anyhow::Result<()> {
                 edge_token,
                 org_id: std::env::var("ZERON_ORG_ID").ok(),
                 default_harness: zeron_ui::HarnessId::ClaudeCode,
-                initial_url: cli.open_url,
+                initial_url: open_url,
             });
             Ok(())
         }
@@ -270,8 +304,29 @@ fn harness_from_env() -> zeron_engine::HarnessId {
     }
 }
 
+/// Resolves `$HOME` (unix/macOS) or `%USERPROFILE%` (Windows, falling back to
+/// `%HOMEDRIVE%%HOMEPATH%` for the rare profile that only sets those).
+fn home_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() {
+                return std::path::PathBuf::from(profile);
+            }
+        }
+        let drive = std::env::var("HOMEDRIVE").unwrap_or_default();
+        let path = std::env::var("HOMEPATH").unwrap_or_default();
+        if !drive.is_empty() && !path.is_empty() {
+            return std::path::PathBuf::from(format!("{drive}{path}"));
+        }
+        panic!("USERPROFILE not set and HOMEDRIVE/HOMEPATH not set");
+    }
+    #[cfg(not(windows))]
+    std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"))
+}
+
 fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
+    let home = home_dir();
     let dir = home.join(".zeron");
     // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
     // device identity, prefs) instead of starting fresh.
@@ -282,6 +337,30 @@ fn dirs_data_dir() -> std::path::PathBuf {
         }
     }
     dir
+}
+
+/// Windows only: applies `<data_dir>\env` (written by `daemon::install`) to the
+/// current process environment before anything else reads `ZERON_*`/`PATH`.
+/// This is the Scheduled Task equivalent of systemd's `EnvironmentFile=-%h/.zeron/env`.
+/// A missing file is fine (not installed as a service, or a plain manual
+/// `zeron headless` run); a var already set in the process environment is
+/// never overridden, matching systemd's precedence.
+#[cfg(windows)]
+fn apply_env_file_from_data_dir() {
+    let data_dir = std::env::var_os("ZERON_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(dirs_data_dir);
+    let path = daemon::env_file_path(&data_dir);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    for (key, value) in daemon::parse_env_file(&content) {
+        if std::env::var_os(&key).is_none() {
+            // SAFETY: called once, single-threaded, before the tokio runtime
+            // (or any other thread) starts.
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
 }
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
@@ -464,14 +543,59 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
         sweep_stale_pid_logs(dir, mode);
         Some(file)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Probe the CURRENT inode for a live writer before touching it, same
+        // shape as the unix branch above but via exclusive sharing instead of
+        // flock: `share_mode(0)` denies any other open (read, write, or
+        // delete) of the file while we hold it, so a second instance's own
+        // `share_mode(0)` open fails immediately (surfaced as
+        // `PermissionDenied`) instead of silently succeeding the way a
+        // default (shared) open would.
+        let preexisting = path.exists();
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path);
+        let probe = match probe {
+            Ok(file) => file,
+            Err(_) => {
+                // A live process owns the canonical log; leave it alone.
+                return std::fs::File::create(
+                    dir.join(format!("zeron-{mode}.{}.log", std::process::id())),
+                )
+                .ok();
+            }
+        };
+        // No live writer: rotate, create fresh, and hold it open exclusively
+        // for the rest of this process's lifetime (this becomes the next
+        // launch's contention check, mirroring the unix flock handoff).
+        drop(probe);
+        if preexisting {
+            let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .share_mode(0)
+            .open(&path)
+            .ok()?;
+        sweep_stale_pid_logs(dir, mode);
+        Some(file)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
         std::fs::File::create(&path).ok()
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod log_file_tests {
     use super::open_log_file_in;
 
@@ -505,7 +629,8 @@ mod log_file_tests {
 
 /// Delete `zeron-{mode}.{pid}.log` overflow files older than a week — they
 /// only exist when a second instance raced a live one for the canonical log.
-#[cfg(unix)]
+/// Pure `std::fs`, so it runs on every platform that has a pid-suffixed
+/// overflow path (unix flock contention, windows sharing-violation contention).
 fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

@@ -37,6 +37,14 @@ fn fixture_path() -> PathBuf {
     path
 }
 
+/// A cwd that exists on every platform (`/tmp` does not on Windows).
+fn tmp_dir() -> String {
+    std::env::temp_dir()
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
+}
+
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
@@ -44,7 +52,7 @@ fn request(prompt: &str) -> RunRequest {
         model: Some("grok-4.5".into()),
         reasoning: None,
         model_options: serde_json::Map::new(),
-        cwd: "/tmp".into(),
+        cwd: tmp_dir(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),

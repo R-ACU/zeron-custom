@@ -4638,7 +4638,7 @@ mod source_context_tests {
     use std::sync::Arc;
 
     fn git(repo: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = Command::new(crate::exec::resolve_tool("git"))
             .args(args)
             .current_dir(repo)
             .status()

@@ -264,6 +264,35 @@ fn error(message: String) -> Response<Body> {
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
+/// True if binding the IPv6 loopback failed because the platform (or this
+/// process) does not support that address family, rather than because the
+/// port is already owned by another application. `libc`'s `EAFNOSUPPORT`
+/// family of constants only exists for unix targets, so the MSVC build
+/// matches the equivalent WSA error codes instead.
+fn is_unsupported_family_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::EADDRNOTAVAIL)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // WSAEAFNOSUPPORT, WSAEPROTONOSUPPORT, WSAEADDRNOTAVAIL.
+        matches!(error.raw_os_error(), Some(10047 | 10043 | 10049))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
 /// Bind both loopback families: `.localhost` commonly resolves to ::1 first.
 /// Fail explicitly if another application owns the stable port.
 pub async fn serve(
@@ -276,11 +305,7 @@ pub async fn serve(
     let mut sockets = vec![v4];
     match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
         Ok(v6) => sockets.push(v6),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::EADDRNOTAVAIL)
-            ) => {}
+        Err(error) if is_unsupported_family_error(&error) => {}
         Err(error) => return Err(error.into()),
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(128));

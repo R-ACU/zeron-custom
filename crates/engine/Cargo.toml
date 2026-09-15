@@ -28,7 +28,6 @@ chrono.workspace = true
 notify.workspace = true
 portable-pty.workspace = true
 base64 = "0.22"
-libc.workspace = true
 gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
@@ -37,6 +36,21 @@ ignore.workspace = true
 nucleo-matcher.workspace = true
 
 tempfile.workspace = true
+
+# `flock` for the single-instance lock and the device-id lock; nothing on
+# Windows needs libc (the equivalents come from windows-sys below).
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Win32 pieces with no stable std equivalent on 1.95: LockFileEx/UnlockFileEx for
+# the single-instance lock, GetFileInformationByHandle for file identity (the
+# std accessors are still behind the unstable `windows_by_handle` feature).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true

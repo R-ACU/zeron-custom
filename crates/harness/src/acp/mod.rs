@@ -43,7 +43,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -124,29 +124,11 @@ fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String 
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
+/// `extra` are DIRECTORIES to probe after PATH; the shared resolver appends
+/// the platform's install dirs and expands the name (see
+/// [`crate::find_executable`]).
 pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    candidates.extend(extra);
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    crate::find_executable(exe, extra)
 }
 
 /// Generic effort ladder for agents without their own clamping rules.
@@ -175,31 +157,31 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
     // fn pointers can't capture; probe the fixed npm-global locations and
     // append the exe at call time via a small per-exe shim table.
     match exe {
-        "pi-acp" => || npm_global_bins("pi-acp"),
+        "pi-acp" => npm_global_bins,
         _ => || Vec::new(),
     }
 }
 
-fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
+fn npm_global_bins() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".local").join("bin").join(exe));
-        dirs.push(home.join(".npm-global").join("bin").join(exe));
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin").join(exe));
-    dirs.push(PathBuf::from("/usr/local/bin").join(exe));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
     dirs
 }
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".local").join("bin").join("grok"));
-        dirs.push(home.join(".grok").join("bin").join("grok"));
-        dirs.push(home.join(".npm-global").join("bin").join("grok"));
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".grok").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/grok"));
-    dirs.push(PathBuf::from("/usr/local/bin/grok"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
     dirs
 }
 
@@ -263,13 +245,13 @@ fn grok_spec() -> AcpAgentSpec {
 
 fn devin_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         // The official installer's launcher symlink (the binary lives below
         // ~/.local/share/devin/cli/_versions).
-        dirs.push(home.join(".local").join("bin").join("devin"));
+        dirs.push(home.join(".local").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/devin"));
-    dirs.push(PathBuf::from("/usr/local/bin/devin"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
     dirs
 }
 
@@ -334,12 +316,12 @@ fn devin_spec() -> AcpAgentSpec {
 
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".local").join("bin").join("hermes"));
-        dirs.push(home.join(".hermes").join("bin").join("hermes"));
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".hermes").join("bin"));
     }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/hermes"));
-    dirs.push(PathBuf::from("/usr/local/bin/hermes"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
     dirs
 }
 
@@ -407,7 +389,7 @@ fn pi_spec() -> AcpAgentSpec {
         npm_package: Some("pi-acp@0.0.33"),
         extra_paths: npm_global_paths("pi-acp"),
         cli_executable: "pi",
-        cli_extra_paths: || npm_global_bins("pi"),
+        cli_extra_paths: npm_global_bins,
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
              and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
              pi-acp automatically when npm is available — the pi CLI itself is \
@@ -718,10 +700,9 @@ impl AcpHarness {
         extra_args: &[String],
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
-        let mut cmd = Command::new(&exe);
+        let mut cmd = crate::child_command(&exe);
         cmd.args(args);
         cmd.args(extra_args);
-        crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
         }
