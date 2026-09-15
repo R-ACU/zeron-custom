@@ -2699,6 +2699,14 @@ pub struct Transcript {
     bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// Hover preview for image file chips: dwell timer, the hovered badge's
+    /// window rect, and the bounded metadata cache. The card itself is a
+    /// root-level `deferred` overlay, so it never enters a row's layout.
+    image_hover: crate::image_hover::ImageHover,
+    /// Bounded LRU of measured preview dimensions, keyed by path: re-hovering
+    /// a chip costs no header parse (the bytes themselves live in the global
+    /// attachment cache).
+    image_preview_meta: crate::image_hover::PreviewCache,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -2913,6 +2921,8 @@ impl Transcript {
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
+            image_hover: crate::image_hover::ImageHover::default(),
+            image_preview_meta: crate::image_hover::PreviewCache::default(),
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -3134,6 +3144,8 @@ impl Transcript {
         // wheel/touch input. Neither operation reads the borrowed ListState.
         self.user_collapse_scroll = None;
         self.cancel_user_hold();
+        // A moving viewport invalidates the hover card's anchor immediately.
+        self.image_hover.dismiss();
         let released_own_turn = self.own_turn.as_ref().is_some_and(|anchor| anchor.held);
         self.release_own_turn_hold();
         if self.own_turn.is_some() {
@@ -4584,6 +4596,122 @@ impl Transcript {
             ids.push(local);
         }
         ids
+    }
+
+    // -----------------------------------------------------------------------
+    // Image chip hover previews
+    // -----------------------------------------------------------------------
+
+    /// Hover wiring for one tool chip, or `None` when the chip names no image.
+    /// Only the chip under the pointer gets the measuring canvas, so the
+    /// hundreds of chips in a long transcript stay plain divs.
+    fn chip_image_hover(
+        &self,
+        id: SharedString,
+        tool: &ToolItem,
+        cx: &Context<Self>,
+    ) -> Option<ChipImageHover> {
+        let path = match &tool.call {
+            ToolCall::ReadFile { path }
+            | ToolCall::WriteFile { path, .. }
+            | ToolCall::EditFile { path, .. }
+            | ToolCall::ApplyPatch { path: Some(path) } => path.clone(),
+            _ => return None,
+        };
+        if !crate::image_hover::is_previewable_image(&path) {
+            return None;
+        }
+        let probe = (self.image_hover.target_key() == Some(&id))
+            .then(|| self.image_hover.anchor_cell());
+        let key = id.clone();
+        let on_hover = cx.listener(move |this: &mut Self, hovered: &bool, _, cx| {
+            if *hovered {
+                this.begin_image_hover(key.clone(), path.clone(), cx);
+            } else {
+                this.end_image_hover(&key, cx);
+            }
+        });
+        Some(ChipImageHover {
+            id,
+            on_hover: Rc::new(on_hover),
+            probe,
+        })
+    }
+
+    /// Pointer entered an image chip: arm the dwell timer. A wake-up carries
+    /// the generation token it was armed with, so leaving the chip (or moving
+    /// to another one) silently retires it.
+    fn begin_image_hover(&mut self, key: SharedString, path: String, cx: &mut Context<Self>) {
+        if self.image_hover.target_key() == Some(&key) {
+            return;
+        }
+        let name = file_badge_name(&path).to_owned();
+        let token = self
+            .image_hover
+            .begin(crate::image_hover::HoverTarget { key, path, name });
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::image_hover::HOVER_DELAY)
+                .await;
+            this.update(cx, |transcript, cx| {
+                if transcript.image_hover.reveal(token) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.image_hover.arm(task);
+    }
+
+    fn end_image_hover(&mut self, key: &SharedString, cx: &mut Context<Self>) {
+        if self.image_hover.end(key) {
+            cx.notify();
+        }
+    }
+
+    /// The floating card for the chip whose dwell elapsed. Bytes come from the
+    /// same `(deviceId, path)` cache and `ReadAttachmentChunk` ladder as the
+    /// user-bubble thumbnails, so a file owned by another device resolves
+    /// through its owner and a second hover is instant.
+    fn render_image_hover(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::attachments::AttachmentSnapshot;
+        use crate::image_hover::PreviewState;
+
+        let target = self.image_hover.open_target()?.clone();
+        // No measured rect yet (the badge paints one frame after the hover
+        // lands) — wait rather than anchor the card at the window origin.
+        let anchor = self.image_hover.anchor_bounds()?;
+        let device_ids = self.attachment_device_ids(cx);
+        let state = match self.attachment_state(&device_ids, &target.path, cx) {
+            AttachmentSnapshot::Loading => PreviewState::Loading,
+            AttachmentSnapshot::Error { .. } => PreviewState::Failed,
+            AttachmentSnapshot::Loaded(image) => {
+                let meta = match self.image_preview_meta.get(&target.path) {
+                    Some(meta) => Some(meta),
+                    None => {
+                        let measured = crate::image_hover::measure(&image.image);
+                        if let Some(measured) = measured {
+                            self.image_preview_meta
+                                .put(target.path.clone(), measured);
+                        }
+                        measured
+                    }
+                };
+                PreviewState::Ready {
+                    image: image.image,
+                    meta,
+                }
+            }
+        };
+        let theme = Theme::of(cx).clone();
+        let reduced = motion::reduced_motion(cx);
+        Some(crate::image_hover::preview_card(
+            &theme, &target, state, anchor, viewport, reduced,
+        ))
     }
 
     /// Effective load state for one attachment across its candidate devices:
@@ -6212,6 +6340,8 @@ impl Transcript {
                 }
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
+                let image_hover =
+                    self.chip_image_hover(SharedString::from(format!("{row_id}#img{ix}")), tool, cx);
                 if detail.is_none() && invocation.is_none() {
                     return reveal_tool_row(
                         tool_chip(
@@ -6222,6 +6352,7 @@ impl Transcript {
                             content_reveal,
                             connector_reveal,
                             continuation_reveal,
+                            image_hover,
                             theme,
                             cx.entity_id(),
                             cx,
@@ -6270,6 +6401,10 @@ impl Transcript {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
+                                // A click means the pointer is committing to the
+                                // row, not inspecting it: the preview goes away
+                                // and the chip performs its usual toggle.
+                                this.image_hover.dismiss();
                                 let entry =
                                     this.tool_details.entry(toggle_key.clone()).or_default();
                                 let currently_open = entry.open.unwrap_or(open);
@@ -6279,7 +6414,14 @@ impl Transcript {
                                 entry.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
-                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                            .child(chip_header(
+                                tool,
+                                open,
+                                image_hover,
+                                theme,
+                                cx.entity_id(),
+                                cx,
+                            )),
                     );
                 // The body stays mounted while the close tween shrinks over it.
                 // Invocation first (what was asked), then output/diff (what
@@ -6882,9 +7024,22 @@ enum ChipTrail {
 /// at the right of the ordinary static detail; done is the ordinary quiet
 /// chip; failed takes the danger tint — no status words, no live text (a
 /// header rewriting itself per stream delta read as noise — user report).
+/// Hover-preview wiring for one chip's file badge. Built by the transcript
+/// (the only owner of a `Context`) and merely ATTACHED by the chip renderers:
+/// the card itself paints from the transcript's root, so a chip stays exactly
+/// as tall as it was.
+struct ChipImageHover {
+    id: SharedString,
+    on_hover: Rc<dyn Fn(&bool, &mut Window, &mut gpui::App)>,
+    /// `Some` while this chip is the hover target: the canvas that publishes
+    /// the badge's window rect for the root-level card to anchor against.
+    probe: Option<Rc<Cell<Option<Bounds<Pixels>>>>>,
+}
+
 fn chip_header_row(
     tool: &ToolItem,
     trail: Option<ChipTrail>,
+    image_hover: Option<ChipImageHover>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -7037,16 +7192,37 @@ fn chip_header_row(
                                 .child(SharedString::from(file_badge_name(path).to_owned())),
                         )
                         .map(|badge| {
-                            if hover_text {
-                                badge
-                                    .id("tool-file-badge")
-                                    .group_hover("tool-header", |style| {
+                            // An image badge owns the element id (it needs hover
+                            // tracking of its own); otherwise the group-hover tint
+                            // keeps the old one.
+                            let Some(hover) = image_hover else {
+                                return if hover_text {
+                                    badge
+                                        .id("tool-file-badge")
+                                        .group_hover("tool-header", |style| {
+                                            style.text_color(theme.text)
+                                        })
+                                        .into_any_element()
+                                } else {
+                                    badge.into_any_element()
+                                };
+                            };
+                            let on_hover = hover.on_hover.clone();
+                            badge
+                                .id(hover.id.clone())
+                                .relative()
+                                .on_hover(move |hovered, window, cx| {
+                                    on_hover(hovered, window, cx)
+                                })
+                                .when(hover_text, |badge| {
+                                    badge.group_hover("tool-header", |style| {
                                         style.text_color(theme.text)
                                     })
-                                    .into_any_element()
-                            } else {
-                                badge.into_any_element()
-                            }
+                                })
+                                .when_some(hover.probe, |badge, cell| {
+                                    badge.child(crate::image_hover::anchor_probe(cell))
+                                })
+                                .into_any_element()
                         });
                     crate::frost::frosted(5.0, 16.0, badge).into_any_element()
                 } else {
@@ -7150,11 +7326,19 @@ fn chip_header_row(
 fn chip_header(
     tool: &ToolItem,
     open: bool,
+    image_hover: Option<ChipImageHover>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    chip_header_row(tool, Some(ChipTrail::Chevron { open }), theme, view, cx)
+    chip_header_row(
+        tool,
+        Some(ChipTrail::Chevron { open }),
+        image_hover,
+        theme,
+        view,
+        cx,
+    )
 }
 
 /// Max chars a subagent tab title keeps. The strip chip is fixed-width and
@@ -7338,6 +7522,7 @@ fn activity_ribbon(path: &mut PathBuilder, points: &[Point<Pixels>]) {
 }
 
 /// A plain activity row, or a card for a subagent without a linked document.
+#[allow(clippy::too_many_arguments)]
 fn tool_chip(
     tool: &ToolItem,
     rail: bool,
@@ -7346,6 +7531,7 @@ fn tool_chip(
     content_reveal: f32,
     connector_reveal: f32,
     continuation_reveal: f32,
+    image_hover: Option<ChipImageHover>,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -7393,7 +7579,7 @@ fn tool_chip(
                         .top(px(4.0 * (1.0 - content_reveal)))
                         .opacity(content_reveal)
                 })
-                .child(chip_header_row(tool, None, theme, view, cx)),
+                .child(chip_header_row(tool, None, image_hover, theme, view, cx)),
         )
         .into_any_element()
 }
@@ -7449,6 +7635,8 @@ fn subagent_chip(
                 .child(chip_header_row(
                     tool,
                     Some(ChipTrail::OpenArrow),
+                    // Spawn chips carry no file badge.
+                    None,
                     theme,
                     view,
                     cx,
@@ -7673,13 +7861,17 @@ impl Render for Transcript {
         } else {
             list_el.into_any_element()
         };
+        let image_hover = self.render_image_hover(window.viewport_size(), cx);
         let root = div()
             .relative()
             .size_full()
             .min_h_0()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(Self::on_selection_mouse_down),
+                cx.listener(|this: &mut Self, event, window, cx| {
+                    this.image_hover.dismiss();
+                    this.on_selection_mouse_down(event, window, cx);
+                }),
             )
             .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
@@ -7689,7 +7881,10 @@ impl Render for Transcript {
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
             .child(content)
-            .child(rail);
+            .child(rail)
+            // Deferred overlay: no content mask, no layout contribution — the
+            // list's clip and its measured row heights stay untouched.
+            .children(image_hover);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {

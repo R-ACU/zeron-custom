@@ -206,6 +206,71 @@ impl Default for GitHistoryColumnWidths {
     }
 }
 
+/// A section on the Accounts settings page: the four CLI providers plus the
+/// stored API keys, which the page orders and hides like any other section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountsProvider {
+    ClaudeCode,
+    Codex,
+    Cursor,
+    Kimi,
+    ApiKeys,
+}
+
+impl AccountsProvider {
+    /// Canonical order — also the fallback for anything a stored order omits.
+    pub const ALL: [Self; 5] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Cursor,
+        Self::Kimi,
+        Self::ApiKeys,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+            Self::Kimi => "Kimi",
+            Self::ApiKeys => "API keys",
+        }
+    }
+}
+
+/// Section order on the Accounts settings page. A hidden section keeps its
+/// place in the sequence, so showing it again restores the position the user
+/// chose (same contract as [`GitHistoryColumnOrder`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AccountsProviderOrder(pub Vec<AccountsProvider>);
+
+impl AccountsProviderOrder {
+    /// Drop duplicates and append anything a hand-edited or older file left
+    /// out, so the page always renders every section exactly once.
+    pub fn normalized(mut self) -> Self {
+        let mut providers = Vec::with_capacity(AccountsProvider::ALL.len());
+        for provider in self.0.drain(..) {
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        for provider in AccountsProvider::ALL {
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        Self(providers)
+    }
+}
+
+impl Default for AccountsProviderOrder {
+    fn default() -> Self {
+        Self(AccountsProvider::ALL.to_vec())
+    }
+}
+
 /// Whether a settings mutation should wait for the normal coalescing window or
 /// reach disk before returning to the event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +701,14 @@ pub struct UiSettings {
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
+    /// Section order on the Accounts settings page.
+    pub accounts_provider_order: AccountsProviderOrder,
+    /// Sections hidden on the Accounts settings page. `None` — a file written
+    /// before the setting existed, or a fresh install — means "not decided
+    /// yet": the page seeds it once from detection, hiding a provider whose
+    /// CLI is missing and which has no stored account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts_hidden_providers: Option<Vec<AccountsProvider>>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -696,6 +769,8 @@ impl Default for UiSettings {
             glass_strength: crate::theme::GLASS_STRENGTH_DEFAULT,
             new_thread_composer_background: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
+            accounts_provider_order: AccountsProviderOrder::default(),
+            accounts_hidden_providers: None,
             legacy_accent_color: None,
         }
     }
@@ -1169,6 +1244,17 @@ impl UiSettings {
         );
         self.git_history_column_widths = self.git_history_column_widths.clamped();
         self.git_history_column_order = self.git_history_column_order.normalized();
+        self.accounts_provider_order = self.accounts_provider_order.clone().normalized();
+        if let Some(hidden) = &mut self.accounts_hidden_providers {
+            let mut seen = Vec::with_capacity(hidden.len());
+            hidden.retain(|provider| {
+                let fresh = !seen.contains(provider);
+                if fresh {
+                    seen.push(*provider);
+                }
+                fresh
+            });
+        }
         self.ui_font_size = self.ui_font_size.normalized();
         self.keymap.heal_jump_slots();
         self.keymap.heal_reserved_composer_shortcuts();
@@ -1627,6 +1713,14 @@ mod tests {
                 name: "background.png".into(),
             }),
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            accounts_provider_order: AccountsProviderOrder(vec![
+                AccountsProvider::ApiKeys,
+                AccountsProvider::Kimi,
+                AccountsProvider::Codex,
+                AccountsProvider::Cursor,
+                AccountsProvider::ClaudeCode,
+            ]),
+            accounts_hidden_providers: Some(vec![AccountsProvider::Cursor]),
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -1637,6 +1731,9 @@ mod tests {
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
         assert!(json.contains(r#""glassStrength": 0.72"#));
+        // The Accounts page's own order and hidden set survive a round trip.
+        assert!(json.contains(r#""accountsProviderOrder""#));
+        assert!(json.contains(r#""accountsHiddenProviders""#));
     }
 
     #[test]
@@ -1773,6 +1870,15 @@ mod tests {
             loaded.git_history_author_display,
             GitHistoryAuthorDisplay::Avatar,
             "pre-author-display files default to avatars"
+        );
+        assert_eq!(
+            loaded.accounts_provider_order,
+            AccountsProviderOrder::default(),
+            "pre-reorder files use the canonical Accounts section order"
+        );
+        assert_eq!(
+            loaded.accounts_hidden_providers, None,
+            "a file predating the setting leaves the Accounts visibility undecided"
         );
     }
 

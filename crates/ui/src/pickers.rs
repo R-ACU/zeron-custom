@@ -3822,7 +3822,25 @@ impl Pickers {
         let is_active = ix == self.active;
         let is_fav = self.defaults.is_favorite(row.harness, &row.model.id);
         let (icon_path, tint) = harness_brand_icon(row.harness);
-        let label: SharedString = row.model.label.clone().into();
+        // Provider-routed catalogs (pi over pi-acp) spell the whole route into
+        // every label: "openrouter/DeepSeek: DeepSeek V3 0324". The route and
+        // the vendor come out of the name into a mark and a muted tagline, so
+        // the row shows what the model is CALLED (user request: the raw labels
+        // overflowed the row and the composer pill).
+        let display =
+            crate::model_display::display_model(row.harness, &row.model.id, &row.model.label);
+        let label: SharedString = display.name.clone().into();
+        // A routed row wears its ROUTE's mark — OpenRouter's own for openrouter
+        // routes, the harness's otherwise. An unrouted row wears none, as
+        // before: on a harness tab every row already shares the tab's agent.
+        let route_icon: Option<(&'static str, Option<gpui::Hsla>)> =
+            display.route.as_ref().map(|route| {
+                if route.is_openrouter() {
+                    (crate::icons::BRAND_OPENROUTER, None)
+                } else {
+                    (icon_path, tint)
+                }
+            });
         let harness_name = row.harness_name.clone();
         let harness = row.harness;
         let star_model = row.model.id.clone();
@@ -3831,15 +3849,24 @@ impl Pickers {
         // under 64 providers — and rows were indistinguishable). The driver
         // ships the provider display name in `description`; other harnesses'
         // taglines read fine in the same slot. Skip when it just repeats the
-        // harness name.
-        let attribution: Option<SharedString> = row
-            .model
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(harness_name.as_ref()))
-            .map(|d| SharedString::from(d.to_owned()));
+        // harness name. A routed label's own vendor/route wins the slot: that
+        // is exactly the text just taken out of the name.
         let compact = self.model_rail == ModelRail::Harness;
+        // A compact row draws the route's mark, so its tagline drops the
+        // redundant "via" clause; the two-line favorites row marks the
+        // HARNESS instead and spells the route out.
+        let attribution: Option<SharedString> = display
+            .tagline(compact && route_icon.is_some())
+            .or_else(|| {
+                row.model
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.eq_ignore_ascii_case(harness_name.as_ref()))
+                    .map(str::to_owned)
+            })
+            .filter(|d| !d.is_empty())
+            .map(SharedString::from);
         let mut el = div()
             .id(("model-row", ix))
             .px(px(8.0))
@@ -3881,6 +3908,14 @@ impl Pickers {
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
+                .when_some(route_icon, |el, (path, tint)| {
+                    el.child(
+                        crate::icons::icon(path)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(tint.unwrap_or(theme.text_muted.opacity(0.8))),
+                    )
+                })
                 .child(
                     div()
                         .flex_none()
@@ -4120,8 +4155,17 @@ impl Pickers {
     /// rather than showing zeros. `ListPrice` rows carry a muted "list price"
     /// hint beside the heading so subscription users read them as
     /// informational.
+    ///
+    /// Shown only where the user actually pays per token
+    /// ([`crate::pricing::shows_model_cost`]). On a subscription agent a price
+    /// list is a bill that never arrives, so the whole section - the "list
+    /// price" hint with it - stays out of the way; the prices remain on the
+    /// model for whenever that changes.
     fn render_cost_row(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
+        if !crate::pricing::shows_model_cost(self.effective_harness(cx)?) {
+            return None;
+        }
         let pricing = self.selected_model(cx)?.pricing.clone()?;
         let heading = |text: String, muted: f32, size: f32| {
             div()
@@ -4407,12 +4451,17 @@ fn scoped_model_rows<'a>(
                     continue;
                 }
                 let by_label = popover::match_rank(query, &model.label);
+                // The FULL label and the FULL id stay in the haystack even
+                // though the row renders a shortened name: "openrouter",
+                // "deepseek/deepseek-chat-v3-0324" and the vendor word must
+                // all keep finding the row they used to (user request).
                 let by_description = popover::match_rank(
                     query,
                     &format!(
-                        "{} {}",
+                        "{} {} {}",
                         model.description.as_deref().unwrap_or(""),
-                        model.label
+                        model.label,
+                        model.id
                     ),
                 )
                 .map(|rank| rank + 2);
@@ -4800,20 +4849,26 @@ impl Render for Pickers {
         let model_label: SharedString = if no_agents {
             SharedString::from("No agents available")
         } else {
-            let loaded = self.selected_model(cx).map(|m| m.label.clone());
+            // Same shortening as the picker rows, name only: the pill has the
+            // least room of anywhere, and the brand mark beside it already
+            // names the agent.
+            let pill_harness = self.effective_harness(cx);
+            let shorten = |id: &str, label: &str| match pill_harness {
+                Some(harness) => crate::model_display::display_model(harness, id, label).name,
+                None => label.to_owned(),
+            };
+            let loaded = self.selected_model(cx).map(|m| shorten(&m.id, &m.label));
             let label = loaded.or_else(|| {
-                let remembered = self
-                    .effective_harness(cx)
-                    .and_then(|h| self.defaults.model_for(h));
+                let remembered = pill_harness.and_then(|h| self.defaults.model_for(h));
                 match self.effective_model_id(cx) {
                     Some(id) => Some(
                         remembered
                             .filter(|m| m.id == id)
-                            .map(|m| m.label.clone())
-                            .or_else(|| self.defaults.label_for(id).map(str::to_string))
-                            .unwrap_or_else(|| id.to_string()),
+                            .map(|m| shorten(&m.id, &m.label))
+                            .or_else(|| self.defaults.label_for(id).map(|l| shorten(id, l)))
+                            .unwrap_or_else(|| shorten(id, id)),
                     ),
-                    None => remembered.map(|m| m.label.clone()),
+                    None => remembered.map(|m| shorten(&m.id, &m.label)),
                 }
             });
             label.map(SharedString::from).unwrap_or_default()
@@ -5340,6 +5395,49 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].harness, HarnessId::ClaudeCode);
         assert_eq!(rows[0].model.id, "fable-5");
+    }
+
+    /// The rows shorten, the haystack does not: pi's labels are the only
+    /// place the route and the vendor are written down, and the id is the
+    /// only place the provider's own model slug is.
+    #[test]
+    fn routed_rows_shorten_but_still_match_their_full_label_and_id() {
+        let descriptors = vec![descriptor(HarnessId::Pi, "Pi")];
+        // Verbatim from pi-acp: `{provider}/{id}` and `{provider}/{name}`.
+        let pi = vec![bare_model(
+            "openrouter/deepseek/deepseek-chat-v3-0324",
+            "openrouter/DeepSeek: DeepSeek V3 0324",
+        )];
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::Pi).then(|| pi.as_slice())
+        };
+        for query in [
+            // What the row now READS as.
+            "deeps",
+            "V3 0324",
+            // What was taken out of it, and what only the id carries.
+            "openrouter",
+            "DeepSeek: DeepSeek",
+            "deepseek-chat-v3",
+        ] {
+            let rows = scoped_model_rows(
+                query,
+                ModelRail::Harness,
+                Some(HarnessId::Pi),
+                &descriptors,
+                models_for,
+                |_, _| false,
+            );
+            assert_eq!(rows.len(), 1, "{query}");
+        }
+        // And what the row actually shows is the model's own name.
+        let shown = crate::model_display::display_model(
+            HarnessId::Pi,
+            &pi[0].id,
+            &pi[0].label,
+        );
+        assert_eq!(shown.name, "DeepSeek V3 0324");
+        assert!(shown.route.is_some_and(|r| r.is_openrouter()));
     }
 
     #[test]

@@ -44,7 +44,9 @@ pub const SESSION_ESTIMATE_TOOLTIP: &str =
 /// actually billed per token (and its models carry pricing).
 pub fn shows_session_cost(harness: HarnessId) -> bool {
     match harness {
-        HarnessId::Opencode => true,
+        // Both run on the user's own provider keys (OpenRouter and friends),
+        // so every reported token costs real money.
+        HarnessId::Opencode | HarnessId::Pi => true,
         HarnessId::ClaudeCode
         | HarnessId::Codex
         | HarnessId::Kimi
@@ -52,7 +54,37 @@ pub fn shows_session_cost(harness: HarnessId) -> bool {
         | HarnessId::Devin
         | HarnessId::Grok
         | HarnessId::Hermes
-        | HarnessId::Pi
+        | HarnessId::Mock => false,
+    }
+}
+
+/// Whether the model picker shows the COST row for this harness at all.
+///
+/// Same question as [`shows_session_cost`], asked one step earlier: does the
+/// user pay per token here? Only then is a price list something they act on.
+///
+/// - **opencode** and **pi** drive the user's OWN keys (opencode through its
+///   provider config or OpenCode Zen, pi through `~/.pi` — in practice an
+///   OpenRouter key). Every token is billed to them, so the row is shown.
+/// - **Claude Code**, **Codex** and **Kimi** are subscription products (Claude
+///   Max, a ChatGPT plan, a Kimi Code plan). Their models carry list prices
+///   for orientation, but a price list in the picker reads as a bill the user
+///   will never get.
+/// - **Cursor**, **Devin**, **Grok** and **Hermes** are likewise subscription
+///   products, and carry no prices at all today.
+///
+/// The pricing DATA stays on the model either way — hiding the row is a UI
+/// decision, and widening this is a one-line change.
+pub fn shows_model_cost(harness: HarnessId) -> bool {
+    match harness {
+        HarnessId::Opencode | HarnessId::Pi => true,
+        HarnessId::ClaudeCode
+        | HarnessId::Codex
+        | HarnessId::Kimi
+        | HarnessId::Cursor
+        | HarnessId::Devin
+        | HarnessId::Grok
+        | HarnessId::Hermes
         | HarnessId::Mock => false,
     }
 }
@@ -221,5 +253,44 @@ mod tests {
             assert!(!shows_session_cost(subscription));
         }
         assert!(!shows_session_cost(HarnessId::Grok));
+    }
+
+    #[test]
+    fn the_cost_row_follows_who_pays_per_token() {
+        // The user's own keys: a price list is a bill they will get.
+        assert!(shows_model_cost(HarnessId::Opencode));
+        assert!(shows_model_cost(HarnessId::Pi));
+        // Subscription products, even the ones carrying list prices.
+        for subscription in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Kimi,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Mock,
+        ] {
+            assert!(!shows_model_cost(subscription), "{subscription:?}");
+        }
+        // Every harness that shows a running session cost must also be
+        // allowed to show the price list that estimate is built from.
+        for harness in [
+            HarnessId::Opencode,
+            HarnessId::Pi,
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Kimi,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Mock,
+        ] {
+            assert!(
+                !shows_session_cost(harness) || shows_model_cost(harness),
+                "{harness:?}"
+            );
+        }
     }
 }

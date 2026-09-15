@@ -912,6 +912,37 @@ impl AcpHarness {
         }
     }
 
+    /// The harness's own model list, before any price enrichment.
+    ///
+    /// Devin refreshes through its native catalog command on each request.
+    /// Other ACP agents use a cached session probe, with the spec's static
+    /// catalog as fallback when they advertise nothing or probing fails.
+    async fn discovered_models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.resolve_launch()?;
+        if self.spec.id == HarnessId::Devin {
+            let (exe, _) = self.resolve_program(false).await?;
+            return self
+                .devin_models
+                .refresh(&exe, self.model_discovery_timeout)
+                .await;
+        }
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        let _probe = self.models_probe.lock().await;
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        match self.discover_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                Ok(self.models_cache.get().cloned().unwrap_or(models))
+            }
+            Ok(_) => Ok((self.spec.models)()),
+            Err(_) => Ok((self.spec.models)()),
+        }
+    }
+
     /// One short-lived probe for the agent's real model list: initialize →
     /// `session/new`, then read the response's first-class `models`
     /// (SessionModelState) with the `model` config option as fallback. The
@@ -1253,33 +1284,20 @@ impl Harness for AcpHarness {
         find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
     }
 
-    /// Devin refreshes through its native catalog command on each request.
-    /// Other ACP agents use a cached session probe, with the spec's static
-    /// catalog as fallback when they advertise nothing or probing fails.
+    /// The discovered catalog ([`Self::discovered_models`]), with prices
+    /// filled in for provider-routed rows the wire leaves unpriced.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        self.resolve_launch()?;
-        if self.spec.id == HarnessId::Devin {
-            let (exe, _) = self.resolve_program(false).await?;
-            return self
-                .devin_models
-                .refresh(&exe, self.model_discovery_timeout)
-                .await;
+        let mut models = self.discovered_models().await?;
+        // pi routes its catalog through the user's own provider config and
+        // the ACP wire carries no prices at all, so `openrouter/`-routed rows
+        // borrow OpenRouter's public catalog. Applied on EVERY listing and
+        // never folded into `models_cache`: the first listing of a cold start
+        // may miss the fetch, and then the next one fills the prices in.
+        if self.spec.id == HarnessId::Pi {
+            let prices = crate::openrouter_pricing::prices().await;
+            crate::openrouter_pricing::apply(&mut models, &prices);
         }
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
-        }
-        let _probe = self.models_probe.lock().await;
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
-        }
-        match self.discover_models().await {
-            Ok(models) if !models.is_empty() => {
-                let _ = self.models_cache.set(models.clone());
-                Ok(self.models_cache.get().cloned().unwrap_or(models))
-            }
-            Ok(_) => Ok((self.spec.models)()),
-            Err(_) => Ok((self.spec.models)()),
-        }
+        Ok(models)
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {

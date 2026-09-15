@@ -11,6 +11,10 @@
 //! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
 //!   ports of zeron's `icons.tsx`. gpui tints SVGs with the text color, so the
 //!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
+//! - The `brand-*` marks identify the API-key providers. DeepSeek, Gemini,
+//!   Mistral, OpenRouter and Ollama come from Simple Icons (CC0); Groq,
+//!   Fireworks and Together are the vendors' own site marks, refitted to the
+//!   24px box as single-colour paths. All of them paint in `currentColor`.
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -200,6 +204,17 @@ icon_assets![
     (PI_MARK, "pi-mark"),
     (KIMI_MARK, "kimi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    // API-key provider marks. The five Simple Icons marks (CC0) carry the
+    // vendors' own artwork; Groq, Fireworks and Together are their official
+    // site marks, redrawn as single-colour 24px glyphs (see the module docs).
+    (BRAND_DEEPSEEK, "brand-deepseek"),
+    (BRAND_GOOGLE_GEMINI, "brand-googlegemini"),
+    (BRAND_MISTRAL, "brand-mistralai"),
+    (BRAND_OPENROUTER, "brand-openrouter"),
+    (BRAND_OLLAMA, "brand-ollama"),
+    (BRAND_GROQ, "brand-groq"),
+    (BRAND_FIREWORKS, "brand-fireworks"),
+    (BRAND_TOGETHER, "brand-together"),
 ];
 
 /// Serves both the compact control-icon set and the complete file-identity

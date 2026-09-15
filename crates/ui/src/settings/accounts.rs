@@ -1,4 +1,4 @@
-//! Settings → Agents / accounts (feature-inventory §1.9): provider cards
+//! Settings → Agents / accounts (feature-inventory §1.9): provider sections
 //! (Claude Code, Codex, Cursor, Kimi) with account rows — email, plan badge, Active,
 //! usage meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
 //! the add-account dialogs (paste-code and browser-poll flows), the stored
@@ -6,17 +6,27 @@
 //! account-shaped loading skeletons. Zeron retargets devices from the settings
 //! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
 //!
+//! Every add action lives in ONE page-header menu instead of a button per
+//! section: the sections themselves are a quiet list. The same menu owns the
+//! page's shape — which sections are shown and in what order
+//! (`accountsProviderOrder` / `accountsHiddenProviders` in ui-settings.json).
+//! A provider whose CLI is not installed and which has no stored account
+//! starts hidden, so an agent the user never signed into cannot spend a whole
+//! card on saying so; the moment detection finds a login for one of those, it
+//! comes back on its own.
+//!
 //! The accounts RPC surface is being implemented engine-side in parallel —
 //! every call here surfaces failures as inline UI states rather than assuming
 //! the methods exist.
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, Context, Entity, FocusHandle, Hsla, ScrollAnchor, ScrollHandle, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use std::time::Duration;
 
+use zeron_engine::registry::HarnessDescriptor;
 use zeron_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
     AgentLoginStatus, HarnessId,
@@ -25,6 +35,7 @@ use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover::{self, Loadable};
+use crate::settings::{AccountsProvider, AccountsProviderOrder, SavePolicy};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -124,17 +135,6 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
     (HarnessId::Kimi, "Kimi", "kimi"),
 ];
 
-/// The header action of a provider card. Claude/Codex/Cursor can capture a
-/// SECOND login into a slot and swap between them; Kimi cannot — its token set
-/// is bound to the CLI's own configuration hash, so the only thing zeron can
-/// offer is running the CLI's own sign-in. Pure.
-pub fn add_action_label(harness: HarnessId) -> &'static str {
-    match harness {
-        HarnessId::Kimi => "Sign in with kimi",
-        _ => "Add account",
-    }
-}
-
 /// The quiet line under an account with no usage meters. Kimi's CLI reports no
 /// rate-limit view at all, so "unavailable" would read as a failure. Pure.
 pub fn no_usage_label(harness: HarnessId, switchable: bool) -> &'static str {
@@ -158,6 +158,174 @@ pub fn provider_accounts(
         .iter()
         .filter(|a| a.harness == harness)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Pure: section order, visibility, and the Add menu
+// ---------------------------------------------------------------------------
+
+/// The harness a section speaks for. The API keys section has none — it holds
+/// credentials no CLI ever logged in with. Pure.
+pub fn provider_harness(provider: AccountsProvider) -> Option<HarnessId> {
+    match provider {
+        AccountsProvider::ClaudeCode => Some(HarnessId::ClaudeCode),
+        AccountsProvider::Codex => Some(HarnessId::Codex),
+        AccountsProvider::Cursor => Some(HarnessId::Cursor),
+        AccountsProvider::Kimi => Some(HarnessId::Kimi),
+        AccountsProvider::ApiKeys => None,
+    }
+}
+
+/// The CLI a provider signs in with, named in its empty-state copy. Pure.
+pub fn provider_cli(provider: AccountsProvider) -> &'static str {
+    let harness = provider_harness(provider);
+    PROVIDERS
+        .iter()
+        .find(|(id, _, _)| Some(*id) == harness)
+        .map(|(_, _, cli)| *cli)
+        .unwrap_or("")
+}
+
+/// One row of the page-header Add menu's first group. The wording names the
+/// destination, because the menu is the only place an account can be added
+/// from now (zeron's per-section "Add account" is gone). Pure.
+pub fn add_menu_label(provider: AccountsProvider) -> &'static str {
+    match provider {
+        AccountsProvider::ClaudeCode => "Add Claude Code account",
+        AccountsProvider::Codex => "Add Codex account",
+        AccountsProvider::Cursor => "Add Cursor account",
+        // Kimi's token set is bound to the CLI's configuration hash, so the
+        // only thing zeron can offer is the CLI's own sign-in.
+        AccountsProvider::Kimi => "Sign in with Kimi",
+        AccountsProvider::ApiKeys => "Add API key",
+    }
+}
+
+/// What detection knows about one section. `cli_installed` is always true for
+/// the API keys section: it needs no CLI, so it never hides itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPresence {
+    pub provider: AccountsProvider,
+    pub cli_installed: bool,
+    pub has_accounts: bool,
+}
+
+/// Fold the accounts snapshot and the device's harness catalog into one
+/// presence row per section. A harness the catalog does not mention at all
+/// counts as not installed. Pure.
+pub fn presence(
+    snapshot: &AgentAccountsSnapshot,
+    harnesses: &[HarnessDescriptor],
+) -> Vec<ProviderPresence> {
+    AccountsProvider::ALL
+        .into_iter()
+        .map(|provider| {
+            let harness = provider_harness(provider);
+            ProviderPresence {
+                provider,
+                cli_installed: match harness {
+                    None => true,
+                    Some(harness) => harnesses
+                        .iter()
+                        .find(|d| d.id == harness)
+                        .is_some_and(|d| d.installed),
+                },
+                has_accounts: harness.is_some_and(|harness| {
+                    snapshot.accounts.iter().any(|a| a.harness == harness)
+                }),
+            }
+        })
+        .collect()
+}
+
+/// The sections that start hidden: no CLI on this device AND nothing stored.
+/// Anything the user could actually act on stays visible. Pure.
+pub fn default_hidden_providers(presence: &[ProviderPresence]) -> Vec<AccountsProvider> {
+    presence
+        .iter()
+        .filter(|row| !row.cli_installed && !row.has_accounts)
+        .map(|row| row.provider)
+        .collect()
+}
+
+/// A section the DEFAULT pass hid, which detection has since found a login
+/// for, comes back by itself — once. A section the user hid stays hidden: it
+/// is not in `auto_hidden`. Returns the new hidden set, or `None` when
+/// nothing changes. Pure.
+pub fn auto_revealed(
+    hidden: &[AccountsProvider],
+    auto_hidden: &[AccountsProvider],
+    presence: &[ProviderPresence],
+) -> Option<Vec<AccountsProvider>> {
+    let reveal: Vec<AccountsProvider> = presence
+        .iter()
+        .filter(|row| {
+            row.has_accounts
+                && hidden.contains(&row.provider)
+                && auto_hidden.contains(&row.provider)
+        })
+        .map(|row| row.provider)
+        .collect();
+    if reveal.is_empty() {
+        return None;
+    }
+    Some(
+        hidden
+            .iter()
+            .copied()
+            .filter(|provider| !reveal.contains(provider))
+            .collect(),
+    )
+}
+
+/// The sections to render, in the user's order. A hidden one is GONE — no
+/// placeholder, no dimmed card. Pure.
+pub fn visible_sections(
+    order: &AccountsProviderOrder,
+    hidden: &[AccountsProvider],
+) -> Vec<AccountsProvider> {
+    order
+        .0
+        .iter()
+        .copied()
+        .filter(|provider| !hidden.contains(provider))
+        .collect()
+}
+
+/// Hidden set with one section flipped. Pure.
+pub fn toggled_hidden(
+    hidden: &[AccountsProvider],
+    provider: AccountsProvider,
+) -> Vec<AccountsProvider> {
+    if hidden.contains(&provider) {
+        hidden
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != provider)
+            .collect()
+    } else {
+        let mut next = hidden.to_vec();
+        next.push(provider);
+        next
+    }
+}
+
+/// Move one section up (`-1`) or down (`+1`). `None` at either end, so the
+/// caller can dim the control instead of offering a no-op. Hidden sections
+/// keep their slot in the sequence, so the move is over the FULL order. Pure.
+pub fn moved(
+    order: &AccountsProviderOrder,
+    provider: AccountsProvider,
+    delta: isize,
+) -> Option<AccountsProviderOrder> {
+    let mut list = order.0.clone();
+    let ix = list.iter().position(|candidate| *candidate == provider)?;
+    let target = ix as isize + delta;
+    if target < 0 || target as usize >= list.len() {
+        return None;
+    }
+    list.swap(ix, target as usize);
+    Some(AccountsProviderOrder(list))
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +368,22 @@ impl LoginFlow {
     }
 }
 
+/// The open page-header Add menu: one keyboard cursor over both groups (the
+/// add actions, then the provider list).
+struct AddMenu {
+    active: usize,
+    focus: FocusHandle,
+}
+
+/// A row of the Add menu, in render order — what the keyboard cursor walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddRow {
+    /// Start an add flow for this provider.
+    Action(AccountsProvider),
+    /// Toggle this section's visibility.
+    Provider(AccountsProvider),
+}
+
 pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
@@ -213,9 +397,22 @@ pub struct AccountsPage {
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
-    /// The stored provider API keys, rendered under the provider cards.
+    /// The stored provider API keys — a section like any other, ordered and
+    /// hidden with the rest.
     api_keys: Entity<crate::settings::api_keys::ApiKeysSection>,
+    /// The page-header Add menu (add actions + section visibility/order).
+    add_menu: popover::Popup<AddMenu>,
+    /// The target device's harness catalog — the `installed` probe behind the
+    /// default hiding rule. Only ever read for that.
+    harnesses: Loadable<Vec<HarnessDescriptor>>,
+    /// Sections the DEFAULT pass hid. Only these are revealed automatically
+    /// when a login turns up; a section the user hid stays hidden.
+    auto_hidden: Vec<AccountsProvider>,
+    /// Scroll plumbing for "Add API key", which jumps to the key row.
+    page_scroll: ScrollHandle,
+    api_keys_anchor: ScrollAnchor,
     load_task: Option<Task<()>>,
+    harness_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -233,6 +430,8 @@ impl AccountsPage {
         });
         let api_keys =
             cx.new(|cx| crate::settings::api_keys::ApiKeysSection::new(state.clone(), cx));
+        let page_scroll = ScrollHandle::new();
+        let api_keys_anchor = ScrollAnchor::for_handle(page_scroll.clone());
         let mut page = Self {
             state,
             target_device: None,
@@ -243,7 +442,13 @@ impl AccountsPage {
             error: None,
             code_input,
             api_keys,
+            add_menu: popover::Popup::default(),
+            harnesses: Loadable::Idle,
+            auto_hidden: Vec::new(),
+            page_scroll,
+            api_keys_anchor,
             load_task: None,
+            harness_task: None,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -255,6 +460,7 @@ impl AccountsPage {
         // Loading skeleton (meter ghosts) covers the probe latency, so
         // "Usage unavailable" is reserved for a probe that genuinely failed.
         page.load(force_usage_for(LoadTrigger::Mount), cx);
+        page.load_harnesses(cx);
         page
     }
 
@@ -282,6 +488,9 @@ impl AccountsPage {
         self.busy_account = None;
         self.error = None;
         self.load(force_usage_for(LoadTrigger::Mount), cx);
+        // Installs are per device, and the default hiding rule reads them.
+        self.harnesses = Loadable::Idle;
+        self.load_harnesses(cx);
     }
 
     /// Params with the `targetDeviceId` passthrough merged in.
@@ -476,10 +685,104 @@ impl AccountsPage {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                page.apply_default_visibility(cx);
                 cx.notify();
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    /// `ListHarnesses` against the target device — read ONLY for the
+    /// `installed` probe behind the default hiding rule, so a failure is
+    /// silent: the page is perfectly usable without it, every section simply
+    /// counts as installed until the catalog lands.
+    fn load_harnesses(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        if matches!(self.harnesses, Loadable::Loading) {
+            return;
+        }
+        self.harnesses = Loadable::Loading;
+        let params = self.params(serde_json::json!({}));
+        self.harness_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::LIST_HARNESSES, params).await;
+            this.update(cx, |page, cx| {
+                page.harnesses = match result {
+                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                        Ok(list) => Loadable::Ready(list),
+                        Err(err) => Loadable::Error(err.to_string()),
+                    },
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                page.apply_default_visibility(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    // ---- section order and visibility ----
+
+    fn order(&self, cx: &Context<Self>) -> AccountsProviderOrder {
+        crate::settings::current(cx)
+            .accounts_provider_order
+            .normalized()
+    }
+
+    fn hidden(&self, cx: &Context<Self>) -> Vec<AccountsProvider> {
+        crate::settings::current(cx)
+            .accounts_hidden_providers
+            .unwrap_or_default()
+    }
+
+    /// Seed the hidden set once from detection, and afterwards let a section
+    /// the seeding hid return as soon as a login for it shows up. Needs both
+    /// halves of detection (accounts + the installed probe); until then the
+    /// page shows everything, which is the honest state of "not known yet".
+    fn apply_default_visibility(&mut self, cx: &mut Context<Self>) {
+        let presence = match (self.snapshot.ready(), self.harnesses.ready()) {
+            (Some(snapshot), Some(harnesses)) => presence(snapshot, harnesses),
+            _ => return,
+        };
+        match crate::settings::current(cx).accounts_hidden_providers {
+            None => {
+                let hidden = default_hidden_providers(&presence);
+                self.auto_hidden = hidden.clone();
+                self.write_hidden(hidden, cx);
+            }
+            Some(hidden) => {
+                if let Some(next) = auto_revealed(&hidden, &self.auto_hidden, &presence) {
+                    self.auto_hidden.retain(|provider| next.contains(provider));
+                    self.write_hidden(next, cx);
+                }
+            }
+        }
+    }
+
+    fn write_hidden(&mut self, hidden: Vec<AccountsProvider>, cx: &mut Context<Self>) {
+        crate::settings::update(SavePolicy::Debounced, cx, |settings| {
+            settings.accounts_hidden_providers = Some(hidden);
+        });
+        cx.notify();
+    }
+
+    /// Show/hide one section from the Add menu. A manual hide takes the
+    /// section out of [`Self::auto_hidden`], so detection never overrules it.
+    fn toggle_provider(&mut self, provider: AccountsProvider, cx: &mut Context<Self>) {
+        let next = toggled_hidden(&self.hidden(cx), provider);
+        self.auto_hidden.retain(|candidate| *candidate != provider);
+        self.write_hidden(next, cx);
+    }
+
+    fn move_provider(&mut self, provider: AccountsProvider, delta: isize, cx: &mut Context<Self>) {
+        let Some(next) = moved(&self.order(cx), provider, delta) else {
+            return;
+        };
+        crate::settings::update(SavePolicy::Debounced, cx, |settings| {
+            settings.accounts_provider_order = next;
+        });
         cx.notify();
     }
 
@@ -1238,6 +1541,431 @@ impl AccountsPage {
     }
 }
 
+/// The brand mark of a section, plus the tint gpui cannot take from the asset
+/// (it paints SVGs in the text colour). Pure.
+pub fn section_mark(provider: AccountsProvider) -> (&'static str, Option<Hsla>) {
+    match provider {
+        AccountsProvider::Codex => (crate::icons::OPENAI_MARK, None),
+        AccountsProvider::Cursor => (crate::icons::CURSOR_MARK, None),
+        AccountsProvider::Kimi => (crate::icons::KIMI_MARK, None),
+        AccountsProvider::ApiKeys => (crate::icons::KEY_MINIMALISTIC, None),
+        AccountsProvider::ClaudeCode => (
+            crate::icons::CLAUDE_MARK,
+            Some(crate::icons::claude_brand()),
+        ),
+    }
+}
+
+/// Brand mark inside a 24px centered box (zeron: `grid size-6
+/// place-items-center [&_svg]:size-4`).
+fn provider_mark(provider: AccountsProvider, theme: &Theme, size: f32) -> gpui::Div {
+    let (mark, tint) = section_mark(provider);
+    div()
+        .flex_none()
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            crate::icons::icon(mark)
+                .size(px(size))
+                .text_color(tint.unwrap_or(theme.text_muted)),
+        )
+}
+
+/// The vertical rhythm between sections. Tighter than zeron's, because the
+/// header rows lost their trailing button: the page reads as one list.
+fn section_shell() -> gpui::Div {
+    div().mt(px(18.0)).flex().flex_col()
+}
+
+fn section_header(provider: AccountsProvider, theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .child(provider_mark(provider, theme, 16.0))
+        .child(
+            div()
+                .text_size(crate::typography::ui_rems(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(SharedString::from(provider.label())),
+        )
+}
+
+impl AccountsPage {
+    // ---- the page-header Add menu ----
+
+    fn close_add_menu(&mut self, cx: &mut Context<Self>) {
+        if self.add_menu.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.add_menu);
+            cx.notify();
+        }
+    }
+
+    fn open_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = cx.focus_handle();
+        self.add_menu.open(AddMenu {
+            active: 0,
+            focus: focus.clone(),
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Every row the keyboard cursor walks: the add actions in a fixed order,
+    /// then the sections in the user's own order.
+    fn add_menu_rows(&self, cx: &Context<Self>) -> Vec<AddRow> {
+        let mut rows: Vec<AddRow> = AccountsProvider::ALL.into_iter().map(AddRow::Action).collect();
+        rows.extend(self.order(cx).0.into_iter().map(AddRow::Provider));
+        rows
+    }
+
+    fn activate_add_row(&mut self, row: AddRow, window: &mut Window, cx: &mut Context<Self>) {
+        match row {
+            AddRow::Action(AccountsProvider::ApiKeys) => {
+                self.close_add_menu(cx);
+                self.reveal_api_keys(window, cx);
+            }
+            AddRow::Action(provider) => {
+                let Some(harness) = provider_harness(provider) else {
+                    return;
+                };
+                self.close_add_menu(cx);
+                // A login that lands in a hidden section would look lost.
+                if self.hidden(cx).contains(&provider) {
+                    self.toggle_provider(provider, cx);
+                }
+                self.start_login(harness, cx);
+            }
+            // Visibility is a series of decisions - the menu stays open.
+            AddRow::Provider(provider) => self.toggle_provider(provider, cx),
+        }
+    }
+
+    /// "Add API key": show the section if it was hidden, scroll it into view,
+    /// and put the caret in the key field.
+    fn reveal_api_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hidden(cx).contains(&AccountsProvider::ApiKeys) {
+            self.toggle_provider(AccountsProvider::ApiKeys, cx);
+        }
+        self.api_keys_anchor.scroll_to(window, cx);
+        self.api_keys
+            .update(cx, |section, cx| section.focus_key_field(window, cx));
+        cx.notify();
+    }
+
+    /// Arrow keys move the highlight, Enter activates, alt+arrows reorder the
+    /// highlighted section, Escape closes.
+    fn add_menu_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.add_menu.is_open() {
+            return;
+        }
+        let rows = self.add_menu_rows(cx);
+        let active = self.add_menu.get().map(|menu| menu.active).unwrap_or(0);
+        let raw = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.alt && (raw == "up" || raw == "down") {
+            if let Some(AddRow::Provider(provider)) = rows.get(active).copied() {
+                self.move_provider(provider, if raw == "up" { -1 } else { 1 }, cx);
+                // The cursor follows the row it just moved.
+                let moved_to = self
+                    .order(cx)
+                    .0
+                    .iter()
+                    .position(|candidate| *candidate == provider);
+                if let (Some(menu), Some(ix)) = (self.add_menu.open_mut(), moved_to) {
+                    menu.active = AccountsProvider::ALL.len() + ix;
+                }
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let key = popover::classify_key(
+            raw,
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => {
+                self.close_add_menu(cx);
+                cx.stop_propagation();
+            }
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                if let Some(menu) = self.add_menu.open_mut() {
+                    menu.active =
+                        popover::menu_step(Some(menu.active), rows.len(), delta).unwrap_or(0);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                if let Some(row) = rows.get(active).copied() {
+                    self.activate_add_row(row, window, cx);
+                }
+                cx.stop_propagation();
+            }
+            popover::MenuKey::Backspace | popover::MenuKey::Other => {}
+        }
+    }
+
+    fn render_add_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::widgets;
+        let open = self.add_menu.is_open();
+        let mut trigger = widgets::ghost_action(theme)
+            .id("accounts-add")
+            .flex_none()
+            .text_size(crate::typography::ui_rems(12.5))
+            .when(open, |el| {
+                el.bg(crate::theme::ink(0.06)).text_color(theme.text)
+            })
+            .when(!open, |el| el.hover(|s| widgets::ghost_hover(theme, s)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.add_menu.note_trigger_press()),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.add_menu.take_press_was_open() {
+                    this.close_add_menu(cx);
+                } else {
+                    this.open_add_menu(window, cx);
+                }
+            }))
+            .child(
+                crate::icons::icon(crate::icons::ADD_CIRCLE)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(SharedString::from("Add"));
+
+        if let Some(menu) = self.add_menu.get() {
+            let active = menu.active;
+            let focus = menu.focus.clone();
+            let closing = self.add_menu.closing_since();
+            let order = self.order(cx);
+            let hidden = self.hidden(cx);
+            let last = order.0.len().saturating_sub(1);
+            let actions = AccountsProvider::ALL;
+            let card = popover::popover_card(theme)
+                .w(px(268.0))
+                .track_focus(&focus)
+                .on_key_down(
+                    cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                        this.add_menu_key(event, window, cx);
+                    }),
+                )
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_add_menu(cx)))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(popover::menu_heading(theme, "Add"))
+                .children(actions.into_iter().enumerate().map(|(ix, provider)| {
+                    popover::menu_row_nav(theme, false, ix == active, format!("accounts-add-{ix}"))
+                        .id(("accounts-add-action", ix))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.activate_add_row(AddRow::Action(provider), window, cx);
+                        }))
+                        .child(provider_mark(provider, theme, 14.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(add_menu_label(provider))),
+                        )
+                }))
+                .child(popover::menu_separator())
+                .child(popover::menu_heading(theme, "Providers"))
+                .children(order.0.iter().copied().enumerate().map(|(ix, provider)| {
+                    let shown = !hidden.contains(&provider);
+                    let row_ix = actions.len() + ix;
+                    let arrow = |glyph: &'static str, delta: isize, enabled: bool, id: usize| {
+                        div()
+                            .id(("accounts-provider-move", id))
+                            .flex_none()
+                            .rounded(px(5.0))
+                            .px(px(3.0))
+                            .py(px(2.0))
+                            .when(!enabled, |el| el.opacity(0.25))
+                            .when(enabled, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(crate::theme::ink(0.08)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        // The row itself toggles visibility.
+                                        cx.stop_propagation();
+                                        this.move_provider(provider, delta, cx);
+                                    }))
+                            })
+                            .child(
+                                crate::icons::icon(glyph)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_muted),
+                            )
+                    };
+                    popover::menu_row_nav(
+                        theme,
+                        false,
+                        row_ix == active,
+                        format!("accounts-provider-{ix}"),
+                    )
+                    .id(("accounts-provider-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_provider(provider, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(shown, |el| {
+                                el.child(
+                                    crate::icons::icon(crate::icons::CHECK)
+                                        .size(px(13.0))
+                                        .text_color(theme.text),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .when(!shown, |el| el.text_color(theme.text_muted.opacity(0.6)))
+                            .child(SharedString::from(provider.label())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(arrow(crate::icons::ALT_ARROW_UP, -1, ix > 0, ix * 2))
+                            .child(arrow(
+                                crate::icons::ALT_ARROW_DOWN,
+                                1,
+                                ix < last,
+                                ix * 2 + 1,
+                            )),
+                    )
+                }))
+                .into_any_element();
+            trigger = trigger.child(popover::anchored_menu_below_end(
+                "accounts-add-menu",
+                card,
+                closing,
+            ));
+        }
+        trigger.into_any_element()
+    }
+
+    // ---- sections ----
+
+    /// One provider section: brand header, then the account rows card. The
+    /// header carries no action any more - everything that adds lives in the
+    /// page-header Add menu.
+    fn render_provider_section(
+        &mut self,
+        provider: AccountsProvider,
+        harness: HarnessId,
+        snapshot: &AgentAccountsSnapshot,
+        theme: &Theme,
+        now: DateTime<Utc>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::settings::widgets;
+        let name = provider.label();
+        let cli = provider_cli(provider);
+        let accounts = provider_accounts(snapshot, harness);
+        // EVERY warning renders its own strip (zeron maps them).
+        let warnings: Vec<String> = snapshot
+            .warnings
+            .iter()
+            .filter(|w| w.harness == harness)
+            .map(|w| w.message.clone())
+            .collect();
+        let rows: Vec<AnyElement> = accounts
+            .iter()
+            .enumerate()
+            .map(|(ix, account)| self.render_account_row(account, ix, ix == 0, theme, now, cx))
+            .collect();
+        let empty_copy = match harness {
+            // Cursor's app login is SEPARATE from `cursor-agent login` -
+            // pointing at the CLI would send users to a sign-in that does not
+            // light this up.
+            HarnessId::Cursor => format!(
+                "{name} isn\u{2019}t connected on this device \u{2014} connect it to run \
+                 Cursor sessions."
+            ),
+            _ => format!(
+                "No {name} login detected on this device \u{2014} sign in \
+                 with \u{201C}{cli}\u{201D} or add an account."
+            ),
+        };
+        let card = widgets::section_card(theme).mt(px(6.0));
+        let card = if rows.is_empty() {
+            card.child(
+                div()
+                    .px(px(20.0))
+                    .py(px(28.0))
+                    .text_center()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(empty_copy)),
+            )
+        } else {
+            card.children(rows)
+        };
+        section_shell()
+            .child(section_header(provider, theme))
+            .children(
+                warnings
+                    .into_iter()
+                    .map(|warning| widgets::warning_strip(theme, warning)),
+            )
+            .child(card)
+            .into_any_element()
+    }
+
+    /// The same section shape with ghost rows, so loaded data lands without a
+    /// layout jump.
+    fn render_provider_skeleton(
+        &mut self,
+        provider: AccountsProvider,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::settings::widgets;
+        let skeleton_id = match provider {
+            AccountsProvider::Codex => "accounts-skeleton-codex",
+            AccountsProvider::Cursor => "accounts-skeleton-cursor",
+            AccountsProvider::Kimi => "accounts-skeleton-kimi",
+            _ => "accounts-skeleton-claude",
+        };
+        section_shell()
+            .child(section_header(provider, theme))
+            .child(
+                widgets::section_card(theme)
+                    .mt(px(6.0))
+                    .child(self.render_skeleton_row((skeleton_id, 0), false, true, theme, cx))
+                    .child(self.render_skeleton_row((skeleton_id, 1), true, false, theme, cx)),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
@@ -1250,211 +1978,77 @@ impl Render for AccountsPage {
             .ready()
             .map(|s| s.accounts.len())
             .filter(|&n| n > 0);
+        let order = self.order(cx);
+        let hidden = self.hidden(cx);
+        let visible = visible_sections(&order, &hidden);
 
-        let provider_icon = |harness: HarnessId| match harness {
-            HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
-            HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-            HarnessId::Devin => (crate::icons::DEVIN_MARK, None),
-            HarnessId::Grok => (crate::icons::GROK_MARK, None),
-            HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
-            HarnessId::Pi => (crate::icons::PI_MARK, None),
-            HarnessId::Kimi => (crate::icons::KIMI_MARK, None),
-            HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
-            _ => (
-                crate::icons::CLAUDE_MARK,
-                Some(crate::icons::claude_brand()),
-            ),
-        };
-        // Brand mark inside a 24px centered box (zeron: `grid size-6
-        // place-items-center [&_svg]:size-4`).
-        let provider_mark = |harness: HarnessId, theme: &Theme| {
-            let (mark, tint) = provider_icon(harness);
-            div()
-                .flex_none()
-                .size(px(24.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    crate::icons::icon(mark)
-                        .size(px(16.0))
-                        .text_color(tint.unwrap_or(theme.text_muted)),
-                )
-        };
-
-        // One section per provider (zeron settings.agents.tsx `ProviderSection`):
-        // brand header + Add account, then the account rows card.
-        let sections: Vec<AnyElement> = match &self.snapshot {
-            Loadable::Idle | Loadable::Loading => PROVIDERS
-                .into_iter()
-                .map(|(harness, name, _cli)| {
-                    let skeleton_id = match harness {
-                        HarnessId::Codex => "accounts-skeleton-codex",
-                        HarnessId::Cursor => "accounts-skeleton-cursor",
-                        HarnessId::Kimi => "accounts-skeleton-kimi",
-                        _ => "accounts-skeleton-claude",
-                    };
-                    div()
-                        .mt(px(24.0))
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(provider_mark(harness, &theme))
-                                .child(
-                                    div()
-                                        .text_size(crate::typography::ui_rems(14.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child(SharedString::from(name)),
-                                ),
-                        )
-                        .child(
-                            // Ghost rows shaped like real ones (row two dimmed)
-                            // so the card keeps its size while data develops.
-                            widgets::section_card(&theme)
-                                .mt(px(8.0))
-                                .child(self.render_skeleton_row(
-                                    (skeleton_id, 0),
-                                    false,
-                                    true,
-                                    &theme,
-                                    cx,
-                                ))
-                                .child(self.render_skeleton_row(
-                                    (skeleton_id, 1),
-                                    true,
-                                    false,
-                                    &theme,
-                                    cx,
-                                )),
-                        )
-                        .into_any_element()
-                })
-                .collect(),
-            Loadable::Error(message) => {
-                let message = message.clone();
-                vec![
-                    widgets::error_strip(&theme, message)
-                        .id("accounts-load-error")
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            // Retry IS the visit's first successful list — force usage.
-                            this.load(force_usage_for(LoadTrigger::Retry), cx)
-                        }))
-                        .child(
-                            div()
-                                .mt(px(4.0))
-                                .text_size(crate::typography::ui_rems(11.5))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from("Click to retry")),
-                        )
-                        .into_any_element(),
-                ]
-            }
-            Loadable::Ready(snapshot) => {
-                let snapshot = snapshot.clone();
-                PROVIDERS
-                    .into_iter()
-                    .map(|(harness, name, cli)| {
-                        let accounts = provider_accounts(&snapshot, harness);
-                        // EVERY warning renders its own strip (zeron maps them).
-                        let warnings: Vec<String> = snapshot
-                            .warnings
-                            .iter()
-                            .filter(|w| w.harness == harness)
-                            .map(|w| w.message.clone())
-                            .collect();
-                        let rows: Vec<AnyElement> = accounts
-                            .iter()
-                            .enumerate()
-                            .map(|(ix, account)| {
-                                self.render_account_row(account, ix, ix == 0, &theme, now, cx)
-                            })
-                            .collect();
-                        let add_id: SharedString = format!("add-account-{name}").into();
-                        let card = widgets::section_card(&theme).mt(px(8.0));
-                        let action_label = add_action_label(harness);
-                        let empty_copy = match harness {
-                            // Cursor's app login is SEPARATE from `cursor-agent
-                            // login` — pointing at the CLI would send users to a
-                            // sign-in that does not light this up.
-                            HarnessId::Cursor => format!(
-                                "{name} isn't connected on this device — connect it to run \
-                                 Cursor sessions."
-                            ),
-                            _ => format!(
-                                "No {name} login detected on this device — sign in \
-                                 with \u{201C}{cli}\u{201D} or add an account."
-                            ),
-                        };
-                        let card = if rows.is_empty() {
-                            card.child(
-                                div()
-                                    .px(px(20.0))
-                                    .py(px(32.0))
-                                    .text_center()
-                                    .text_size(crate::typography::ui_rems(14.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(empty_copy)),
-                            )
-                        } else {
-                            card.children(rows)
-                        };
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if let Loadable::Error(message) = &self.snapshot {
+            let message = message.clone();
+            sections.push(
+                widgets::error_strip(&theme, message)
+                    .id("accounts-load-error")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // Retry IS the visit's first successful list - force usage.
+                        this.load(force_usage_for(LoadTrigger::Retry), cx)
+                    }))
+                    .child(
                         div()
-                            .mt(px(24.0))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(provider_mark(harness, &theme))
-                                    .child(
-                                        div()
-                                            .text_size(crate::typography::ui_rems(14.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text)
-                                            .child(SharedString::from(name)),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        widgets::ghost_action(&theme)
-                                            .id(add_id)
-                                            .hover(|s| widgets::ghost_hover(&theme, s))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.start_login(harness, cx);
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from(action_label)),
-                                    ),
-                            )
-                            .children(
-                                warnings
-                                    .into_iter()
-                                    .map(|warning| widgets::warning_strip(&theme, warning)),
-                            )
-                            .child(card)
-                            .into_any_element()
-                    })
-                    .collect()
+                            .mt(px(4.0))
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("Click to retry")),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let snapshot = self.snapshot.ready().cloned();
+        let failed = matches!(self.snapshot, Loadable::Error(_));
+        for provider in visible.iter().copied() {
+            if provider == AccountsProvider::ApiKeys {
+                sections.push(
+                    div()
+                        // Stateful: the anchor lives on the interactivity of
+                        // an identified element, like the scroll handle does.
+                        .id("accounts-api-keys")
+                        .anchor_scroll(Some(self.api_keys_anchor.clone()))
+                        .child(self.api_keys.clone())
+                        .into_any_element(),
+                );
+                continue;
             }
-        };
+            let Some(harness) = provider_harness(provider) else {
+                continue;
+            };
+            let section = match &snapshot {
+                Some(snapshot) => {
+                    self.render_provider_section(provider, harness, snapshot, &theme, now, cx)
+                }
+                // A failed list already renders its own strip above.
+                None if failed => continue,
+                None => self.render_provider_skeleton(provider, &theme, cx),
+            };
+            sections.push(section);
+        }
+        if visible.is_empty() {
+            sections.push(
+                div()
+                    .mt(px(24.0))
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(
+                        "All providers hidden. Use Add to show them.",
+                    ))
+                    .into_any_element(),
+            );
+        }
 
         div()
             .id("accounts-page")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.page_scroll)
             .child(
                 widgets::page_column()
                     .child(
@@ -1465,6 +2059,7 @@ impl Render for AccountsPage {
                             .gap(px(10.0))
                             .child(widgets::page_header(&theme, "Accounts", account_count))
                             .child(div().flex_1())
+                            .child(self.render_add_menu(&theme, cx))
                             .child(
                                 // `text-[12.5px]` + leading 16px Refresh icon,
                                 // dimmed while a refresh is in flight (zeron
@@ -1506,7 +2101,6 @@ impl Render for AccountsPage {
                         )
                     })
                     .children(sections)
-                    .child(self.api_keys.clone())
                     // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
                     .child(
@@ -1531,6 +2125,7 @@ impl Render for AccountsPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+    use gpui::AssetSource as _;
 
     #[test]
     fn first_load_of_a_visit_forces_the_usage_probe() {
@@ -1548,12 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_is_a_read_only_provider_card() {
-        // Its token set is bound to the CLI's configuration hash, so the card
-        // offers the CLI's own sign-in, not "add a second account".
-        assert_eq!(add_action_label(HarnessId::Kimi), "Sign in with kimi");
-        assert_eq!(add_action_label(HarnessId::ClaudeCode), "Add account");
-        assert_eq!(add_action_label(HarnessId::Codex), "Add account");
+    fn kimi_is_a_read_only_provider_section() {
         // "Credentials unavailable" would read as a failure for a login that
         // is perfectly fine and simply reports no quota.
         assert_eq!(
@@ -1621,6 +2211,232 @@ mod tests {
                 monthly.with_timezone(&Local).format("%b %-d")
             ))
         );
+    }
+
+    fn descriptor(id: HarnessId, installed: bool) -> HarnessDescriptor {
+        HarnessDescriptor {
+            id,
+            name: format!("{id:?}"),
+            supports_steering: true,
+            steering_mode: zeron_proto::SteeringMode::StepBoundary,
+            reasoning_levels: vec![],
+            installed,
+            enabled: None,
+        }
+    }
+
+    fn login(harness: HarnessId) -> AgentAccount {
+        AgentAccount {
+            id: format!("{harness:?}-1"),
+            harness,
+            email: Some("remo@example.com".into()),
+            plan_label: None,
+            active: true,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    #[test]
+    fn a_section_with_no_cli_and_no_login_starts_hidden() {
+        // The complaint this rule answers: a big empty "Cursor isn't
+        // connected" card on a device that never had cursor-agent.
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![login(HarnessId::ClaudeCode), login(HarnessId::Codex)],
+            warnings: vec![],
+        };
+        let harnesses = vec![
+            descriptor(HarnessId::ClaudeCode, true),
+            descriptor(HarnessId::Codex, true),
+            descriptor(HarnessId::Cursor, false),
+            descriptor(HarnessId::Kimi, true),
+        ];
+        let rows = presence(&snapshot, &harnesses);
+        assert_eq!(
+            default_hidden_providers(&rows),
+            vec![AccountsProvider::Cursor]
+        );
+        // API keys need no CLI, so they are never hidden by the default pass.
+        assert!(rows.iter().all(|row| row.provider != AccountsProvider::ApiKeys
+            || (row.cli_installed && !row.has_accounts)));
+        // An installed CLI with no login keeps its section: the user can act
+        // on it. A missing CLI with a stored login keeps its section too.
+        let harnesses = vec![
+            descriptor(HarnessId::ClaudeCode, false),
+            descriptor(HarnessId::Codex, true),
+            descriptor(HarnessId::Cursor, true),
+            descriptor(HarnessId::Kimi, false),
+        ];
+        let rows = presence(&snapshot, &harnesses);
+        assert_eq!(default_hidden_providers(&rows), vec![AccountsProvider::Kimi]);
+    }
+
+    #[test]
+    fn a_detected_login_reveals_an_auto_hidden_section_but_not_a_user_hidden_one() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![login(HarnessId::Cursor), login(HarnessId::Kimi)],
+            warnings: vec![],
+        };
+        let harnesses = vec![
+            descriptor(HarnessId::ClaudeCode, true),
+            descriptor(HarnessId::Codex, true),
+            descriptor(HarnessId::Cursor, false),
+            descriptor(HarnessId::Kimi, false),
+        ];
+        let rows = presence(&snapshot, &harnesses);
+        let hidden = vec![AccountsProvider::Cursor, AccountsProvider::Kimi];
+        // Cursor was hidden by the default pass, Kimi by the user: only
+        // Cursor comes back when a login turns up.
+        let auto_hidden = vec![AccountsProvider::Cursor];
+        assert_eq!(
+            auto_revealed(&hidden, &auto_hidden, &rows),
+            Some(vec![AccountsProvider::Kimi])
+        );
+        // Nothing to reveal a second time: the section is no longer hidden.
+        assert_eq!(
+            auto_revealed(&[AccountsProvider::Kimi], &auto_hidden, &rows),
+            None
+        );
+        // Without a detected login nothing moves on its own.
+        let empty = AgentAccountsSnapshot::default();
+        assert_eq!(
+            auto_revealed(&hidden, &auto_hidden, &presence(&empty, &harnesses)),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_sections_are_gone_but_keep_their_slot_in_the_order() {
+        let order = AccountsProviderOrder::default();
+        let hidden = vec![AccountsProvider::Cursor];
+        assert_eq!(
+            visible_sections(&order, &hidden),
+            vec![
+                AccountsProvider::ClaudeCode,
+                AccountsProvider::Codex,
+                AccountsProvider::Kimi,
+                AccountsProvider::ApiKeys,
+            ]
+        );
+        // Showing it again restores the position, not the end of the list.
+        let shown = toggled_hidden(&hidden, AccountsProvider::Cursor);
+        assert!(shown.is_empty());
+        assert_eq!(visible_sections(&order, &shown), order.0);
+        assert_eq!(
+            toggled_hidden(&shown, AccountsProvider::ApiKeys),
+            vec![AccountsProvider::ApiKeys]
+        );
+        // Everything hidden is a legal state (the page says so in one line).
+        let all: Vec<AccountsProvider> = AccountsProvider::ALL.to_vec();
+        assert!(visible_sections(&order, &all).is_empty());
+    }
+
+    #[test]
+    fn reordering_moves_one_section_and_stops_at_the_ends() {
+        let order = AccountsProviderOrder::default();
+        let moved_down = moved(&order, AccountsProvider::ClaudeCode, 1).unwrap();
+        assert_eq!(
+            moved_down.0,
+            vec![
+                AccountsProvider::Codex,
+                AccountsProvider::ClaudeCode,
+                AccountsProvider::Cursor,
+                AccountsProvider::Kimi,
+                AccountsProvider::ApiKeys,
+            ]
+        );
+        assert!(moved(&order, AccountsProvider::ClaudeCode, -1).is_none());
+        assert!(moved(&order, AccountsProvider::ApiKeys, 1).is_none());
+        // A hidden section still occupies a slot, so moving over it works.
+        let up = moved(&order, AccountsProvider::ApiKeys, -1).unwrap();
+        assert_eq!(up.0.last(), Some(&AccountsProvider::Kimi));
+    }
+
+    #[test]
+    fn the_order_and_the_hidden_set_persist_in_ui_settings() {
+        use crate::settings::UiSettings;
+        let settings = UiSettings {
+            accounts_provider_order: AccountsProviderOrder(vec![
+                AccountsProvider::ApiKeys,
+                AccountsProvider::Codex,
+                AccountsProvider::ClaudeCode,
+                AccountsProvider::Kimi,
+                AccountsProvider::Cursor,
+            ]),
+            accounts_hidden_providers: Some(vec![AccountsProvider::Cursor]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            value["accountsProviderOrder"],
+            serde_json::json!(["apiKeys", "codex", "claudeCode", "kimi", "cursor"])
+        );
+        assert_eq!(
+            value["accountsHiddenProviders"],
+            serde_json::json!(["cursor"])
+        );
+        let restored: UiSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, settings);
+
+        // A file written before the setting existed keeps the canonical order
+        // and leaves visibility undecided, so detection may still seed it.
+        let old: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(old.accounts_provider_order, AccountsProviderOrder::default());
+        assert_eq!(old.accounts_hidden_providers, None);
+        // A hand-edited file that names a section twice, or forgets one,
+        // still renders every section exactly once.
+        let patchy: UiSettings = serde_json::from_str(
+            r#"{"accountsProviderOrder":["kimi","kimi","apiKeys"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            patchy.clamped().accounts_provider_order.0,
+            vec![
+                AccountsProvider::Kimi,
+                AccountsProvider::ApiKeys,
+                AccountsProvider::ClaudeCode,
+                AccountsProvider::Codex,
+                AccountsProvider::Cursor,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_add_menu_names_its_destination_for_every_section() {
+        // One action per section, each naming where it lands - the sections
+        // carry no Add button of their own any more.
+        assert_eq!(
+            add_menu_label(AccountsProvider::ClaudeCode),
+            "Add Claude Code account"
+        );
+        assert_eq!(add_menu_label(AccountsProvider::Codex), "Add Codex account");
+        assert_eq!(
+            add_menu_label(AccountsProvider::Cursor),
+            "Add Cursor account"
+        );
+        assert_eq!(add_menu_label(AccountsProvider::Kimi), "Sign in with Kimi");
+        assert_eq!(add_menu_label(AccountsProvider::ApiKeys), "Add API key");
+        for provider in AccountsProvider::ALL {
+            // No emoji, no trailing punctuation, and a real brand mark.
+            assert!(add_menu_label(provider).is_ascii());
+            assert!(crate::icons::Assets
+                .load(section_mark(provider).0)
+                .unwrap()
+                .is_some());
+        }
+        // Every CLI section maps to the harness it signs in, and names the
+        // command its empty state points at.
+        assert_eq!(
+            provider_harness(AccountsProvider::Cursor),
+            Some(HarnessId::Cursor)
+        );
+        assert_eq!(provider_harness(AccountsProvider::ApiKeys), None);
+        assert_eq!(provider_cli(AccountsProvider::Kimi), "kimi");
+        assert_eq!(provider_cli(AccountsProvider::Cursor), "cursor-agent");
     }
 
     #[test]

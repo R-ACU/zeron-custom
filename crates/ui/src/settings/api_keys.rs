@@ -71,17 +71,25 @@ pub fn key_page_url(provider: ApiKeyProvider) -> &'static str {
     }
 }
 
-/// The brand mark for a provider row. The embedded icon set only carries the
-/// harness marks, so providers without one fall back to the key glyph (and the
-/// custom base URL to the globe — it is an address, not a credential).
+/// The brand mark for a provider row. Every provider carries its own vendor
+/// mark now (`brand-*` in the icon set, plus the harness marks zeron already
+/// embedded), so a row is recognisable before its label is read.
 pub fn provider_icon(provider: ApiKeyProvider) -> &'static str {
     match provider {
         ApiKeyProvider::Anthropic => crate::icons::CLAUDE_MARK,
         ApiKeyProvider::Openai => crate::icons::OPENAI_MARK,
+        // xAI ships no single-colour mark of its own; the Grok glyph is the
+        // company's own artwork and the one its console wears.
         ApiKeyProvider::Xai => crate::icons::GROK_MARK,
         ApiKeyProvider::Moonshot => crate::icons::KIMI_MARK,
-        ApiKeyProvider::OllamaCompatible => crate::icons::GLOBE,
-        _ => crate::icons::KEY_MINIMALISTIC,
+        ApiKeyProvider::Openrouter => crate::icons::BRAND_OPENROUTER,
+        ApiKeyProvider::Deepseek => crate::icons::BRAND_DEEPSEEK,
+        ApiKeyProvider::Groq => crate::icons::BRAND_GROQ,
+        ApiKeyProvider::Google => crate::icons::BRAND_GOOGLE_GEMINI,
+        ApiKeyProvider::Mistral => crate::icons::BRAND_MISTRAL,
+        ApiKeyProvider::Fireworks => crate::icons::BRAND_FIREWORKS,
+        ApiKeyProvider::Together => crate::icons::BRAND_TOGETHER,
+        ApiKeyProvider::OllamaCompatible => crate::icons::BRAND_OLLAMA,
     }
 }
 
@@ -187,6 +195,16 @@ impl ApiKeysSection {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.load(cx);
+    }
+
+    /// Put the caret in the key field — the landing spot for the page header's
+    /// "Add API key". Revealing the field first is what makes the focus
+    /// visible: the masked stand-in paints bullets, not a caret.
+    pub fn focus_key_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.revealed = true;
+        self.error = None;
+        window.focus(&self.key_input.focus_handle(cx), cx);
+        cx.notify();
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -721,7 +739,7 @@ impl Render for ApiKeysSection {
             });
 
         div()
-            .mt(px(24.0))
+            .mt(px(18.0))
             .flex()
             .flex_col()
             .child(
@@ -765,7 +783,7 @@ impl Render for ApiKeysSection {
             )
             .child(
                 widgets::section_card(&theme)
-                    .mt(px(8.0))
+                    .mt(px(6.0))
                     .map(|card| {
                         if empty {
                             card.child(
@@ -789,6 +807,7 @@ impl Render for ApiKeysSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AssetSource as _;
     use zeron_proto::StoredApiKey;
 
     fn stored(provider: ApiKeyProvider) -> StoredApiKey {
@@ -846,6 +865,30 @@ mod tests {
             selectable_providers(None, ApiKeyProvider::Anthropic).len(),
             ApiKeyProvider::ALL.len()
         );
+    }
+
+    #[test]
+    fn every_provider_row_wears_its_own_brand_mark() {
+        // No generic key/globe fallback: a row is identified by its logo.
+        let mut marks = Vec::new();
+        for provider in ApiKeyProvider::ALL {
+            let mark = provider_icon(provider);
+            assert_ne!(mark, crate::icons::KEY_MINIMALISTIC, "{provider:?}");
+            assert_ne!(mark, crate::icons::GLOBE, "{provider:?}");
+            assert!(
+                crate::icons::Assets
+                    .load(mark)
+                    .expect("asset source")
+                    .is_some(),
+                "{provider:?} points at an unregistered icon"
+            );
+            marks.push(mark);
+        }
+        // Each vendor gets a distinct glyph.
+        let mut unique = marks.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), marks.len(), "two providers share a mark");
     }
 
     #[test]

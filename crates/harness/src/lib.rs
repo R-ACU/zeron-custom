@@ -127,6 +127,7 @@ pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
+pub mod openrouter_pricing;
 pub mod pricing_table;
 pub mod shell_env;
 #[cfg(windows)]
@@ -144,6 +145,17 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(profile));
     }
     None
+}
+
+/// zeron's data dir — `$ZERON_DATA_DIR`, else `~/.zeron`. Mirrors the app's
+/// own resolution (`apps/zeron/src/main.rs::dirs_data_dir`), minus the 0.2.0
+/// rename migration the app performs at startup. Caches this crate writes
+/// (model catalogs, prices) live under it.
+pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("ZERON_DATA_DIR").filter(|d| !d.is_empty()) {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    home_dir().map(|home| home.join(".zeron"))
 }
 
 /// File names to try for an executable name. One name on unix; on Windows a

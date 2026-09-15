@@ -339,14 +339,28 @@ impl Harness for OpencodeHarness {
 
     /// Live discovery off `GET /provider` (what the desktop app populates its
     /// picker from), cached on success. Failures surface — the picker retries.
+    ///
+    /// models.dev prices most rows, but some OpenRouter-routed ones arrive
+    /// with no `cost` object at all; those borrow OpenRouter's own catalog.
+    /// Applied outside `models_cache` so a cold first listing that misses the
+    /// fetch is priced on the next one.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if self.base_url.is_none() {
             self.resolve_executable()?;
         }
-        self.models_cache
+        let mut models = self
+            .models_cache
             .get_or_try_init(|| self.probe_models())
             .await
-            .cloned()
+            .cloned()?;
+        if models
+            .iter()
+            .any(|m| m.pricing.is_none() && crate::openrouter_pricing::strip_route(&m.id).is_some())
+        {
+            let prices = crate::openrouter_pricing::prices().await;
+            crate::openrouter_pricing::apply(&mut models, &prices);
+        }
+        Ok(models)
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
