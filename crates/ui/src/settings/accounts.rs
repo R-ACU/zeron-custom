@@ -1,7 +1,8 @@
 //! Settings → Agents / accounts (feature-inventory §1.9): provider cards
-//! (Claude Code, Codex, Cursor) with account rows — email, plan badge, Active, usage
-//! meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
-//! the add-account dialogs (paste-code and browser-poll flows) and
+//! (Claude Code, Codex, Cursor, Kimi) with account rows — email, plan badge, Active,
+//! usage meters (indigo → amber ≥80% → red ≥95%, reset time), Switch / Forget — plus
+//! the add-account dialogs (paste-code and browser-poll flows), the stored
+//! provider API keys ([`crate::settings::api_keys`]) and
 //! account-shaped loading skeletons. Zeron retargets devices from the settings
 //! sidebar (`targetDeviceId` passthrough kept plumbed, unused single-device).
 //!
@@ -116,11 +117,33 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Kimi, "Kimi", "kimi"),
 ];
+
+/// The header action of a provider card. Claude/Codex/Cursor can capture a
+/// SECOND login into a slot and swap between them; Kimi cannot — its token set
+/// is bound to the CLI's own configuration hash, so the only thing zeron can
+/// offer is running the CLI's own sign-in. Pure.
+pub fn add_action_label(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::Kimi => "Sign in with kimi",
+        _ => "Add account",
+    }
+}
+
+/// The quiet line under an account with no usage meters. Kimi's CLI reports no
+/// rate-limit view at all, so "unavailable" would read as a failure. Pure.
+pub fn no_usage_label(harness: HarnessId, switchable: bool) -> &'static str {
+    match (harness, switchable) {
+        (HarnessId::Kimi, _) => "Signed in \u{2014} the Kimi CLI reports no usage",
+        (_, true) => "Usage unavailable",
+        (_, false) => "Credentials unavailable",
+    }
+}
 
 /// Accounts of one provider, in the engine's order (slot creation). No
 /// active-first re-sort: switching accounts must not move the switched-to
@@ -171,6 +194,7 @@ impl LoginFlow {
         match harness {
             HarnessId::Codex => "Add Codex account",
             HarnessId::Cursor => "Connect Cursor",
+            HarnessId::Kimi => "Sign in with kimi",
             _ => "Add Claude account",
         }
     }
@@ -189,6 +213,8 @@ pub struct AccountsPage {
     login: Option<LoginFlow>,
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
+    /// The stored provider API keys, rendered under the provider cards.
+    api_keys: Entity<crate::settings::api_keys::ApiKeysSection>,
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
@@ -205,6 +231,8 @@ impl AccountsPage {
                 this.submit_code(cx);
             }
         });
+        let api_keys =
+            cx.new(|cx| crate::settings::api_keys::ApiKeysSection::new(state.clone(), cx));
         let mut page = Self {
             state,
             target_device: None,
@@ -214,6 +242,7 @@ impl AccountsPage {
             login: None,
             error: None,
             code_input,
+            api_keys,
             load_task: None,
             action_task: None,
             poll_task: None,
@@ -507,7 +536,11 @@ impl AccountsPage {
                         .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(start) => {
-                        cx.open_url(&start.url);
+                        // Kimi's sign-in happens in the CLI's own console; it
+                        // hands back no URL to open.
+                        if !start.url.is_empty() {
+                            cx.open_url(&start.url);
+                        }
                         match start.mode {
                             AgentLoginMode::PasteCode => {
                                 page.code_input
@@ -893,11 +926,10 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(crate::typography::ui_rems(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        "Usage unavailable"
-                                    } else {
-                                        "Credentials unavailable"
-                                    })),
+                                    .child(SharedString::from(no_usage_label(
+                                        account.harness,
+                                        account.switchable,
+                                    ))),
                             )
                         } else {
                             el.child(
@@ -1037,6 +1069,11 @@ impl AccountsPage {
             } => {
                 let has_error = error.is_some();
                 let body = match harness {
+                    HarnessId::Kimi => {
+                        "A terminal opened running `kimi login`. Follow the device-code \
+                         prompt there — open the page it prints and enter the code it \
+                         shows. Zeron picks the new login up as soon as the CLI stores it."
+                    }
                     HarnessId::Cursor => {
                         "Finish signing in to Cursor in your browser. This mints a \
                          zeron-named API key you can revoke any time from Cursor's \
@@ -1052,12 +1089,15 @@ impl AccountsPage {
                     .flex()
                     .flex_col()
                     .child(div().mt(px(8.0)).child(popover::dialog_body(&theme, body)))
-                    .child(url_link(
-                        "login-open-url-browser",
-                        "Reopen the sign-in page",
-                        &start.url,
-                        cx,
-                    ))
+                    // Kimi's CLI owns its own console and hands back no URL.
+                    .when(!start.url.is_empty(), |el| {
+                        el.child(url_link(
+                            "login-open-url-browser",
+                            "Reopen the sign-in page",
+                            &start.url,
+                            cx,
+                        ))
+                    })
                     .when(!has_error, |el| {
                         el.child(
                             div()
@@ -1251,6 +1291,7 @@ impl Render for AccountsPage {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
                         HarnessId::Cursor => "accounts-skeleton-cursor",
+                        HarnessId::Kimi => "accounts-skeleton-kimi",
                         _ => "accounts-skeleton-claude",
                     };
                     div()
@@ -1337,6 +1378,7 @@ impl Render for AccountsPage {
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
                         let card = widgets::section_card(&theme).mt(px(8.0));
+                        let action_label = add_action_label(harness);
                         let empty_copy = match harness {
                             // Cursor's app login is SEPARATE from `cursor-agent
                             // login` — pointing at the CLI would send users to a
@@ -1394,7 +1436,7 @@ impl Render for AccountsPage {
                                                     .size(px(16.0))
                                                     .text_color(theme.text_muted),
                                             )
-                                            .child(SharedString::from("Add account")),
+                                            .child(SharedString::from(action_label)),
                                     ),
                             )
                             .children(
@@ -1447,7 +1489,8 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code, Codex, and Cursor logins on this device. Zeron \
+                        "The Claude Code, Codex, Cursor, and Kimi logins on this device, plus \
+                         the provider API keys zeron passes to every agent it starts. Zeron \
                          detects the live session, keeps each account backed up, and can \
                          swap between them.",
                     ))
@@ -1463,6 +1506,7 @@ impl Render for AccountsPage {
                         )
                     })
                     .children(sections)
+                    .child(self.api_keys.clone())
                     // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
                     // text-muted-foreground/60`).
                     .child(
@@ -1501,6 +1545,29 @@ mod tests {
         assert!(force_usage_for(LoadTrigger::PostLogin));
         // Switch/Forget re-lists ride the still-warm 60s cache.
         assert!(!force_usage_for(LoadTrigger::PostAction));
+    }
+
+    #[test]
+    fn kimi_is_a_read_only_provider_card() {
+        // Its token set is bound to the CLI's configuration hash, so the card
+        // offers the CLI's own sign-in, not "add a second account".
+        assert_eq!(add_action_label(HarnessId::Kimi), "Sign in with kimi");
+        assert_eq!(add_action_label(HarnessId::ClaudeCode), "Add account");
+        assert_eq!(add_action_label(HarnessId::Codex), "Add account");
+        // "Credentials unavailable" would read as a failure for a login that
+        // is perfectly fine and simply reports no quota.
+        assert_eq!(
+            no_usage_label(HarnessId::Kimi, false),
+            "Signed in \u{2014} the Kimi CLI reports no usage"
+        );
+        assert_eq!(no_usage_label(HarnessId::Codex, true), "Usage unavailable");
+        assert_eq!(
+            no_usage_label(HarnessId::ClaudeCode, false),
+            "Credentials unavailable"
+        );
+        // Kimi has a card of its own, after the three swappable providers.
+        assert_eq!(PROVIDERS[3].0, HarnessId::Kimi);
+        assert_eq!(PROVIDERS[3].2, "kimi");
     }
 
     #[test]

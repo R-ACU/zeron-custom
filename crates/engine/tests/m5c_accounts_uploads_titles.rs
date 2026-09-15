@@ -36,6 +36,7 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
         cursor_sdk_auth_file: root.join("cursor-sdk").join("auth.json"),
+        kimi_dir: root.join("kimi-code"),
     };
     (AgentAccounts::new(config.clone()), config)
 }

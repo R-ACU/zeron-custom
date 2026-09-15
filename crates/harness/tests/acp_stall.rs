@@ -41,6 +41,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
             rx
         }),
         steering: steer_rx,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Bypass).1,
         interrupt: token.clone(),
     };
     let request = RunRequest {

@@ -181,10 +181,16 @@ mod windows {
         #[test]
         fn machine_path_comes_before_user_path() {
             assert_eq!(
-                join_paths(Some(r"C:\Windows;"), Some(r"C:\Users\x\AppData\Roaming\npm")),
+                join_paths(
+                    Some(r"C:\Windows;"),
+                    Some(r"C:\Users\x\AppData\Roaming\npm")
+                ),
                 Some(r"C:\Windows;C:\Users\x\AppData\Roaming\npm".to_owned())
             );
-            assert_eq!(join_paths(None, Some(r"C:\tools")), Some(r"C:\tools".to_owned()));
+            assert_eq!(
+                join_paths(None, Some(r"C:\tools")),
+                Some(r"C:\tools".to_owned())
+            );
             assert_eq!(join_paths(Some(""), None), None);
             assert_eq!(join_paths(None, None), None);
         }

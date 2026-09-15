@@ -30,8 +30,8 @@ use zeron_doc::{
 };
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UsageTotals,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -55,7 +55,46 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
-type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+/// Parked `request_input` calls: request id -> (resolver, the questions it
+/// asked). The questions ride along so a permission-mode change can answer
+/// the TOOL-PERMISSION ones (those with an `allow_label`) without a second
+/// round trip to the harness — see [`Sessions::set_permission_mode`].
+type PendingInputs = Arc<
+    Mutex<
+        HashMap<
+            String,
+            (
+                oneshot::Sender<Vec<UserInputAnswer>>,
+                Vec<UserInputQuestion>,
+            ),
+        >,
+    >,
+>;
+
+/// The answers that clear every parked TOOL-PERMISSION question: each
+/// question that carries an `allow_label` is answered with it. A request
+/// whose questions are all content questions is left alone, so a mode change
+/// can never put words in the user's mouth.
+fn auto_answers(pending: &PendingInputs) -> Vec<(String, Vec<UserInputAnswer>)> {
+    lock(pending)
+        .iter()
+        .filter_map(|(request_id, (_, questions))| {
+            if !questions.iter().any(|q| q.allow_label.is_some()) {
+                return None;
+            }
+            let answers = questions
+                .iter()
+                .filter_map(|q| {
+                    Some(UserInputAnswer {
+                        question_id: q.id.clone(),
+                        labels: vec![q.allow_label.clone()?],
+                    })
+                })
+                .collect();
+            Some((request_id.clone(), answers))
+        })
+        .collect()
+}
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -115,6 +154,10 @@ struct RunHandle {
     /// ignores its token can never strand the run.
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
+    /// The live permission mode handed to the harness. Updated in place by
+    /// [`Sessions::set_permission_mode`] so a chip move mid-run reaches the
+    /// running process instead of waiting for the next fresh run.
+    permission: watch::Sender<zeron_proto::PermissionMode>,
     pending_inputs: PendingInputs,
     /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
     /// event — the at-least-once ledger. A run can die with accepted steers
@@ -160,6 +203,12 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// chat_id → cumulative reported token usage, folded from the harnesses'
+    /// `Usage` passthrough. PROCESS-LOCAL and never persisted: the composer's
+    /// session cost chip is an estimate for THIS run of the app and starts at
+    /// zero again after a restart (the events themselves are explicitly
+    /// non-persisted, so there is nothing durable to rebuild it from).
+    usage: Mutex<HashMap<String, UsageTotals>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -195,6 +244,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                usage: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -248,6 +298,13 @@ impl SessionsEngine {
 
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
         lock(&self.inner.statuses).get(chat_id).cloned()
+    }
+
+    /// Cumulative reported token usage for this chat since the engine started.
+    /// `None` until the harness has reported any — the composer then shows no
+    /// cost chip rather than a misleading "$0.00".
+    pub fn usage_totals(&self, chat_id: &str) -> Option<UsageTotals> {
+        lock(&self.inner.usage).get(chat_id).copied()
     }
 
     /// Whether this harness takes a prompt *during* a turn, rather than only at
@@ -460,7 +517,7 @@ impl SessionsEngine {
             Box::new(move |questions: Vec<UserInputQuestion>| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), tx);
+                lock(&pending).insert(request_id.clone(), (tx, questions.clone()));
                 let _ = engine_tx.send(AgentEvent::InputRequested {
                     request_id,
                     questions,
@@ -469,9 +526,11 @@ impl SessionsEngine {
             })
         };
         let interrupt_token = CancellationToken::new();
+        let (permission_tx, permission_rx) = watch::channel(request.permission_mode());
         let controls = RunControls {
             request_input,
             steering: steer_rx,
+            permission: permission_rx,
             interrupt: interrupt_token.clone(),
         };
 
@@ -485,6 +544,7 @@ impl SessionsEngine {
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
+                permission: permission_tx,
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
@@ -606,7 +666,7 @@ impl SessionsEngine {
         };
         // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
+        let parked: Vec<_> = lock(&pending).drain().map(|(_, (tx, _))| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
@@ -625,6 +685,58 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Apply a permission-mode change to the LIVE run of a chat, if any.
+    ///
+    /// Three things happen, in this order:
+    /// 1. the run's remembered configuration is updated, so the next steered
+    ///    prompt still routes into this process instead of being treated as a
+    ///    configuration change that warrants a restart;
+    /// 2. the harness's watch channel is updated, so the adapter can push the
+    ///    change down its own wire (claude sends `set_permission_mode`) and
+    ///    stops gating what the new mode allows;
+    /// 3. if the new mode approves everything, every TOOL-PERMISSION question
+    ///    still parked on this run is answered with its allow label through
+    ///    the ordinary `respond_input` path — the agent unblocks and the
+    ///    question panel clears. Content questions are never auto-answered,
+    ///    and narrowing the mode never retroactively changes anything.
+    ///
+    /// Returns `false` when the chat has no live run (nothing to apply: the
+    /// next run reads the pick from the request).
+    pub fn set_permission_mode(
+        &self,
+        chat_id: &str,
+        mode: zeron_proto::PermissionMode,
+    ) -> Result<bool, EngineError> {
+        let pending = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(handle) = runs.get_mut(chat_id) else {
+                return Ok(false);
+            };
+            handle.runtime_config.permission = mode;
+            let _ = handle.permission.send(mode);
+            handle.pending_inputs.clone()
+        };
+        // The stored request is what an auto-resume or a queued send replays.
+        if let Some(request) = lock(&self.inner.last_requests).get_mut(chat_id) {
+            request.set_permission_mode(mode);
+        }
+        let mut cleared = 0usize;
+        if mode.auto_approves() {
+            for (request_id, answers) in auto_answers(&pending) {
+                if self.respond_input(chat_id, &request_id, answers)? {
+                    cleared += 1;
+                }
+            }
+        }
+        tracing::info!(
+            chat = %chat_id,
+            mode = ?mode,
+            cleared,
+            "permission mode applied to the live run"
+        );
+        Ok(true)
+    }
+
     /// Resolve a pending `request_input` question set. Returns `false` when no such
     /// request is pending (unknown id, or the run already settled).
     pub fn respond_input(
@@ -639,7 +751,7 @@ impl SessionsEngine {
         let Some((pending, engine_tx)) = target else {
             return Ok(false);
         };
-        let Some(resolver) = lock(&pending).remove(request_id) else {
+        let Some((resolver, _questions)) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
         let _ = resolver.send(answers);
@@ -1826,6 +1938,21 @@ async fn drive_run(
                 continue;
             }
         }
+        // Billing usage is a pure passthrough: it never lands in the doc (it
+        // would replicate to every device and outlive the process) and it must
+        // not reopen a parked turn, so it is folded into the process-local
+        // running total here and dropped, exactly like ContextUsage below.
+        if let AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } = &event
+        {
+            lock(&inner.usage)
+                .entry(chat_id.clone())
+                .or_default()
+                .add(*input_tokens, *output_tokens);
+            continue;
+        }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
@@ -1899,7 +2026,7 @@ async fn drive_run(
                         let resolver = lock(&inner.runs)
                             .get(&chat_id)
                             .and_then(|h| lock(&h.pending_inputs).remove(request_id));
-                        if let Some(tx) = resolver {
+                        if let Some((tx, _)) = resolver {
                             let _ = tx.send(Vec::new());
                         }
                         tracing::debug!(chat = %chat_id, "parked session: post-turn input request auto-declined");
@@ -2100,7 +2227,7 @@ async fn drive_run(
                 .filter(|h| h.run_id == run_id)
                 .map(|h| h.pending_inputs.clone());
             if let Some(pending) = pending {
-                for (_, tx) in lock(&pending).drain() {
+                for (_, (tx, _)) in lock(&pending).drain() {
                     let _ = tx.send(Vec::new());
                 }
             }
@@ -2267,9 +2394,71 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeConfig, subagent_doc_id};
-    use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+    use super::{PendingInputs, RuntimeConfig, auto_answers, subagent_doc_id};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use zeron_proto::{HarnessId, RunRequest, SandboxLevel, UserInputQuestion};
 
+    fn question(id: &str, allow: Option<&str>) -> UserInputQuestion {
+        UserInputQuestion {
+            id: id.into(),
+            header: "h".into(),
+            question: "q".into(),
+            options: vec!["Yes".into(), "No".into()],
+            multi_select: false,
+            allow_label: allow.map(str::to_owned),
+        }
+    }
+
+    fn pending(entries: Vec<(&str, Vec<UserInputQuestion>)>) -> PendingInputs {
+        let mut map = HashMap::new();
+        for (request_id, questions) in entries {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // The receiver must outlive the map or the sender reads as closed.
+            std::mem::forget(rx);
+            map.insert(request_id.to_string(), (tx, questions));
+        }
+        Arc::new(Mutex::new(map))
+    }
+
+    #[test]
+    fn a_bypass_switch_answers_only_the_parked_permission_questions() {
+        let pending = pending(vec![
+            ("req-perm", vec![question("q1", Some("Yes"))]),
+            // A tool's own content question: the user still has to answer it.
+            ("req-content", vec![question("q2", None)]),
+        ]);
+        let answers = auto_answers(&pending);
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        let (request_id, answers) = &answers[0];
+        assert_eq!(request_id, "req-perm");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].question_id, "q1");
+        assert_eq!(answers[0].labels, vec!["Yes".to_string()]);
+    }
+
+    #[test]
+    fn a_request_with_nothing_to_approve_is_left_alone() {
+        let pending = pending(vec![(
+            "req",
+            vec![question("q", None), question("q2", None)],
+        )]);
+        assert!(auto_answers(&pending).is_empty());
+    }
+
+    #[test]
+    fn a_permission_mode_change_is_part_of_the_runtime_configuration() {
+        // A mode change alone must not look like a routable configuration: the
+        // engine updates the live handle in place (set_permission_mode) rather
+        // than restarting, and `can_route` is what tells the two apart.
+        let mut initial = request();
+        initial.set_permission_mode(zeron_proto::PermissionMode::Ask);
+        let config = RuntimeConfig::from_request(HarnessId::Grok, &initial);
+        assert!(config.can_route(HarnessId::Grok, &initial));
+        let mut changed = initial.clone();
+        changed.set_permission_mode(zeron_proto::PermissionMode::Bypass);
+        assert!(!config.can_route(HarnessId::Grok, &changed));
+    }
     fn request() -> RunRequest {
         RunRequest {
             prompt: "first".into(),

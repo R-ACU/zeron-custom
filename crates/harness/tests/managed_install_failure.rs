@@ -43,6 +43,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     let controls = RunControls {
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Bypass).1,
         interrupt: CancellationToken::new(),
     };
     let request = RunRequest {

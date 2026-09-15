@@ -220,6 +220,7 @@ fn grok_spec() -> AcpAgentSpec {
                     ReasoningLevel::High,
                 ],
                 options: Vec::new(),
+                pricing: None,
             }]
         },
         // No `_session/steering` extension: steers deliver at turn boundaries.
@@ -285,6 +286,7 @@ fn devin_spec() -> AcpAgentSpec {
                     description: Some("Devin's default coding model".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    pricing: None,
                 },
                 Model {
                     id: "claude-fable-5-1-high".into(),
@@ -292,6 +294,7 @@ fn devin_spec() -> AcpAgentSpec {
                     description: Some("Anthropic's frontier model through Devin".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    pricing: None,
                 },
                 Model {
                     id: "adaptive".into(),
@@ -299,6 +302,7 @@ fn devin_spec() -> AcpAgentSpec {
                     description: Some("Devin picks the model per request".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    pricing: None,
                 },
             ]
         },
@@ -356,6 +360,7 @@ fn hermes_spec() -> AcpAgentSpec {
                     description: Some("Nous Research's hybrid-reasoning flagship".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    pricing: None,
                 },
                 Model {
                     id: "hermes-4-70b".into(),
@@ -363,6 +368,7 @@ fn hermes_spec() -> AcpAgentSpec {
                     description: Some("Faster Hermes 4 — same post-training, 70B".into()),
                     reasoning_levels: Vec::new(),
                     options: Vec::new(),
+                    pricing: None,
                 },
             ]
         },
@@ -413,6 +419,7 @@ fn pi_spec() -> AcpAgentSpec {
                     ReasoningLevel::Max,
                 ],
                 options: Vec::new(),
+                pricing: None,
             }]
         },
         // The adapter has no `_session/steering` extension: turn boundaries.
@@ -479,6 +486,7 @@ fn kimi_spec() -> AcpAgentSpec {
                         ReasoningLevel::Max,
                     ],
                     options: Vec::new(),
+                    pricing: crate::pricing_table::kimi_pricing("kimi-code/k3-256k"),
                 },
                 Model {
                     id: "kimi-code/k3".into(),
@@ -490,6 +498,7 @@ fn kimi_spec() -> AcpAgentSpec {
                         ReasoningLevel::Max,
                     ],
                     options: Vec::new(),
+                    pricing: crate::pricing_table::kimi_pricing("kimi-code/k3"),
                 },
                 Model {
                     id: "kimi-code/kimi-for-coding".into(),
@@ -501,6 +510,7 @@ fn kimi_spec() -> AcpAgentSpec {
                         ReasoningLevel::Max,
                     ],
                     options: Vec::new(),
+                    pricing: crate::pricing_table::kimi_pricing("kimi-code/kimi-for-coding"),
                 },
                 Model {
                     id: "kimi-code/kimi-for-coding-highspeed".into(),
@@ -512,6 +522,9 @@ fn kimi_spec() -> AcpAgentSpec {
                         ReasoningLevel::Max,
                     ],
                     options: Vec::new(),
+                    pricing: crate::pricing_table::kimi_pricing(
+                        "kimi-code/kimi-for-coding-highspeed",
+                    ),
                 },
             ]
         },
@@ -1044,6 +1057,9 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 None => ladder.clone(),
             },
             options,
+            // The ACP wire carries no prices; the static catalog row (exact
+            // id or family alias) is the only source we have.
+            pricing: known.and_then(|m| m.pricing.clone()),
         }
     };
 
@@ -1527,6 +1543,52 @@ fn first_class_model_change(
     Ok(Some(requested.to_owned()))
 }
 
+/// The agent's own permission-mode option, remembered from the session
+/// response so a mid-session change can be pushed without re-reading it:
+/// the `configId` to set, and the values it advertises.
+#[derive(Debug, Clone)]
+struct ModeOption {
+    config_id: String,
+    values: Vec<String>,
+}
+
+/// Find the `category: "mode"` select in a session response, if the agent
+/// advertises one (claude-agent-acp, codex-acp, Kimi, Devin do; a plain ACP
+/// agent may not).
+fn mode_config_option(session_response: &Value) -> Option<ModeOption> {
+    let options = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)?;
+    options.iter().find_map(|option| {
+        if option.get("category").and_then(Value::as_str) != Some("mode")
+            || option.get("type").and_then(Value::as_str) != Some("select")
+        {
+            return None;
+        }
+        Some(ModeOption {
+            config_id: option.get("id").and_then(Value::as_str)?.to_owned(),
+            values: option
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|o| o.get("value").and_then(Value::as_str).map(str::to_owned))
+                .collect(),
+        })
+    })
+}
+
+impl ModeOption {
+    /// The value to set for a permission mode, if this agent advertises one.
+    fn value_for(&self, mode: PermissionMode) -> Option<&str> {
+        permission_mode_values(mode)
+            .iter()
+            .find(|v| self.values.iter().any(|a| a == *v))
+            .copied()
+    }
+}
+
 /// The agent `mode` values one permission mode is willing to select, best
 /// first. Empty for [`PermissionMode::Ask`]: asking IS every ACP agent's
 /// default, so the option is left untouched — and a mode whose candidates an
@@ -1538,9 +1600,13 @@ pub(crate) fn permission_mode_values(mode: PermissionMode) -> &'static [&'static
         PermissionMode::Ask => &[],
         // claude-agent-acp `acceptEdits`; nothing else advertises a
         // dedicated one, so those agents stay on their default.
-        PermissionMode::AutoEdits => {
-            &["acceptEdits", "accept_edits", "accept-edits", "autoEdit", "auto-edit"]
-        }
+        PermissionMode::AutoEdits => &[
+            "acceptEdits",
+            "accept_edits",
+            "accept-edits",
+            "autoEdit",
+            "auto-edit",
+        ],
         // Kimi and codex-acp both call their unattended-but-sandboxed mode
         // `auto`; claude-agent-acp has none, so it lands on acceptEdits.
         PermissionMode::Auto => &["auto", "acceptEdits", "accept_edits", "accept-edits"],
@@ -1902,6 +1968,7 @@ fn handle_server_request_live(
         },
         options: names.clone(),
         multi_select: false,
+        allow_label: None,
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
@@ -2062,11 +2129,15 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        permission: mut permission_rx,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
-    // The run's permission pick: read once, before `request` is consumed
-    // piecemeal below, so every approval path agrees on it.
-    let permission = request.permission_mode();
+    // The run's permission pick as of NOW. `permission_rx` keeps feeding it:
+    // moving the composer's Permissions chip while this session is alive
+    // re-sends the agent's own `mode` config option (below) instead of
+    // waiting for the next run.
+    let mut permission = *permission_rx.borrow_and_update();
+    let mut permission_open = true;
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
@@ -2203,13 +2274,18 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
+        // Remember the agent's own mode option so a later chip move can be
+        // pushed down the same wire (`session/set_config_option`) — ACP has
+        // no dedicated permission call, the mode IS a config option.
+        let mode_option = mode_config_option(&options_snapshot);
+        Ok::<(String, bool, Vec<SlashCommand>, Option<ModeOption>), HarnessError>((
             session_id,
             steer_ext,
             init_commands,
+            mode_option,
         ))
     };
-    let (session_id, steer_ext, init_commands) = tokio::select! {
+    let (session_id, steer_ext, init_commands, mode_option) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -2399,6 +2475,49 @@ async fn run_session(session: Session) {
 
     'main: loop {
         tokio::select! {
+            // The Permissions chip moved while this session is alive. ACP has
+            // no dedicated permission call, so the live change IS the agent's
+            // own mode option: re-send it when the agent advertises a value
+            // for the new mode, and judge every later permission request
+            // against it either way. An agent with no matching value keeps
+            // asking, which is what the fallback rules say anyway.
+            changed = permission_rx.changed(), if permission_open => {
+                if changed.is_err() {
+                    permission_open = false;
+                } else {
+                    let next = *permission_rx.borrow_and_update();
+                    if next != permission {
+                        permission = next;
+                        if let Some(value) = mode_option
+                            .as_ref()
+                            .and_then(|option| option.value_for(next).map(|v| (option.config_id.clone(), v.to_owned())))
+                        {
+                            let (config_id, value) = value;
+                            let client = client.clone();
+                            let session_id = session_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = client
+                                    .request(
+                                        "session/set_config_option",
+                                        json!({
+                                            "sessionId": session_id,
+                                            "configId": config_id,
+                                            "value": value,
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        target: "zeron_harness::acp",
+                                        "live mode switch to {value} rejected: {e}"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
             res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
                 turn = None;
                 starve_deadline = None;
@@ -3239,7 +3358,13 @@ mod tests {
         // Model switch + effort preference list; fastMode untouched without a
         // model-option selection.
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["medium"], &no_opts, PermissionMode::Bypass),
+            config_option_sets(
+                &response,
+                Some("claude-opus-5"),
+                &["medium"],
+                &no_opts,
+                PermissionMode::Bypass
+            ),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5" })),
                 ("effort".to_owned(), json!({ "value": "medium" })),
@@ -3247,7 +3372,13 @@ mod tests {
         );
         // Effort preference order: first ADVERTISED candidate wins.
         assert_eq!(
-            config_option_sets(&response, None, &["xhigh", "max"], &no_opts, PermissionMode::Bypass),
+            config_option_sets(
+                &response,
+                None,
+                &["xhigh", "max"],
+                &no_opts,
+                PermissionMode::Bypass
+            ),
             vec![("effort".to_owned(), json!({ "value": "max" }))]
         );
         // contextWindow=1m composes the [1m] model id; fastMode=on matches the
@@ -3256,7 +3387,13 @@ mod tests {
         opts.insert("contextWindow".into(), json!("1m"));
         opts.insert("fastMode".into(), json!("on"));
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts, PermissionMode::Bypass),
+            config_option_sets(
+                &response,
+                Some("claude-opus-5"),
+                &["high"],
+                &opts,
+                PermissionMode::Bypass
+            ),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5[1m]" })),
                 (
@@ -3267,16 +3404,34 @@ mod tests {
         );
         // Already-current values and unadvertised models set nothing.
         assert_eq!(
-            config_option_sets(&response, Some("claude-sonnet-5"), &["high"], &no_opts, PermissionMode::Bypass),
+            config_option_sets(
+                &response,
+                Some("claude-sonnet-5"),
+                &["high"],
+                &no_opts,
+                PermissionMode::Bypass
+            ),
             Vec::new()
         );
         assert_eq!(
-            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts, PermissionMode::Bypass),
+            config_option_sets(
+                &response,
+                Some("gpt-5.6-sol"),
+                &[],
+                &no_opts,
+                PermissionMode::Bypass
+            ),
             Vec::new()
         );
         // No configOptions advertised → nothing to set.
         assert_eq!(
-            config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts, PermissionMode::Auto),
+            config_option_sets(
+                &json!({"sessionId": "s"}),
+                Some("x"),
+                &["high"],
+                &no_opts,
+                PermissionMode::Auto
+            ),
             Vec::new()
         );
     }
@@ -3637,10 +3792,7 @@ mod tests {
         let no_opts = serde_json::Map::new();
         assert_eq!(
             config_option_sets(&claude, None, &[], &no_opts, PermissionMode::Bypass),
-            vec![(
-                "mode".to_string(),
-                json!({ "value": "bypassPermissions" })
-            )]
+            vec![("mode".to_string(), json!({ "value": "bypassPermissions" }))]
         );
         assert_eq!(
             config_option_sets(&claude, None, &[], &no_opts, PermissionMode::AutoEdits),
@@ -3652,9 +3804,7 @@ mod tests {
             vec![("mode".to_string(), json!({ "value": "acceptEdits" }))]
         );
         // Ask leaves the option untouched — asking is the agent default.
-        assert!(
-            config_option_sets(&claude, None, &[], &no_opts, PermissionMode::Ask).is_empty()
-        );
+        assert!(config_option_sets(&claude, None, &[], &no_opts, PermissionMode::Ask).is_empty());
 
         // Kimi: default/plan/auto/yolo.
         let kimi = json!({

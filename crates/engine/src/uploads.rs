@@ -499,9 +499,14 @@ mod tests {
         assert!(racing.exists(), "fresh empty staging dir was reclaimed");
 
         let stale = std::time::SystemTime::now() - (STAGING_TTL + Duration::from_secs(60));
-        open_directory_for_mtime(&racing).set_modified(stale).unwrap();
+        open_directory_for_mtime(&racing)
+            .set_modified(stale)
+            .unwrap();
         uploads.append("upload-other", "aGk=", Some(0)).unwrap();
-        assert!(!racing.exists(), "abandoned empty staging dir must be swept");
+        assert!(
+            !racing.exists(),
+            "abandoned empty staging dir must be swept"
+        );
     }
 
     #[test]

@@ -54,6 +54,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
             rx
         }),
         steering: steer_rx,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Bypass).1,
         interrupt: token.clone(),
     };
     (controls, steer_tx, token)

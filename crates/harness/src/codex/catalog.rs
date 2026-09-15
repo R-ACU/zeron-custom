@@ -124,6 +124,9 @@ fn model(
         description: (!description.is_empty()).then(|| description.into()),
         reasoning_levels: ladder.to_vec(),
         options,
+        // OpenAI API list prices; Codex on a ChatGPT plan is not billed per
+        // token. Ids the pricing page does not carry resolve to `None`.
+        pricing: crate::pricing_table::codex_pricing(id),
     }
 }
 

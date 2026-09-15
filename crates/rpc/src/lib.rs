@@ -50,6 +50,12 @@ pub mod methods {
     /// executing, so the doc row arriving later dedupes to a no-op —
     /// exactly-once by construction. Params `{chatId, entry}`.
     pub const RELAY_COMMAND: &str = "RelayCommand";
+    /// Apply the composer's Permissions pick to a chat's LIVE run, so a mode
+    /// change takes effect on the running agent process instead of only on
+    /// the next fresh run. `{ chatId, permission }` -> `{ applied }`
+    /// (`applied: false` = no live run, nothing to do — the next run reads
+    /// the pick from its request). IPC-only, like the other live controls.
+    pub const SET_PERMISSION_MODE: &str = "SetPermissionMode";
     /// User-driven delivery retry for a chat with unadopted queued sends:
     /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
     /// per pending command. Params `{chatId}`; IPC-only.
@@ -179,6 +185,16 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    // Provider API keys (device-local, IPC-only like `LocalDevice`): the keys
+    // live in the engine's own data dir and are exported into its process
+    // environment, so they are only meaningful on the engine you are directly
+    // connected to. `ListApiKeys` replies with MASKED values; the plaintext
+    // key travels exactly once, as `SetApiKey`'s `key` param.
+    pub const LIST_API_KEYS: &str = "ListApiKeys";
+    /// `{ provider, key }` -> the fresh masked `ApiKeysSnapshot`.
+    pub const SET_API_KEY: &str = "SetApiKey";
+    /// `{ provider }` -> the fresh masked `ApiKeysSnapshot`.
+    pub const REMOVE_API_KEY: &str = "RemoveApiKey";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";

@@ -39,6 +39,8 @@ async fn main() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        // Probes run unattended: a fixed, never-changing mode.
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::default()).1,
     };
     // Optional second arg overrides the prompt (e.g. the mock rig's
     // "TWO subagents" variant exercising concurrent binding).

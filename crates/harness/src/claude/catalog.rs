@@ -138,6 +138,10 @@ fn model(
         description: (!description.is_empty()).then(|| description.into()),
         reasoning_levels: ladder.to_vec(),
         options,
+        // Anthropic API list prices. Claude Code driven from a Claude
+        // subscription is NOT billed per token, so the picker labels these
+        // "list price" and the composer shows no session cost for them.
+        pricing: crate::pricing_table::claude_pricing(id),
     }
 }
 

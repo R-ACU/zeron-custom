@@ -15,6 +15,7 @@ use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod api_keys;
 pub mod appearance;
 pub mod archived;
 pub mod composer;

@@ -409,6 +409,10 @@ impl ClaudeHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
+        // The live-mode channel, taken before `controls` is moved into the
+        // session below. A title run is spawned with the mode it was given
+        // and ignores later changes (it has no tools anyway).
+        let controls_permission = controls.permission.clone();
         let mut cmd = self.build_command(&exe, &request);
         if title_only {
             cmd.args([
@@ -470,7 +474,7 @@ impl ClaudeHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             title_only,
-            permission: request.permission_mode(),
+            permission: controls_permission,
             child,
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
@@ -595,9 +599,10 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 
 struct Session {
     title_only: bool,
-    /// The run's permission pick — decides whether a gated tool is allowed
-    /// outright or turned into a question.
-    permission: PermissionMode,
+    /// The chat's LIVE permission mode: decides whether a gated tool is
+    /// allowed outright or turned into a question, and a change while the
+    /// process runs is pushed to the CLI as `set_permission_mode`.
+    permission: tokio::sync::watch::Receiver<PermissionMode>,
     child: Child,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
@@ -615,7 +620,7 @@ struct Session {
 async fn run_session(session: Session) {
     let Session {
         title_only,
-        permission,
+        permission: mut permission_rx,
         mut child,
         mut stdout_lines,
         stdin_tx,
@@ -630,8 +635,14 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        permission: _live_permission,
     } = controls;
     let request_input = Arc::new(request_input);
+    // The mode every gated tool is judged against this instant. Kept beside
+    // the watch receiver so the hot path never borrows the channel.
+    let mut permission = *permission_rx.borrow_and_update();
+
+    let mut permission_open = true;
 
     let mut norm = Normalizer::new();
     let mut steering_open = true;
@@ -692,6 +703,31 @@ async fn run_session(session: Session) {
                     break 'main;
                 }
             },
+
+            // The chip moved while this process is alive: tell the CLI, so
+            // the change applies to THIS session instead of the next one.
+            // `set_permission_mode` is the CLI's own stream-json control
+            // request (present in 2.1.272's bundle; the SDK exposes it as
+            // `setPermissionMode`). Whatever the CLI still gates afterwards
+            // is judged against the new `permission` below.
+            changed = permission_rx.changed(), if permission_open && !title_only => {
+                if changed.is_err() {
+                    // Sender gone (the run is tearing down): retire the arm
+                    // rather than spinning on a closed channel.
+                    permission_open = false;
+                    continue;
+                }
+                let next = *permission_rx.borrow_and_update();
+                if next != permission {
+                    permission = next;
+                    let line = wire::set_permission_mode_line(cli_permission_mode(next));
+                    let _ = stdin_tx.send(StdinMsg::Line(line));
+                    tracing::debug!(
+                        target: "zeron_harness::claude",
+                        "permission mode -> {}", cli_permission_mode(next)
+                    );
+                }
+            }
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
@@ -796,6 +832,19 @@ pub(crate) fn permission_args(mode: PermissionMode) -> &'static [&'static str] {
     }
 }
 
+/// The CLI's own name for a permission mode — the `--permission-mode` value
+/// and the `set_permission_mode` control request's `mode` field use the same
+/// vocabulary. `default` is the still-accepted older spelling of `manual`
+/// (see [`permission_args`]).
+pub(crate) fn cli_permission_mode(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Ask => "default",
+        PermissionMode::AutoEdits => "acceptEdits",
+        PermissionMode::Auto => "auto",
+        PermissionMode::Bypass => "bypassPermissions",
+    }
+}
+
 /// The yes/no question one gated tool becomes in every mode but
 /// [`PermissionMode::Bypass`] (the CLI already applied whatever its own mode
 /// treats as routine, so anything that still arrives is worth asking about).
@@ -820,6 +869,9 @@ fn permission_question(tool_name: &str, input: &Value) -> UserInputQuestion {
         question,
         options: vec!["Yes".into(), "No".into()],
         multi_select: false,
+        // A permission gate: switching the chat to a mode that approves
+        // everything answers it with "Yes" instead of leaving it parked.
+        allow_label: Some("Yes".into()),
     }
 }
 
@@ -858,7 +910,9 @@ fn handle_control_request(
         let request_input = Arc::clone(request_input);
         let stdin_tx = stdin_tx.clone();
         tokio::spawn(async move {
-            let answers = (request_input)(vec![question.clone()]).await.unwrap_or_default();
+            let answers = (request_input)(vec![question.clone()])
+                .await
+                .unwrap_or_default();
             let allowed = answers.iter().any(|a| {
                 a.question_id == question.id
                     && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
@@ -911,6 +965,7 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
             UserInputQuestion {
                 id: uuid::Uuid::new_v4().to_string(),
                 header: field(["header", "title"]).unwrap_or("Question").into(),
+                allow_label: None,
                 question: field(["question", "prompt"]).unwrap_or("").into(),
                 multi_select: ["multiSelect", "multi_select"]
                     .iter()

@@ -107,6 +107,48 @@ case "$first" in
   esac
   ;;
 
+*scenario:setmode*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-mode"}'
+  # A gated tool in Ask mode: the driver must turn it into a question, and the
+  # test leaves that question PARKED (its request_input never answers), so no
+  # response for cr-0 ever arrives here.
+  emit '{"type":"control_request","request_id":"cr-0","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}'
+  # The chip moves to Bypass: the next line on stdin must be the CLI's own
+  # set_permission_mode control request, not an answer to cr-0.
+  read -r modeline || exit 1
+  # Key order is serializer-defined, so match the two fields independently.
+  case "$modeline" in
+  *'"subtype":"set_permission_mode"'*)
+    case "$modeline" in
+    *'"mode":"bypassPermissions"'*) ;;
+    *)
+      printf 'set_permission_mode with the wrong mode: %s
+' "$modeline" >&2
+      emit '{"type":"result","subtype":"error_during_execution","errors":["set_permission_mode carried the wrong mode"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-mode"}'
+      exit 0
+      ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected stdin line: %s
+' "$modeline" >&2
+    emit '{"type":"result","subtype":"error_during_execution","errors":["expected a set_permission_mode control request"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-mode"}'
+    exit 0
+    ;;
+  esac
+  # And from here the driver must stop asking: this one is allowed outright.
+  emit '{"type":"control_request","request_id":"cr-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls -la"}}}'
+  read -r resp1 || exit 1
+  case "$resp1" in
+  *'"request_id":"cr-1"'*'"behavior":"allow"'*)
+    emit '{"type":"result","subtype":"success","result":"mode applied","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-mode"}'
+    ;;
+  *)
+    emit '{"type":"result","subtype":"error_during_execution","errors":["still gating after the mode change"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-mode"}'
+    ;;
+  esac
+  ;;
+
 *scenario:steer*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-steer"}'
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'

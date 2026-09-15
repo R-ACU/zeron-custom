@@ -439,6 +439,9 @@ fn parse_model_list_page(result: &Value) -> (Vec<(Model, bool)>, Option<String>)
                 description,
                 reasoning_levels,
                 options,
+                // The app server's `model/list` carries no prices; fall back
+                // to the static OpenAI list-price table keyed by id.
+                pricing: crate::pricing_table::codex_pricing(id),
             },
             item.get("isDefault").and_then(Value::as_bool) == Some(true),
         ));
@@ -767,6 +770,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        permission: permission_rx,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -775,7 +779,23 @@ async fn run_session(session: Session) {
     // comment anticipated: "on-request" used to turn every command into a
     // yes/no question (user report: "asking me for approval at every step"),
     // so it is only reached when the user asked for it. Title runs never ask.
-    let permission = request.permission_mode();
+    //
+    // LIVE CHANGES: the app-server has no method to repoint a RUNNING thread's
+    // approval policy or sandbox (there is no `thread/setConfig` on the
+    // 0.153.x wire this driver is pinned to), so moving the composer's
+    // Permissions chip mid-run does exactly two things here and no more:
+    // every approval request that arrives from now on is answered against
+    // the NEW mode (the engine clears any question already parked), and the
+    // next `turn/start` carries the new policy and sandbox. The turn already
+    // in flight keeps the policy it was started with.
+    let live_permission = move || {
+        if title_only {
+            PermissionMode::Ask
+        } else {
+            *permission_rx.borrow()
+        }
+    };
+    let permission = live_permission();
     let approval_policy = if title_only {
         "never"
     } else {
@@ -925,10 +945,20 @@ async fn run_session(session: Session) {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), json!([{ "type": "text", "text": text }]));
-        p.insert("approvalPolicy".into(), approval_policy.into());
+        // Read at TURN START, never at spawn: a chip move between turns
+        // takes effect here.
+        let mode = live_permission();
+        p.insert(
+            "approvalPolicy".into(),
+            crate::codex::approval_policy(mode).into(),
+        );
         p.insert(
             "sandboxPolicy".into(),
-            sandbox_policy_value(request.sandbox),
+            sandbox_policy_value(if title_only {
+                SandboxLevel::ReadOnly
+            } else {
+                effective_sandbox(mode, request.sandbox)
+            }),
         );
         // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
         // when asked for — without this codex "thinks" in silence for minutes:
@@ -1258,7 +1288,7 @@ async fn run_session(session: Session) {
                         id,
                         &method,
                         &params,
-                        permission,
+                        live_permission(),
                         &request_input,
                     );
                 }
@@ -1636,6 +1666,8 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                     .iter()
                     .find_map(|k| q.get(*k).and_then(Value::as_bool))
                     .unwrap_or(false),
+                // A tool's own content question, never a permission gate.
+                allow_label: None,
             };
             (wire_id, question)
         })
@@ -1686,6 +1718,8 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
         question,
         options: vec!["Yes".into(), "No".into()],
         multi_select: false,
+        // A permission gate (see [`UserInputQuestion::allow_label`]).
+        allow_label: Some("Yes".into()),
     }
 }
 
@@ -1813,10 +1847,19 @@ mod tests {
     fn only_the_unattended_modes_answer_every_approval_themselves() {
         let cmd = "item/commandExecution/requestApproval";
         let file = "item/fileChange/requestApproval";
-        assert_eq!(approval_decision(PermissionMode::Bypass, cmd), Some("accept"));
-        assert_eq!(approval_decision(PermissionMode::Bypass, file), Some("accept"));
+        assert_eq!(
+            approval_decision(PermissionMode::Bypass, cmd),
+            Some("accept")
+        );
+        assert_eq!(
+            approval_decision(PermissionMode::Bypass, file),
+            Some("accept")
+        );
         assert_eq!(approval_decision(PermissionMode::Auto, cmd), Some("accept"));
-        assert_eq!(approval_decision(PermissionMode::Auto, file), Some("accept"));
+        assert_eq!(
+            approval_decision(PermissionMode::Auto, file),
+            Some("accept")
+        );
         // Auto edits accepts the edit and still asks about the command.
         assert_eq!(
             approval_decision(PermissionMode::AutoEdits, file),

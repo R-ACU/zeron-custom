@@ -270,6 +270,22 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
+/// Client→CLI permission-mode control request: switches the mode of the
+/// RUNNING session, so the composer's Permissions chip applies to the process
+/// already going instead of only to the next one. `mode` takes the same
+/// values as `--permission-mode` (`default`, `acceptEdits`, `auto`,
+/// `bypassPermissions`); the CLI answers with a `control_response` we do not
+/// need to wait for — the next gated tool (or the absence of one) is the
+/// observable result.
+pub(crate) fn set_permission_mode_line(mode: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": format!("set-mode-{}", uuid::Uuid::new_v4()),
+        "request": { "subtype": "set_permission_mode", "mode": mode },
+    })
+    .to_string()
+}
+
 /// Client→CLI interrupt control request.
 pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     json!({

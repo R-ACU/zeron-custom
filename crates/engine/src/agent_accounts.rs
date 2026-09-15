@@ -13,6 +13,14 @@
 //!   (`StoredSdkCredentials`) holding the named, expiring user API key its
 //!   browser login mints. Deliberately SEPARATE from `cursor-agent login`'s
 //!   whole-account session tokens, which zeron never reads.
+//! - **Kimi Code** — `~/.kimi-code/credentials/<oauth key>.json`: the device-code
+//!   token set (`access_token`/`refresh_token`/`expires_at`/`scope`) minted by
+//!   `kimi login`. READ-ONLY here: the file name embeds a hash of the
+//!   environment the CLI was configured in (`kimi-code-env-<hash>`, referenced
+//!   from `~/.kimi-code/config.toml` as the provider's `oauth.key`), so a token
+//!   set is not portable between configurations and zeron neither snapshots nor
+//!   swaps it. The Kimi card shows the live login and offers "Sign in with
+//!   kimi", which runs `kimi login` in its own terminal.
 //!
 //! Claude-swap mechanics:
 //!
@@ -108,6 +116,9 @@ pub struct AgentAccountsConfig {
     /// named, expiring API key minted by its browser login. SEPARATE from
     /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
+    /// Kimi Code CLI home (`~/.kimi-code`) — holds `config.toml`, `region` and
+    /// the `credentials/` token sets.
+    pub kimi_dir: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -130,6 +141,7 @@ impl AgentAccountsConfig {
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
+            kimi_dir: home_dir().join(".kimi-code"),
         }
     }
 
@@ -143,6 +155,12 @@ impl AgentAccountsConfig {
 
     fn root_dir(&self) -> PathBuf {
         self.data_dir.join("agent-accounts")
+    }
+
+    /// Where `kimi login` writes its token sets, one JSON per configured
+    /// provider environment.
+    fn kimi_credentials_dir(&self) -> PathBuf {
+        self.kimi_dir.join("credentials")
     }
 }
 
@@ -213,6 +231,12 @@ enum LoginFlow {
         output: Arc<Mutex<String>>,
         /// `Some(code)` once the child exited (`None` code = killed by signal).
         exit: Arc<Mutex<Option<Option<i32>>>>,
+        /// Kimi only: the live credential file's modification time when the
+        /// flow started. `kimi login` rewrites the CLI's own store in place
+        /// (there is no throwaway home to point it at), so "a token set newer
+        /// than this" is the completion signal instead of "a file appeared
+        /// under `home`".
+        baseline: Option<std::time::SystemTime>,
     },
 }
 
@@ -334,10 +358,24 @@ impl AgentAccounts {
             }
         }
 
+        // Kimi is detected but never snapshotted: its token set is bound to the
+        // CLI's own configuration hash, so there is nothing zeron could
+        // meaningfully swap it with. `credentials: None` routes it through the
+        // read-only (`switchable: false`) presentation below.
+        if let Some(detected) = self.detect_kimi() {
+            active_keys.insert(HarnessId::Kimi, detected.account_key.clone());
+            unreadable.insert(HarnessId::Kimi, detected);
+        }
+
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
         let mut accounts: Vec<AgentAccount> = Vec::new();
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Cursor] {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Kimi,
+        ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
             for slot in &slots {
@@ -525,6 +563,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
             HarnessId::Codex => self.start_codex_login().await,
             HarnessId::Cursor => self.start_cursor_login().await,
+            HarnessId::Kimi => self.start_kimi_login().await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -633,6 +672,7 @@ impl AgentAccounts {
                 started_at: Instant::now(),
                 output: output.clone(),
                 exit: exit.clone(),
+                baseline: None,
             },
         );
         let url = await_login_url(&output, &exit, scan_openai_url).await;
@@ -686,9 +726,85 @@ impl AgentAccounts {
                 started_at: Instant::now(),
                 output: output.clone(),
                 exit: exit.clone(),
+                baseline: None,
             },
         );
         let url = await_login_url(&output, &exit, scan_cursor_url).await;
+        Ok(AgentLoginStart {
+            login_id,
+            url,
+            mode: AgentLoginMode::Browser,
+        })
+    }
+
+    /// Kimi: `kimi login` runs a device-code flow — it prints a verification
+    /// URL AND a short code the user has to type on that page, then waits. So
+    /// unlike codex and cursor there is nothing zeron can drive headlessly:
+    /// the CLI gets a terminal of its own and the flow completes when it
+    /// rewrites the live token set. There is no throwaway store to isolate a
+    /// second account into either (the file name is bound to the CLI's own
+    /// configuration hash), so this is a sign-in, not an add-account.
+    async fn start_kimi_login(&self) -> Result<AgentLoginStart, EngineError> {
+        self.reap_spawned_flows(HarnessId::Kimi);
+        let login_id = new_id();
+        // Kept only so the shared cancel/reap path has a directory to reclaim.
+        let home = self
+            .inner
+            .config
+            .root_dir()
+            .join(format!(".login-{login_id}"));
+        std::fs::create_dir_all(&home)?;
+        let baseline = self.kimi_credentials_mtime();
+        let mut command = tokio::process::Command::new(crate::exec::resolve_tool("kimi"));
+        command.arg("login");
+        #[cfg(windows)]
+        {
+            // CREATE_NEW_CONSOLE: the device-code prompt is the user interface
+            // here, so it needs a visible console. Inherited stdio would write
+            // into the app's (absent) console and the user would see nothing.
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            command.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        #[cfg(not(windows))]
+        {
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        "The `kimi` CLI was not found on this device — install it first.".into()
+                    } else {
+                        format!("Could not start the Kimi sign-in: {err}")
+                    },
+                ));
+            }
+        };
+        let (child, output, exit) = wire_login_child(child);
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Spawned {
+                harness: HarnessId::Kimi,
+                child,
+                home,
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit: exit.clone(),
+                baseline,
+            },
+        );
+        // On Windows the CLI owns its console and prints nothing back to us;
+        // elsewhere the verification URL is worth offering as a link.
+        let url = if cfg!(windows) {
+            String::new()
+        } else {
+            await_login_url(&output, &exit, scan_kimi_url).await
+        };
         Ok(AgentLoginStart {
             login_id,
             url,
@@ -859,7 +975,7 @@ impl AgentAccounts {
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
         self.sweep_flows();
-        let (harness, home, exit, output) = match lock(&self.inner.flows).get(login_id) {
+        let (harness, home, exit, output, baseline) = match lock(&self.inner.flows).get(login_id) {
             None => {
                 return Err(EngineError::Other(
                     "This sign-in attempt expired — start again.".into(),
@@ -876,9 +992,32 @@ impl AgentAccounts {
                 home,
                 exit,
                 output,
+                baseline,
                 ..
-            }) => (*harness, home.clone(), exit.clone(), output.clone()),
+            }) => (
+                *harness,
+                home.clone(),
+                exit.clone(),
+                output.clone(),
+                *baseline,
+            ),
         };
+        // Kimi rewrites the CLI's own store, so completion is "the live token
+        // set is newer than when we started" rather than a file under `home`.
+        if harness == HarnessId::Kimi {
+            let landed = match (self.kimi_credentials_mtime(), baseline) {
+                (Some(now), Some(before)) => now > before,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if landed && self.detect_kimi().is_some() {
+                self.cancel_login(login_id);
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Done,
+                    message: None,
+                });
+            }
+        }
         let detected = read_json(&home.join("auth.json")).and_then(|auth| match harness {
             HarnessId::Codex => parse_codex_auth(auth),
             HarnessId::Cursor => parse_cursor_auth(auth),
@@ -1010,6 +1149,29 @@ impl AgentAccounts {
 
     fn detect_cursor(&self) -> Option<Detected> {
         read_json(&self.inner.config.cursor_sdk_auth_file).and_then(parse_cursor_auth)
+    }
+
+    /// The live `kimi login` token set, if there is one. Read-only: the token
+    /// itself never leaves this function (`credentials: None`), only the
+    /// identity claims the CLI's own token already carries.
+    fn detect_kimi(&self) -> Option<Detected> {
+        let file = newest_kimi_credentials(&self.inner.config.kimi_credentials_dir())?;
+        let auth = read_json(&file)?;
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("kimi-code")
+            .to_string();
+        let region = str_field(&auth, "region")
+            .or_else(|| read_trimmed(&self.inner.config.kimi_dir.join("region")));
+        parse_kimi_auth(auth, &stem, region.as_deref())
+    }
+
+    /// Modification time of the live Kimi token set — the login flow's
+    /// completion baseline.
+    fn kimi_credentials_mtime(&self) -> Option<std::time::SystemTime> {
+        let file = newest_kimi_credentials(&self.inner.config.kimi_credentials_dir())?;
+        std::fs::metadata(file).ok()?.modified().ok()
     }
 
     /// A live cursor login that runs can actually use: present, parseable,
@@ -1744,6 +1906,90 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
 }
 
 /// Present, parseable, and unexpired — what a run can actually use.
+/// The live Kimi token set: the newest `*.json` under `~/.kimi-code/credentials`.
+/// The CLI keeps one file per configured provider environment and rewrites the
+/// active one on every refresh, so "newest" is "current".
+fn newest_kimi_credentials(dir: &Path) -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(best, _)| modified > *best) {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+fn read_trimmed(file: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(file).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Identity for one Kimi token set. The access token is a JWT the user's own
+/// CLI already trusts; its claims carry the account (`user_id`/`sub`) and the
+/// login region. The token itself is deliberately dropped here — zeron shows
+/// the login, it does not store or swap it.
+fn parse_kimi_auth(
+    auth: serde_json::Value,
+    file_stem: &str,
+    region_hint: Option<&str>,
+) -> Option<Detected> {
+    let access = str_field(&auth, "access_token")?;
+    let claims = jwt_claims(&access).unwrap_or(serde_json::Value::Null);
+    let region = str_field(&claims, "region")
+        .or_else(|| region_hint.map(str::to_string))
+        .or_else(|| str_field(&auth, "region"));
+    // Prefer a human claim if the token ever grows one; otherwise the opaque
+    // account id, shortened — enough to tell two logins apart, and not a
+    // credential.
+    let account_key = str_field(&claims, "user_id")
+        .or_else(|| str_field(&claims, "sub"))
+        .unwrap_or_else(|| file_stem.to_string());
+    let email = str_field(&claims, "email")
+        .or_else(|| str_field(&claims, "user_email"))
+        .unwrap_or_else(|| kimi_account_label(&account_key));
+    Some(Detected {
+        account_key,
+        profile: SlotProfile {
+            email,
+            display_name: None,
+            organization: None,
+            plan: region.as_deref().map(kimi_region_label),
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: None,
+        claude_config: None,
+    })
+}
+
+/// Row title for a Kimi login with no human claim: the account id, shortened.
+fn kimi_account_label(account_key: &str) -> String {
+    let short: String = account_key.chars().take(8).collect();
+    if short.is_empty() {
+        "Kimi Code CLI".to_string()
+    } else {
+        format!("Kimi account {short}")
+    }
+}
+
+/// Badge for the login region (`kimi login --region`). The token claim says
+/// `overseas` where the CLI flag says `global` — both mean kimi.ai rather than
+/// kimi.com.
+fn kimi_region_label(region: &str) -> String {
+    match region {
+        "global" | "overseas" => "Global".to_string(),
+        "mainland-cn" | "cn" => "Mainland CN".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn cursor_key_usable(auth: &serde_json::Value) -> bool {
     str_field(auth, "apiKey").is_some()
         && auth
@@ -1818,7 +2064,12 @@ fn json_ms(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
 }
 
 fn scan_openai_url(output: &str) -> Option<String> {
-    let start = output.find("https://auth.openai.com/")?;
+    scan_url_prefixed(output, "https://auth.openai.com/")
+}
+
+/// First whitespace-delimited token in `output` starting with `prefix`.
+fn scan_url_prefixed(output: &str, prefix: &str) -> Option<String> {
+    let start = output.find(prefix)?;
     let rest = &output[start..];
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     Some(rest[..end].to_string())
@@ -1846,6 +2097,14 @@ fn scan_shim_event(output: &str, ev: &str) -> Option<serde_json::Value> {
         let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
         (v.get("ev").and_then(|e| e.as_str()) == Some(ev)).then_some(v)
     })
+}
+
+/// The verification URL `kimi login` prints (non-Windows, where the child's
+/// output is piped rather than shown in its own console).
+fn scan_kimi_url(output: &str) -> Option<String> {
+    scan_url_prefixed(output, "https://auth.kimi.")
+        .or_else(|| scan_url_prefixed(output, "https://www.kimi."))
+        .or_else(|| scan_url_prefixed(output, "https://kimi."))
 }
 
 fn scan_cursor_url(output: &str) -> Option<String> {
@@ -1975,7 +2234,11 @@ fn urlencode(input: &str) -> String {
 /// file inherits from `%USERPROFILE%`; `restrict_to_current_user` narrows that to
 /// a single ACE afterwards, best effort. See `crate::exec` for why that is the
 /// ceiling without a new dependency.
-fn write_file_atomic(file: &Path, bytes: &[u8], secret: bool) -> Result<(), EngineError> {
+pub(crate) fn write_file_atomic(
+    file: &Path,
+    bytes: &[u8],
+    secret: bool,
+) -> Result<(), EngineError> {
     let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
     {
         use std::io::Write;
@@ -2023,6 +2286,69 @@ mod tests {
         assert_eq!(codex_plan(Some("plus")).as_deref(), Some("ChatGPT Plus"));
         assert_eq!(codex_plan(Some("free")).as_deref(), Some("ChatGPT Free"));
         assert_eq!(codex_plan(None), None);
+    }
+
+    #[test]
+    fn kimi_auth_reads_identity_from_the_token_claims_and_never_the_token() {
+        // A JWT whose payload carries the claims kimi's access token carries
+        // (no email — the CLI's token has none).
+        let payload = BASE64_URL.encode(
+            serde_json::json!({ "user_id": "5f3a1b2c9d8e", "region": "overseas", "scope": "kimi-code" })
+                .to_string()
+                .as_bytes(),
+        );
+        let token = format!("header.{payload}.signature");
+        let detected = parse_kimi_auth(
+            serde_json::json!({
+                "access_token": token,
+                "refresh_token": "refresh-secret",
+                "expires_at": 1_789_453_948i64,
+                "token_type": "Bearer",
+            }),
+            "kimi-code-env-0e4f99c69cc27850",
+            None,
+        )
+        .expect("a token set is a login");
+        assert_eq!(detected.account_key, "5f3a1b2c9d8e");
+        assert_eq!(detected.profile.email, "Kimi account 5f3a1b2c");
+        assert_eq!(detected.profile.plan.as_deref(), Some("Global"));
+        assert_eq!(detected.profile.auth_kind, AgentAuthKind::Oauth);
+        // Read-only: nothing to snapshot, nothing to swap, no secret retained.
+        assert!(detected.credentials.is_none());
+    }
+
+    #[test]
+    fn kimi_auth_falls_back_to_the_file_name_and_the_region_file() {
+        let detected = parse_kimi_auth(
+            serde_json::json!({ "access_token": "not-a-jwt" }),
+            "kimi-code-env-0e4f99c69cc27850",
+            Some("mainland-cn"),
+        )
+        .expect("an unparseable token is still a login");
+        assert_eq!(detected.account_key, "kimi-code-env-0e4f99c69cc27850");
+        assert_eq!(detected.profile.email, "Kimi account kimi-cod");
+        assert_eq!(detected.profile.plan.as_deref(), Some("Mainland CN"));
+        // No token, no login.
+        assert!(parse_kimi_auth(serde_json::json!({ "scope": "kimi-code" }), "x", None).is_none());
+    }
+
+    #[test]
+    fn newest_kimi_credentials_picks_the_current_token_set() {
+        let dir = std::env::temp_dir().join(format!("zeron-kimi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(newest_kimi_credentials(&dir).is_none());
+        std::fs::write(dir.join("old.json"), b"{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
+        // Distinct mtimes: filesystem timestamp granularity is coarse.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(dir.join("new.json"), b"{}").unwrap();
+        assert_eq!(
+            newest_kimi_credentials(&dir)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())),
+            Some("new.json".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

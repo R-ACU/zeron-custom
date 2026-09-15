@@ -144,6 +144,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<Vec<Model>, HarnessError> {
             // Devin encodes effort and fast mode in the exact variant id.
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+            pricing: None,
         });
     }
     if models.is_empty() {

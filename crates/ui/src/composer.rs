@@ -26,8 +26,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer,
-    UserInputQuestion, capabilities,
+    FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer, UserInputQuestion,
+    capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -543,6 +543,28 @@ impl Render for AppshotActionTooltip {
             .text_size(px(11.0))
             .text_color(theme.text)
             .child(self.0.clone())
+    }
+}
+
+/// The session cost chip's note. Its own type because it WRAPS: the estimate
+/// caveat is a sentence, not a label.
+struct SessionCostTooltip;
+
+impl Render for SessionCostTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .w(px(230.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(SharedString::from(crate::pricing::SESSION_ESTIMATE_TOOLTIP))
     }
 }
 
@@ -4141,6 +4163,44 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    /// The session cost estimate beside the context percentage: a small muted
+    /// "$0.12" for what the tokens reported so far would cost at the selected
+    /// model's prices.
+    ///
+    /// Shown only where a run is actually billed per token
+    /// ([`crate::pricing::shows_session_cost`]) — a subscription-driven
+    /// harness would otherwise show a dollar figure nobody is charged. Hidden
+    /// until the harness has reported usage, and hidden again if the model
+    /// carries no prices.
+    fn render_session_cost_chip(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let harness = self.pickers.read(cx).resolved(cx).harness?;
+        if !crate::pricing::shows_session_cost(harness) {
+            return None;
+        }
+        let totals = self.state.read(cx).selected_session_usage()?;
+        let pricing = self.pickers.read(cx).resolved_pricing(cx)?;
+        let estimate = crate::pricing::estimate_usd(totals, &pricing)?;
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .id("session-cost")
+                .flex_none()
+                .flex()
+                .items_center()
+                .h(px(24.0))
+                .px(px(6.0))
+                .rounded(px(6.0))
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .hover(|s| s.bg(crate::theme::ink(0.05)))
+                .child(SharedString::from(crate::pricing::format_estimate(
+                    estimate,
+                )))
+                .tooltip(|_, cx| cx.new(|_| SessionCostTooltip).into())
+                .into_any_element(),
+        )
+    }
+
     pub(crate) fn set_dock_frame(
         &mut self,
         frame: crate::composer_dock::DockFrame,
@@ -7466,7 +7526,34 @@ impl Render for Composer {
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
-            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
+            // The panel takes the composer BOX's place, never the strip under
+            // it: a pending tool-approval question is exactly the moment the
+            // user reaches for the Permissions chip (switching to Bypass
+            // answers the question and unblocks the agent), so checkout,
+            // branch, chip and usage stay where they always are.
+            let footer = self
+                .pickers
+                .update(cx, |pickers, cx| pickers.render_footer(cx));
+            let harness = self.pickers.read(cx).resolved(cx).harness;
+            let chip = self
+                .permissions
+                .update(cx, |picker, cx| picker.render_chip(harness, cx));
+            let usage = self.state.read(cx).context_usage;
+            return container
+                .child(motion::fade_quick("composer-wizard", div().child(wizard)))
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(SESSION_FOOTER_HEIGHT))
+                        .mb(px(-Theme::SPACE_SM))
+                        .flex()
+                        .items_center()
+                        .child(div().flex_1().min_w_0().children(footer))
+                        .child(div().flex_none().child(chip))
+                        .child(div().flex_none().pr(px(10.0)).child(
+                            crate::context_usage::render(usage, self.state.clone(), &theme),
+                        )),
+                );
         }
 
         // What is waiting to be sent, stacked directly above the box it was
@@ -7977,6 +8064,12 @@ impl Render for Composer {
             let session_permission_chip =
                 (session_chrome_opacity > 0.0).then(|| permission_chip(self, cx));
             let usage = self.state.read(cx).context_usage;
+            // Session cost estimate, shown only for API-billed harnesses
+            // (crate::pricing::shows_session_cost) once the harness has
+            // actually reported tokens.
+            let session_cost = (session_chrome_opacity > 0.0)
+                .then(|| self.render_session_cost_chip(cx))
+                .flatten();
             container.child(
                 div()
                     .w_full()
@@ -8010,6 +8103,7 @@ impl Render for Composer {
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
                                 .child(div().flex_none().children(session_permission_chip))
+                                .child(div().flex_none().children(session_cost))
                                 .child(div().flex_none().pr(px(10.0)).child(
                                     crate::context_usage::render(usage, self.state.clone(), &theme),
                                 )),
@@ -8746,6 +8840,7 @@ mod tests {
             question: format!("Question {id}"),
             options: options.iter().map(|s| s.to_string()).collect(),
             multi_select: multi,
+            allow_label: None,
         }
     }
 

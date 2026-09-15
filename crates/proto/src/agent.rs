@@ -115,6 +115,104 @@ pub struct Model {
     pub reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
     pub options: Vec<ModelOption>,
+    /// Per-million-token prices for the COST row under the effort slider.
+    /// Additive + serde-defaulted: an older engine simply serves no prices and
+    /// the row hides itself. `None` means "unknown", never "free" — a catalog
+    /// that reports nothing (or all zeros for a subscription-authenticated
+    /// provider) must not be rendered as Free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+}
+
+/// Where a [`ModelPricing`] row came from. Decides the muted hint next to the
+/// COST heading: catalog prices are what the provider itself bills, list
+/// prices are informational (a Claude Code / Codex / Kimi subscription is not
+/// billed per token at all).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PriceSource {
+    /// Served by the provider's own model catalog (opencode / models.dev).
+    #[default]
+    Catalog,
+    /// A static list price maintained in the harness catalog.
+    ListPrice,
+    /// The provider serves this model at no per-token charge.
+    Free,
+}
+
+/// List prices in [`Self::currency`] per one million tokens.
+///
+/// `cached_input_per_million` is the CACHE READ price (a cache write is a
+/// different, higher rate and is deliberately not modelled: the session
+/// estimate has no way to tell reads from writes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPricing {
+    pub input_per_million: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_million: Option<f64>,
+    pub output_per_million: f64,
+    #[serde(default = "usd")]
+    pub currency: String,
+    #[serde(default)]
+    pub source: PriceSource,
+}
+
+fn usd() -> String {
+    "USD".to_owned()
+}
+
+impl ModelPricing {
+    /// A USD price row.
+    pub fn usd(
+        input_per_million: f64,
+        cached_input_per_million: Option<f64>,
+        output_per_million: f64,
+        source: PriceSource,
+    ) -> Self {
+        Self {
+            input_per_million,
+            cached_input_per_million,
+            output_per_million,
+            currency: usd(),
+            source,
+        }
+    }
+
+    /// A model the provider serves for free.
+    pub fn free() -> Self {
+        Self::usd(0.0, Some(0.0), 0.0, PriceSource::Free)
+    }
+
+    /// Whether this row is the Free marker (rendered as one muted word).
+    pub fn is_free(&self) -> bool {
+        self.source == PriceSource::Free
+    }
+}
+
+/// Cumulative reported token usage for one chat, accumulated from
+/// [`AgentEvent::Usage`]. Session-local: the engine holds it in memory for the
+/// life of the process and never writes it to a doc.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl UsageTotals {
+    /// Fold one reported `Usage` event in. Harnesses report per-turn counts,
+    /// so the totals only ever grow.
+    pub fn add(&mut self, input_tokens: u64, output_tokens: u64) {
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -382,6 +480,16 @@ pub struct UserInputQuestion {
     pub options: Vec<String>,
     #[serde(default)]
     pub multi_select: bool,
+    /// Set when this question is a TOOL-PERMISSION gate, to the option label
+    /// that means "allow". Switching the chat to a permission mode that
+    /// approves everything answers such a question with this label instead of
+    /// leaving it parked on screen (the answer travels the ordinary
+    /// `respond_input` path, so the harness and the question panel both see a
+    /// normal resolution). `None` = a content question the agent genuinely
+    /// needs an answer to; never auto-answered. Additive + serde-defaulted
+    /// for wire compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

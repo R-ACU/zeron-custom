@@ -54,6 +54,15 @@ fn request(prompt: &str) -> RunRequest {
 fn controls(
     answer_label: &'static str,
 ) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+    controls_with(answer_label, zeron_proto::PermissionMode::Bypass)
+}
+
+/// Like [`controls`] but with an explicit live permission mode; the approval
+/// round-trip tests need `Ask`, everything else runs unattended.
+fn controls_with(
+    answer_label: &'static str,
+    mode: zeron_proto::PermissionMode,
+) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -70,6 +79,7 @@ fn controls(
             rx
         }),
         steering: steer_rx,
+        permission: tokio::sync::watch::channel(mode).1,
         interrupt: token.clone(),
     };
     (controls, steer_tx, token)
@@ -421,6 +431,7 @@ async fn approvals_round_trip_as_input_requests() {
             rx
         }),
         steering: steer_rx,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Ask).1,
         interrupt: token.clone(),
     };
     let mut req = request("scenario:approve");
@@ -456,7 +467,7 @@ async fn approvals_round_trip_as_input_requests() {
 
 #[tokio::test]
 async fn approval_no_answer_becomes_decline() {
-    let (controls, _steer, _token) = controls("No");
+    let (controls, _steer, _token) = controls_with("No", zeron_proto::PermissionMode::Ask);
     let mut req = request("scenario:decline");
     req.auto_approve = false;
     let events = run_to_end(&harness(), req, controls).await;

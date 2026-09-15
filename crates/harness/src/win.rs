@@ -588,7 +588,11 @@ mod tests {
     #[test]
     fn vendored_platform_binary_wins_over_the_js_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("node_modules").join("@openai").join("codex");
+        let pkg = dir
+            .path()
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
         let js = pkg.join("bin").join("codex.js");
         touch(&js);
         assert_eq!(vendored_native_binary(&js), None);

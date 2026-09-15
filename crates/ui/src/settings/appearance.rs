@@ -9,7 +9,9 @@ use gpui::{
     ObjectFit, Render, SharedString, StyledImage as _, Subscription, Window, div, img, prelude::*,
     px,
 };
-use gpui_base::slider::{Slider, SliderEvent, SliderIndicator, SliderState, SliderThumb, SliderTrack};
+use gpui_base::slider::{
+    Slider, SliderEvent, SliderIndicator, SliderState, SliderThumb, SliderTrack,
+};
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
     AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
@@ -67,16 +69,14 @@ impl AppearancePage {
                 .step(0.05)
                 .default_value(initial_glass_strength)
         });
-        let glass_strength_events = cx.subscribe(
-            &glass_strength_slider,
-            |_this: &mut Self, _, event, cx| {
+        let glass_strength_events =
+            cx.subscribe(&glass_strength_slider, |_this: &mut Self, _, event, cx| {
                 let value = match event {
                     SliderEvent::Change(value) | SliderEvent::Release(value) => value.start(),
                 };
                 appearance::set_glass_strength(value, cx);
                 cx.notify();
-            },
-        );
+            });
         Self {
             selected_font: typography::effective(cx),
             selected_size: typography::font_size(cx),
@@ -2352,12 +2352,7 @@ impl Render for AppearancePage {
                             ],
                         )),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .ml(px(10.0))
-                        .child(glass_strength_control),
-                )
+                .child(div().flex_none().ml(px(10.0)).child(glass_strength_control))
                 .into_any_element(),
         );
         let background_available = current_background

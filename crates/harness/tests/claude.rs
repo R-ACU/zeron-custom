@@ -71,9 +71,43 @@ fn controls(
             rx
         }),
         steering: steer_rx,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Bypass).1,
         interrupt: token.clone(),
     };
     (controls, steer_tx, token)
+}
+
+/// Controls whose `request_input` NEVER answers (the question stays parked,
+/// as it does in the UI until the user clicks) plus the live-permission
+/// sender, so a test can move the chip mid-run.
+type ParkedControls = (
+    RunControls,
+    mpsc::Sender<SteerMessage>,
+    tokio::sync::watch::Sender<zeron_proto::PermissionMode>,
+    CancellationToken,
+);
+
+fn controls_parked() -> ParkedControls {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let (permission_tx, permission_rx) =
+        tokio::sync::watch::channel(zeron_proto::PermissionMode::Ask);
+    // Park every question the way the UI does: the resolver stays ALIVE and
+    // unanswered. Dropping it would look like a declined question and the
+    // driver would write a deny back.
+    let parked: Arc<Mutex<Vec<oneshot::Sender<Vec<UserInputAnswer>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let controls = RunControls {
+        request_input: Box::new(move |_questions| {
+            let (tx, rx) = oneshot::channel();
+            parked.lock().unwrap().push(tx);
+            rx
+        }),
+        steering: steer_rx,
+        permission: permission_rx,
+        interrupt: token.clone(),
+    };
+    (controls, steer_tx, permission_tx, token)
 }
 
 async fn run_to_end(
@@ -302,6 +336,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
             rx
         }),
         steering: steer_rx,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Bypass).1,
         interrupt: token.clone(),
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;
@@ -571,6 +606,49 @@ async fn captured_live_background_subagent_frames_replay_correctly() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The composer's Permissions chip moved while the CLI is running: the driver
+/// must push `set_permission_mode` down the live stdin and stop turning gated
+/// tools into questions from then on. The fixture asserts both halves; the
+/// question raised BEFORE the change stays parked here (clearing it is the
+/// engine's job — `Sessions::set_permission_mode`).
+#[tokio::test]
+async fn a_mode_change_mid_run_reaches_the_cli_and_stops_the_asking() {
+    let (controls, _steer, permission, _token) = controls_parked();
+    let mut req = request("scenario:setmode");
+    req.set_permission_mode(zeron_proto::PermissionMode::Ask);
+
+    let stream = harness().run(req, controls).await.expect("run starts");
+    // Let the first (parked) question go out, then move the chip.
+    let events = tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.map(|r| r.expect("stream event")).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("run finished in time")
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    permission
+        .send(zeron_proto::PermissionMode::Bypass)
+        .expect("run still alive");
+
+    let events = events.await.expect("collector");
+    let done = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::Done { status, error, .. } => Some((*status, error.clone())),
+            _ => None,
+        })
+        .expect("a Done");
+    assert_eq!(
+        done.0,
+        DoneStatus::Completed,
+        "fixture rejected the mode change: {:?}",
+        done.1
+    );
 }
 
 /// Live smoke against the REAL claude CLI (2.1.x, must be installed + authed):

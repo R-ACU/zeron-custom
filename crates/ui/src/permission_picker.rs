@@ -127,6 +127,8 @@ pub struct PermissionPicker {
     defaults: PermissionDefaults,
     open: Popup<()>,
     focus: FocusHandle,
+    /// In-flight `SetPermissionMode` call; a newer pick replaces it.
+    apply_task: Option<gpui::Task<()>>,
 }
 
 impl PermissionPicker {
@@ -142,6 +144,7 @@ impl PermissionPicker {
             defaults,
             open: Popup::default(),
             focus: cx.focus_handle(),
+            apply_task: None,
         }
     }
 
@@ -172,10 +175,39 @@ impl PermissionPicker {
 
     fn set_choice(&mut self, choice: PermissionChoice, cx: &mut Context<Self>) {
         let chat_id = self.chat_id(cx);
+        let changed = self.choice(cx).mode != choice.mode;
         self.defaults
             .remember_permission(chat_id.as_deref(), choice);
         self.save();
+        // Apply it to a run that is ALREADY going, rather than only to the
+        // next one: the engine pushes the mode into the live harness and
+        // clears any tool-permission question the new mode already answers.
+        if changed && let Some(chat_id) = chat_id {
+            self.apply_live(chat_id, choice.mode, cx);
+        }
         cx.notify();
+    }
+
+    /// Fire-and-forget `SetPermissionMode` for the chat's live run. A chat
+    /// with no live run replies `applied: false` and needs nothing else —
+    /// its next run carries the pick in the request.
+    fn apply_live(&mut self, chat_id: String, mode: PermissionMode, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.apply_task = Some(cx.spawn(async move |_, _| {
+            let params = serde_json::json!({
+                "chatId": chat_id,
+                "permission": mode,
+            });
+            if let Err(err) = engine
+                .client()
+                .call(zeron_rpc::methods::SET_PERMISSION_MODE, params)
+                .await
+            {
+                tracing::warn!(error = %err, "SetPermissionMode failed");
+            }
+        }));
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
@@ -200,7 +232,12 @@ impl PermissionPicker {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut gpui::Window, cx: &mut Context<Self>) {
+    fn on_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
         if event.keystroke.key == "escape" {
             self.dismiss(cx);
             if self.focus.contains_focused(window, cx) {
@@ -212,17 +249,18 @@ impl PermissionPicker {
     /// The footer chip plus, while open, its anchored dropdown. `harness` is
     /// the run's resolved harness (the composer owns that resolution) and
     /// decides whether the sandbox section has any meaning here.
-    pub fn render_chip(&mut self, harness: Option<HarnessId>, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_chip(
+        &mut self,
+        harness: Option<HarnessId>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let choice = self.choice(cx);
         let open = self.open.is_open();
         // The two unattended modes are the ones worth noticing from across
         // the room; Ask and Auto edits stay quiet like the neighbouring
         // checkout labels.
-        let accented = matches!(
-            choice.mode,
-            PermissionMode::Auto | PermissionMode::Bypass
-        );
+        let accented = matches!(choice.mode, PermissionMode::Auto | PermissionMode::Bypass);
         let id = "permission-chip";
         let text = if accented {
             theme.accent
@@ -315,7 +353,11 @@ impl PermissionPicker {
                 el.bg(crate::theme::glass_selected_bg())
                     .font_weight(gpui::FontWeight::MEDIUM)
             })
-            .text_color(if selected { theme.text } else { theme.text_muted })
+            .text_color(if selected {
+                theme.text
+            } else {
+                theme.text_muted
+            })
             .cursor_pointer()
             .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
             .child(
@@ -363,19 +405,17 @@ impl PermissionPicker {
         for (mode, label, _chip, _hint) in MODES {
             let selected = choice.mode == mode;
             let id = SharedString::from(format!("permission-mode-{label}"));
-            modes = modes.child(
-                Self::option_row(id, label, selected, theme).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.set_choice(
-                            PermissionChoice {
-                                mode,
-                                ..this.choice(cx)
-                            },
-                            cx,
-                        );
-                    },
-                )),
-            );
+            modes = modes.child(Self::option_row(id, label, selected, theme).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    this.set_choice(
+                        PermissionChoice {
+                            mode,
+                            ..this.choice(cx)
+                        },
+                        cx,
+                    );
+                }),
+            ));
         }
 
         let mut card = popover::popover_card(theme)
@@ -410,19 +450,17 @@ impl PermissionPicker {
         for (level, label) in SANDBOXES {
             let selected = choice.sandbox == level;
             let id = SharedString::from(format!("permission-sandbox-{label}"));
-            sandboxes = sandboxes.child(
-                Self::option_row(id, label, selected, theme).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.set_choice(
-                            PermissionChoice {
-                                sandbox: level,
-                                ..this.choice(cx)
-                            },
-                            cx,
-                        );
-                    },
-                )),
-            );
+            sandboxes = sandboxes.child(Self::option_row(id, label, selected, theme).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    this.set_choice(
+                        PermissionChoice {
+                            sandbox: level,
+                            ..this.choice(cx)
+                        },
+                        cx,
+                    );
+                }),
+            ));
         }
         card = card
             .child(popover::menu_separator())

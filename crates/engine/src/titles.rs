@@ -264,6 +264,9 @@ async fn collect_text(
     request: RunRequest,
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
+    let (permission_tx, permission_rx) =
+        tokio::sync::watch::channel(zeron_proto::PermissionMode::Ask);
+    let _permission_tx = permission_tx;
     let interrupt = CancellationToken::new();
     let _cancel_on_drop = interrupt.clone().drop_guard();
     let controls = RunControls {
@@ -273,6 +276,9 @@ async fn collect_text(
             rx
         }),
         steering: steer_rx,
+        // A title run has no tools, so its mode never changes: a constant
+        // channel whose sender lives as long as the run.
+        permission: permission_rx,
         interrupt: interrupt.clone(),
     };
     let mut stream = harness.run_title(request, controls).await?;
@@ -324,6 +330,7 @@ mod tests {
             description: None,
             reasoning_levels: vec![],
             options: vec![],
+            pricing: None,
         }
     }
 

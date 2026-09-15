@@ -378,11 +378,7 @@ mod tests {
     fn effort_is_remembered_per_model_and_survives_a_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let mut defaults = ComposerDefaults::default();
-        defaults.remember_effort(
-            HarnessId::ClaudeCode,
-            "claude-opus-5",
-            ReasoningLevel::Max,
-        );
+        defaults.remember_effort(HarnessId::ClaudeCode, "claude-opus-5", ReasoningLevel::Max);
         defaults.remember_effort(HarnessId::Codex, "gpt-5.2-codex", ReasoningLevel::Low);
         // The key is "<harness>/<model id>", so the two never collide.
         assert_eq!(
@@ -514,7 +510,10 @@ mod tests {
         // accumulating one entry per chat ever opened.
         defaults.remember_permission(Some("chat-1"), PermissionChoice::default());
         assert!(defaults.permission_by_chat.is_empty());
-        assert_eq!(defaults.permission_for(Some("chat-1")).mode, PermissionMode::Ask);
+        assert_eq!(
+            defaults.permission_for(Some("chat-1")).mode,
+            PermissionMode::Ask
+        );
     }
 
     #[test]

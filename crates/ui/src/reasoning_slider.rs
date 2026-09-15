@@ -148,10 +148,7 @@ pub fn provider_gradient(harness: Option<HarnessId>, theme: &Theme) -> (Hsla, Hs
             (gpui::rgb(0x8F4A36).into(), gpui::rgb(0xD97757).into())
         }
         Some(HarnessId::Codex) => (gpui::rgb(0x5B21B6).into(), gpui::rgb(0xA855F7).into()),
-        _ => (
-            motion::mix(theme.accent, gpui::black(), 0.45),
-            theme.accent,
-        ),
+        _ => (motion::mix(theme.accent, gpui::black(), 0.45), theme.accent),
     }
 }
 
@@ -342,24 +339,27 @@ impl EffortSlider {
             .items_start()
             .justify_between()
             .pt(px(4.0))
-            .children(tick_labels(&self.levels).into_iter().enumerate().map(
-                |(ix, label)| {
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(TICK_TEXT_SIZE))
-                        .font_weight(if ix == self.current {
-                            gpui::FontWeight::SEMIBOLD
-                        } else {
-                            gpui::FontWeight::NORMAL
-                        })
-                        .text_color(if ix == self.current {
-                            theme.text.opacity(0.9)
-                        } else {
-                            theme.text_muted.opacity(0.55)
-                        })
-                        .child(SharedString::from(label))
-                },
-            ));
+            .children(
+                tick_labels(&self.levels)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, label)| {
+                        div()
+                            .flex_none()
+                            .text_size(crate::typography::ui_rems(TICK_TEXT_SIZE))
+                            .font_weight(if ix == self.current {
+                                gpui::FontWeight::SEMIBOLD
+                            } else {
+                                gpui::FontWeight::NORMAL
+                            })
+                            .text_color(if ix == self.current {
+                                theme.text.opacity(0.9)
+                            } else {
+                                theme.text_muted.opacity(0.55)
+                            })
+                            .child(SharedString::from(label))
+                    }),
+            );
 
         div()
             .flex()
@@ -523,7 +523,10 @@ mod tests {
             max = max.max(a);
         }
         assert!((min - SPARKLE_MIN_ALPHA).abs() < 1e-3, "reaches the floor");
-        assert!((max - SPARKLE_MAX_ALPHA).abs() < 1e-3, "reaches the ceiling");
+        assert!(
+            (max - SPARKLE_MAX_ALPHA).abs() < 1e-3,
+            "reaches the ceiling"
+        );
         // The phase offset de-synchronizes the dots.
         assert!((sparkle_alpha(0.0, 0.0) - sparkle_alpha(0.25, 0.0)).abs() > 0.1);
     }

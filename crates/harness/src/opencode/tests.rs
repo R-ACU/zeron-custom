@@ -94,6 +94,7 @@ impl TurnWire {
             controls: RunControls {
                 request_input: Box::new(|_| panic!("fixture must not ask for input")),
                 steering,
+                permission: tokio::sync::watch::channel(Default::default()).1,
                 interrupt: interrupt.clone(),
             },
             request: serde_json::from_value(

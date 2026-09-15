@@ -770,6 +770,12 @@ impl DocHost {
         lock(&self.inner.sessions).clone()
     }
 
+    /// The wired sessions engine, for the live controls the RPC layer serves
+    /// directly (permission mode) rather than through the command plane.
+    pub fn sessions_engine(&self) -> Option<SessionsEngine> {
+        self.sessions()
+    }
+
     /// Wire the sessions engine (engine assembly; see `SessionsEngine::set_doc_host`).
     pub fn set_sessions(&self, sessions: SessionsEngine) {
         let statuses = sessions.watch_sessions();

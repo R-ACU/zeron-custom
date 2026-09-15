@@ -665,6 +665,10 @@ struct ProviderModel {
     limit: ProviderLimit,
     name: Option<String>,
     variants: Option<std::collections::BTreeMap<String, serde::de::IgnoredAny>>,
+    /// USD per 1M tokens, straight off models.dev. Optional everywhere: 420
+    /// of the ~7.8k catalog models carry no `cost` key at all.
+    #[serde(default)]
+    cost: Option<crate::pricing_table::OpencodeCost>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -742,6 +746,14 @@ fn models_from_providers(providers: &ProviderCatalog) -> Vec<Model> {
                     description: Some(provider_name.to_owned()),
                     reasoning_levels: levels,
                     options: Vec::new(),
+                    // Real catalog prices — opencode bills per token, so this
+                    // is the one harness whose session cost chip is shown.
+                    pricing: crate::pricing_table::from_opencode_cost(
+                        provider_id,
+                        model_id,
+                        model.name.as_deref(),
+                        model.cost.as_ref(),
+                    ),
                 }
             })
             .collect();
@@ -908,6 +920,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        permission: _live_permission,
     } = controls;
     let request_input = Arc::new(request_input);
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
@@ -2465,6 +2478,7 @@ fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
                             })
                             .unwrap_or_default(),
                         multi_select: q.get("multiple").and_then(Value::as_bool).unwrap_or(false),
+                        allow_label: None,
                     })
                 })
                 .collect()

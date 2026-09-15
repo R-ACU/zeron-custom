@@ -31,6 +31,8 @@ async fn main() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        // Probes run unattended: a fixed, never-changing mode.
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::default()).1,
     };
     let request = RunRequest {
         prompt: "Use spawn_subagent to launch ONE subagent of type general with description \

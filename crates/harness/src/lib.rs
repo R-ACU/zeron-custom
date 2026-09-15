@@ -16,12 +16,12 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, Model, PermissionMode, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +52,14 @@ pub struct RunControls {
     >,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
+    /// The chat's LIVE permission mode. Seeded from the run request and
+    /// updated whenever the user moves the composer's Permissions chip while
+    /// this run is still alive, so a mode change takes effect on the running
+    /// process instead of only on the next fresh run. Adapters watch it and
+    /// push the change down their own wire where the agent supports one
+    /// (claude `set_permission_mode`, ACP `session/set_config_option`);
+    /// everything else at least stops gating what the new mode allows.
+    pub permission: watch::Receiver<PermissionMode>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
@@ -119,6 +127,7 @@ pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
+pub mod pricing_table;
 pub mod shell_env;
 #[cfg(windows)]
 pub(crate) mod win;
@@ -156,7 +165,10 @@ pub(crate) fn candidate_names(exe: &str) -> Vec<String> {
 /// Node version managers' bin dirs — each tried with every name
 /// [`candidate_names`] allows. The single resolver every adapter uses, so a
 /// CLI that resolves for one of them resolves for all of them.
-pub(crate) fn find_executable(exe: &str, extra_dirs: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+pub(crate) fn find_executable(
+    exe: &str,
+    extra_dirs: Vec<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();

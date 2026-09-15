@@ -873,7 +873,9 @@ impl ValueTweens {
     /// currently sits, so the next retarget glides from there instead of
     /// snapping (the slider's thumb must never teleport on its second move).
     pub fn active_at(&mut self, key: &str, now: Instant) -> bool {
-        self.entries.get(key).is_some_and(|entry| !entry.settled(now))
+        self.entries
+            .get(key)
+            .is_some_and(|entry| !entry.settled(now))
     }
 
     /// Forget `key` (the element unmounted).

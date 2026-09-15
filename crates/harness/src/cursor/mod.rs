@@ -312,6 +312,7 @@ fn static_models() -> Vec<Model> {
             description: Some("Cursor picks the model per request".into()),
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+            pricing: None,
         },
         Model {
             id: "composer-2.5".into(),
@@ -319,6 +320,7 @@ fn static_models() -> Vec<Model> {
             description: Some("Cursor's own fast coding model".into()),
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+            pricing: None,
         },
     ]
 }
@@ -402,6 +404,7 @@ fn map_model_items(items: &Value) -> Vec<Model> {
                 description: str_of(item, "description"),
                 reasoning_levels: Vec::new(),
                 options,
+                pricing: None,
             })
         })
         .collect()
@@ -456,6 +459,7 @@ async fn run_session(session: Session) {
         request_input: _request_input,
         mut steering,
         interrupt,
+        permission: _live_permission,
     } = controls;
 
     let mut assistant_message_id = new_message_id();
@@ -943,10 +947,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {

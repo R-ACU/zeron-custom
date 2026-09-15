@@ -34,6 +34,8 @@ async fn main() -> anyhow::Result<()> {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        // Probes run unattended: a fixed, never-changing mode.
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::default()).1,
     };
     let request = RunRequest {
         prompt: "Reply with exactly: Devin model discovery verified. Do not use tools.".into(),

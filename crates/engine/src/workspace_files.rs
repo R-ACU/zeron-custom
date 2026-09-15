@@ -1661,8 +1661,7 @@ mod windows_identity {
         // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid out-param;
         // the handle is owned by `file` and outlives the call.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        let ok =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
         if ok == 0 {
             return None;
         }
@@ -1687,7 +1686,8 @@ fn same_file_revision(before: &FileRevision, after: &FileRevision) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        before.metadata.dev() == after.metadata.dev() && before.metadata.ino() == after.metadata.ino()
+        before.metadata.dev() == after.metadata.dev()
+            && before.metadata.ino() == after.metadata.ino()
     }
     #[cfg(windows)]
     {

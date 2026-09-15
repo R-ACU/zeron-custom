@@ -103,6 +103,7 @@ impl Harness for HeldHarness {
                 question: "which one?".into(),
                 options: vec!["a".into(), "b".into()],
                 multi_select: false,
+                allow_label: None,
             }]);
         }
         let mut finish = self.finish.subscribe();

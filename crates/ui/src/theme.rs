@@ -394,7 +394,9 @@ pub(crate) fn lock_appearance() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) fn lock_glass_strength() -> std::sync::MutexGuard<'static, ()> {
     static GLASS_STRENGTH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GLASS_STRENGTH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    GLASS_STRENGTH_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Point the context-free paint helpers at an appearance. Called by
@@ -967,7 +969,11 @@ impl Theme {
     /// itself stays opaque off macOS either way.
     pub fn is_frost(&self) -> bool {
         self.surface_treatment == SurfaceTreatment::Frosted
-            && cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+            && cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            ))
     }
 
     /// Theme-owned hover wash for chrome that sits on glass (sidebar rows,
@@ -2029,8 +2035,14 @@ mod tests {
         assert!((glass_alpha_from_strength(0.0, base) - 0.97).abs() < 1e-6);
         assert!((glass_alpha_from_strength(1.0, base) - 0.45).abs() < 1e-6);
         // Out-of-range input clamps rather than extrapolating.
-        assert_eq!(glass_alpha_from_strength(-1.0, base), glass_alpha_from_strength(0.0, base));
-        assert_eq!(glass_alpha_from_strength(2.0, base), glass_alpha_from_strength(1.0, base));
+        assert_eq!(
+            glass_alpha_from_strength(-1.0, base),
+            glass_alpha_from_strength(0.0, base)
+        );
+        assert_eq!(
+            glass_alpha_from_strength(2.0, base),
+            glass_alpha_from_strength(1.0, base)
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ async fn live_run(cancel: bool) {
     let interrupt = CancellationToken::new();
     let controls = RunControls {
         steering,
+        permission: tokio::sync::watch::channel(zeron_proto::PermissionMode::Bypass).1,
         interrupt: interrupt.clone(),
         request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel();

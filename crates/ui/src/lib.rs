@@ -44,6 +44,7 @@ pub mod notify;
 pub mod permission_picker;
 pub mod pickers;
 pub mod popover;
+pub mod pricing;
 pub mod queue;
 pub mod rail;
 pub mod reasoning_slider;

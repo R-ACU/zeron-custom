@@ -645,6 +645,13 @@ pub struct AppState {
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<zeron_doc::QueuedMessage>,
     pub context_usage: Option<zeron_proto::ContextUsage>,
+    /// chat_id -> cumulative reported token usage, as the engine folds it from
+    /// the harnesses' `Usage` passthrough. SESSION-LOCAL: the event is never
+    /// persisted to a doc, so this starts empty on every app start and the
+    /// composer's cost chip only ever estimates the CURRENT run of the app.
+    /// Kept per chat (not cleared on selection change) so switching away and
+    /// back does not appear to reset a chat's spend.
+    pub session_usage: HashMap<String, zeron_proto::UsageTotals>,
     /// The selected chat's opening `WatchDocMessages` reset has landed. An
     /// empty transcript is otherwise indistinguishable from the pre-replay
     /// gap after selection, where optimistic echoes may already be visible.
@@ -738,6 +745,7 @@ impl AppState {
             transcript: Vec::new(),
             queue: Vec::new(),
             context_usage: None,
+            session_usage: HashMap::new(),
             transcript_replayed: false,
             transcript_revision: 0,
             echoes: HashMap::new(),
@@ -874,9 +882,11 @@ impl AppState {
             && !self.chats.iter().any(|c| &c.id == selected)
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
+            let selected = selected.clone();
             self.selected_chat = None;
             self.transcript.clear();
             self.context_usage = None;
+            self.session_usage.remove(&selected);
             self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_replayed = false;
             self.transcript_task = None;
@@ -1625,6 +1635,7 @@ impl AppState {
         self.spaces_synced = false;
         self.transcript.clear();
         self.context_usage = None;
+        self.session_usage.clear();
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.echoes.clear();
@@ -2236,6 +2247,47 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
     })
 }
 
+impl AppState {
+    /// Fold a cumulative usage report from the engine into this chat's totals.
+    /// See [`crate::pricing::merge_totals`] for why it takes the maximum.
+    pub(crate) fn record_session_usage(
+        &mut self,
+        chat_id: &str,
+        billed: zeron_proto::UsageTotals,
+        cx: &mut Context<Self>,
+    ) {
+        if self.apply_session_usage(chat_id, billed) {
+            cx.notify();
+        }
+    }
+
+    /// The pure half of [`Self::record_session_usage`]: returns whether the
+    /// chat's totals actually moved.
+    pub(crate) fn apply_session_usage(
+        &mut self,
+        chat_id: &str,
+        billed: zeron_proto::UsageTotals,
+    ) -> bool {
+        let merged = crate::pricing::merge_totals(self.session_usage.get(chat_id).copied(), billed);
+        if self.session_usage.get(chat_id) == Some(&merged) {
+            return false;
+        }
+        self.session_usage.insert(chat_id.to_owned(), merged);
+        true
+    }
+
+    /// Cumulative reported tokens for the SELECTED chat, if any have been
+    /// reported since the app started. `None` keeps the composer's cost chip
+    /// hidden rather than showing a confident "$0.00".
+    pub fn selected_session_usage(&self) -> Option<zeron_proto::UsageTotals> {
+        let chat_id = self.selected_chat.as_deref()?;
+        self.session_usage
+            .get(chat_id)
+            .copied()
+            .filter(|t| !t.is_empty())
+    }
+}
+
 fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
@@ -2269,6 +2321,15 @@ fn spawn_transcript_watch(
                 }
             };
             while let Some(value) = rx.recv().await {
+                // `sessionUsage` rides ALONGSIDE the doc-owned TranscriptUpdate
+                // shape (see the engine's doc_messages_stream): billing usage is
+                // a harness passthrough that never enters a doc, so it is read
+                // off the raw frame before the doc type parses the rest. Older
+                // engines simply omit the key.
+                let billed: Option<zeron_proto::UsageTotals> = value
+                    .get("sessionUsage")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok());
                 let update: zeron_doc::TranscriptUpdate = match serde_json::from_value(value) {
                     Ok(frame) => frame,
                     Err(err) => {
@@ -2292,6 +2353,9 @@ fn spawn_transcript_watch(
                         if state.context_usage != usage {
                             state.context_usage = usage;
                             cx.notify();
+                        }
+                        if let Some(billed) = billed {
+                            state.record_session_usage(&chat_id, billed, cx);
                         }
                         if let Err(err) = state.receive_transcript_frame(frame, cx) {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
@@ -3038,6 +3102,53 @@ mod tests {
             status: None,
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn session_usage_accumulates_per_chat_and_survives_switching() {
+        use zeron_proto::UsageTotals;
+        let totals = |i: u64, o: u64| UsageTotals {
+            input_tokens: i,
+            output_tokens: o,
+        };
+        let mut state = AppState::new();
+        state.selected_chat = Some("a".into());
+        // Nothing reported yet: no chip, not a confident zero.
+        assert_eq!(state.selected_session_usage(), None);
+        assert!(state.apply_session_usage("a", totals(0, 0)));
+        assert_eq!(
+            state.selected_session_usage(),
+            None,
+            "an all-zero report is still nothing to show"
+        );
+
+        assert!(state.apply_session_usage("a", totals(1_200, 300)));
+        assert_eq!(state.selected_session_usage(), Some(totals(1_200, 300)));
+        // Cumulative reports replace; a stale replay can never walk them back.
+        assert!(state.apply_session_usage("a", totals(4_000, 900)));
+        assert!(!state.apply_session_usage("a", totals(1_200, 300)));
+        assert_eq!(state.selected_session_usage(), Some(totals(4_000, 900)));
+
+        // A second chat keeps its own running total…
+        state.selected_chat = Some("b".into());
+        assert_eq!(state.selected_session_usage(), None);
+        state.apply_session_usage("b", totals(10, 20));
+        assert_eq!(state.selected_session_usage(), Some(totals(10, 20)));
+        // …and switching back does not appear to reset the first one.
+        state.selected_chat = Some("a".into());
+        assert_eq!(state.selected_session_usage(), Some(totals(4_000, 900)));
+
+        // What the footer chip renders for those tokens.
+        let pricing =
+            zeron_proto::ModelPricing::usd(3.0, Some(0.3), 15.0, zeron_proto::PriceSource::Catalog);
+        let usd = crate::pricing::estimate_usd(state.selected_session_usage().unwrap(), &pricing)
+            .unwrap();
+        assert_eq!(crate::pricing::format_estimate(usd), "$0.03");
+
+        // The totals are session-local: nothing persists them, and a runtime
+        // replacement (prepare_runtime_replacement) clears the map outright.
+        state.session_usage.clear();
+        assert_eq!(state.selected_session_usage(), None);
     }
 
     #[test]

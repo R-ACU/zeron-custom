@@ -16,6 +16,7 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
+pub mod api_keys;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
@@ -131,6 +132,9 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    /// Provider API keys, exported into this process's environment so spawned
+    /// agent CLIs inherit them.
+    pub api_keys: api_keys::ApiKeys,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -283,6 +287,9 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        // Exports the stored provider keys into this process's environment right
+        // here, so every agent CLI spawned later inherits them.
+        let api_keys = api_keys::ApiKeys::shared(data_dir);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -309,6 +316,7 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            api_keys,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -441,6 +449,7 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
+        .with_api_keys(self.api_keys.clone())
         .with_auth(self.auth())
         .with_previews(self.previews.clone());
         if let Some(links) = self.links() {

@@ -1042,6 +1042,12 @@ impl Pickers {
         }
     }
 
+    /// Prices for the model a send would use right now — the composer's
+    /// session cost chip reads this alongside [`Self::resolved`].
+    pub fn resolved_pricing(&self, cx: &App) -> Option<zeron_proto::ModelPricing> {
+        self.selected_model(cx)?.pricing.clone()
+    }
+
     // ---- open/close ----
 
     /// The picker that's open AND interactive — `None` while one animates out.
@@ -3765,25 +3771,28 @@ impl Pickers {
         //    Traits popover folded in here, user request). Hidden entirely
         //    until a model resolves.
         let effort_card = self.render_effort_card(cx);
+        let cost_row = self.render_cost_row(cx);
         let has_options = self
             .selected_model(cx)
             .is_some_and(|m| !m.options.is_empty());
-        let tray: Option<AnyElement> = (effort_card.is_some() || has_options).then(|| {
-            let sections = has_options.then(|| self.render_traits_sections(cx));
-            div()
-                .id("model-traits-tray")
-                .flex_none()
-                .border_t_1()
-                .border_color(crate::theme::hairline(0.08))
-                // Long option stacks scroll inside the tray rather than
-                // growing the card past the viewport.
-                .max_h(px(300.0))
-                .overflow_y_scroll()
-                .pb(px(6.0))
-                .children(effort_card)
-                .child(div().px(px(6.0)).children(sections))
-                .into_any_element()
-        });
+        let tray: Option<AnyElement> = (effort_card.is_some() || cost_row.is_some() || has_options)
+            .then(|| {
+                let sections = has_options.then(|| self.render_traits_sections(cx));
+                div()
+                    .id("model-traits-tray")
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    // Long option stacks scroll inside the tray rather than
+                    // growing the card past the viewport.
+                    .max_h(px(300.0))
+                    .overflow_y_scroll()
+                    .pb(px(6.0))
+                    .children(effort_card)
+                    .children(cost_row)
+                    .child(div().px(px(6.0)).children(sections))
+                    .into_any_element()
+            });
 
         div()
             .flex()
@@ -4099,6 +4108,123 @@ impl Pickers {
                 .border_color(crate::theme::hairline(0.06))
                 .flex()
                 .flex_col()
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// The COST row under the effort slider: per-million list prices for the
+    /// selected model as three labelled columns (Input / Cached input /
+    /// Output), matching the reference footer. A free model collapses to one
+    /// muted word; a model with no published price hides the section entirely
+    /// rather than showing zeros. `ListPrice` rows carry a muted "list price"
+    /// hint beside the heading so subscription users read them as
+    /// informational.
+    fn render_cost_row(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let pricing = self.selected_model(cx)?.pricing.clone()?;
+        let heading = |text: String, muted: f32, size: f32| {
+            div()
+                .text_size(crate::typography::ui_rems(size))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted.opacity(muted))
+                .child(SharedString::from(text))
+        };
+        let body: AnyElement = if pricing.is_free() {
+            div()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from(crate::pricing::FREE_LABEL))
+                .into_any_element()
+        } else {
+            // Label above value, three equal columns: the popover is 304px
+            // wide and "Cached input $0.26 / 1M" does not fit on one line.
+            let column = |label: &'static str, value: Option<f64>| {
+                let value = value.map(crate::pricing::format_price);
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(9.0))
+                            .text_color(theme.text_muted.opacity(0.55))
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap(px(3.0))
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .child(
+                                div()
+                                    .text_color(theme.text.opacity(0.85))
+                                    .child(SharedString::from(value.unwrap_or_else(|| "-".into()))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(9.0))
+                                    .text_color(theme.text_muted.opacity(0.5))
+                                    .child(SharedString::from(crate::pricing::PER_MILLION_SUFFIX)),
+                            ),
+                    )
+            };
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .gap(px(6.0))
+                .child(column(
+                    crate::pricing::INPUT_LABEL,
+                    Some(pricing.input_per_million),
+                ))
+                .child(column(
+                    crate::pricing::CACHED_INPUT_LABEL,
+                    pricing.cached_input_per_million,
+                ))
+                .child(column(
+                    crate::pricing::OUTPUT_LABEL,
+                    Some(pricing.output_per_million),
+                ))
+                .into_any_element()
+        };
+        let caption = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_baseline()
+            .justify_between()
+            .pb(px(3.0))
+            .child(heading(
+                popover::tracked_upper(crate::pricing::COST_LABEL),
+                0.6,
+                10.0,
+            ))
+            .when(
+                pricing.source == zeron_proto::PriceSource::ListPrice,
+                |row| {
+                    row.child(heading(
+                        crate::pricing::LIST_PRICE_HINT.to_owned(),
+                        0.5,
+                        10.0,
+                    ))
+                },
+            );
+        Some(
+            div()
+                .w_full()
+                .px(px(EFFORT_ROW_PAD))
+                .pt(px(6.0))
+                .pb(px(7.0))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.06))
+                .flex()
+                .flex_col()
+                .child(caption)
                 .child(body)
                 .into_any_element(),
         )
@@ -4987,6 +5113,7 @@ mod tests {
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+            pricing: None,
         }
     }
 
@@ -5343,7 +5470,10 @@ mod tests {
 
     #[test]
     fn the_1m_context_variants_ride_with_their_flagship() {
-        assert!(is_flagship_model(HarnessId::ClaudeCode, "claude-opus-5[1m]"));
+        assert!(is_flagship_model(
+            HarnessId::ClaudeCode,
+            "claude-opus-5[1m]"
+        ));
         assert!(is_flagship_model(HarnessId::Mock, "claude-sonnet-5"));
         // A previous generation is not a flagship, and the prefixes never
         // swallow the older point releases.
@@ -5645,6 +5775,7 @@ mod tests {
                     default_choice: "normal".into(),
                 },
             ],
+            pricing: None,
         };
         let mut selections = serde_json::Map::new();
         selections.insert("context".into(), serde_json::Value::String("1m".into()));
@@ -5847,6 +5978,7 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                pricing: None,
             },
             Model {
                 id: "fast".into(),
@@ -5854,6 +5986,7 @@ mod tests {
                 description: None,
                 reasoning_levels: vec![],
                 options: vec![],
+                pricing: None,
             },
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));

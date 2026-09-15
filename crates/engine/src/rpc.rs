@@ -64,6 +64,7 @@ use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
+use crate::api_keys::ApiKeys;
 use crate::auth::Auth;
 use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
@@ -82,6 +83,13 @@ const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
     chat_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetPermissionModeParams {
+    chat_id: String,
+    permission: zeron_proto::PermissionMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +331,21 @@ struct StartAgentLoginParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ApiKeyProviderParams {
+    provider: zeron_proto::ApiKeyProvider,
+}
+
+/// `SetApiKey`. NOT `Debug` — `key` is the plaintext secret and must never be
+/// formatted into a log line.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetApiKeyParams {
+    provider: zeron_proto::ApiKeyProvider,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LoginIdParams {
     login_id: String,
 }
@@ -475,6 +498,7 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    api_keys: Option<ApiKeys>,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
@@ -516,6 +540,7 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            api_keys: None,
             auth: None,
             links: None,
             updater: None,
@@ -526,6 +551,12 @@ impl EngineRpc {
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    /// Attach the provider API-key store (ListApiKeys / SetApiKey / RemoveApiKey).
+    pub fn with_api_keys(mut self, api_keys: ApiKeys) -> Self {
+        self.api_keys = Some(api_keys);
         self
     }
 
@@ -557,6 +588,12 @@ impl EngineRpc {
         self.auth
             .as_ref()
             .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
+    }
+
+    fn require_api_keys(&self) -> Result<&ApiKeys, RpcError> {
+        self.api_keys
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("API key store unavailable".into()))
     }
 
     fn updater(&self) -> Result<&zeron_update::Updater, RpcError> {
@@ -1021,9 +1058,22 @@ where
 /// The transcript watch as delta frames (`zeron_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
+/// `WatchDocMessages` frames: transcript delta + the doc's context snapshot,
+/// plus `sessionUsage` — the chat's cumulative reported token usage.
+///
+/// `sessionUsage` rides ALONGSIDE the `TranscriptUpdate` shape rather than
+/// inside it on purpose: `AgentEvent::Usage` is a passthrough the doc never
+/// stores, so it has no place in a doc type. It is an extra JSON key; readers
+/// that don't know it ignore it, and readers that do pick it out of the raw
+/// frame. The value is CUMULATIVE (not a delta), so a resubscribe or a missed
+/// frame can never double-count or lose tokens.
 fn doc_messages_stream(
     rx: watch::Receiver<std::sync::Arc<Vec<zeron_doc::SessionMessageEntry>>>,
     doc: std::sync::Arc<zeron_doc::SessionDoc>,
+    // `None` skips the session-usage side channel (tests, or a stream
+    // without a live engine).
+    sessions: Option<crate::sessions::SessionsEngine>,
+    chat_id: String,
 ) -> BoxStream<'static, serde_json::Value> {
     use zeron_doc::transcript_delta::{TranscriptFrame, diff_transcript};
     futures::stream::unfold(
@@ -1032,8 +1082,9 @@ fn doc_messages_stream(
             None::<std::sync::Arc<Vec<zeron_doc::SessionMessageEntry>>>,
             doc,
             None,
+            (sessions, chat_id, None),
         ),
-        |(mut rx, mut prev, doc, mut previous_usage)| async move {
+        |(mut rx, mut prev, doc, mut previous_usage, mut billing)| async move {
             loop {
                 if prev.is_some() {
                     rx.changed().await.ok()?;
@@ -1049,16 +1100,25 @@ fn doc_messages_stream(
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
                 let usage = doc.context_usage();
-                if frame.is_empty_delta() && usage == previous_usage {
+                let (sessions, chat_id, previous_billing) = &mut billing;
+                let billed = sessions.as_ref().and_then(|s| s.usage_totals(chat_id));
+                if frame.is_empty_delta() && usage == previous_usage && billed == *previous_billing
+                {
                     continue;
                 }
                 previous_usage = usage;
-                let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
+                *previous_billing = billed;
+                let mut value = serde_json::to_value(zeron_doc::TranscriptUpdate {
                     frame,
                     context_usage: usage,
                 })
                 .ok()?;
-                return Some((value, (rx, prev, doc, previous_usage)));
+                if let (Some(object), Some(billed)) = (value.as_object_mut(), billed) {
+                    if let Ok(billed) = serde_json::to_value(billed) {
+                        object.insert("sessionUsage".into(), billed);
+                    }
+                }
+                return Some((value, (rx, prev, doc, previous_usage, billing)));
             }
         },
     )
@@ -1241,6 +1301,16 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
+            methods::SET_PERMISSION_MODE => {
+                let p: SetPermissionModeParams = parse_params(params)?;
+                let applied = match self.doc_host.sessions_engine() {
+                    Some(sessions) => sessions
+                        .set_permission_mode(&p.chat_id, p.permission)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    None => false,
+                };
+                RpcReply::value(&serde_json::json!({ "applied": applied }))
+            }
             methods::RETRY_DELIVERY => {
                 let p: ChatParams = parse_params(params)?;
                 self.doc_host
@@ -1266,6 +1336,8 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                     handle.doc_arc(),
+                    Some(self.sessions.clone()),
+                    p.chat_id.clone(),
                 )))
             }
             methods::WATCH_QUEUE => {
@@ -2246,6 +2318,26 @@ impl RpcService for EngineRpc {
                 self.agent_accounts.cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            // Provider API keys. Device-local and IPC-only (see the method
+            // docs): they configure THIS engine's process environment, so a
+            // relayed call would silently configure the wrong machine.
+            methods::LIST_API_KEYS => RpcReply::value(&self.require_api_keys()?.list()),
+            methods::SET_API_KEY => {
+                let p: SetApiKeyParams = parse_params(params)?;
+                let snapshot = self
+                    .require_api_keys()?
+                    .set(p.provider, &p.key)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::REMOVE_API_KEY => {
+                let p: ApiKeyProviderParams = parse_params(params)?;
+                let snapshot = self
+                    .require_api_keys()?
+                    .remove(p.provider)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;
                 self.uploads
@@ -2400,7 +2492,7 @@ mod context_usage_tests {
             .import(&host.export_snapshot().unwrap())
             .unwrap();
         let (tx, rx) = watch::channel(Arc::new(Vec::new()));
-        let mut stream = doc_messages_stream(rx, remote.clone());
+        let mut stream = doc_messages_stream(rx, remote.clone(), None, String::new());
         let first = stream.next().await.unwrap();
         assert_eq!(first["contextUsage"]["tokens"], 42000);
         assert!(first.get("reset").is_some());
@@ -2422,7 +2514,7 @@ mod context_usage_tests {
             .unwrap();
         assert_eq!(update["contextUsage"]["tokens"], 0);
         assert_eq!(update["contextUsage"]["window"], 200000);
-        let mut reconnect = doc_messages_stream(tx.subscribe(), remote.clone());
+        let mut reconnect = doc_messages_stream(tx.subscribe(), remote.clone(), None, String::new());
         assert_eq!(
             reconnect.next().await.unwrap()["contextUsage"],
             update["contextUsage"]
