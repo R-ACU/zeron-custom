@@ -326,6 +326,7 @@ async fn workspace_file_rpcs_preserve_plain_folder_search_support() {
     core.shutdown().await;
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_rejects_changed_checkout_even_when_contents_match() {
     let temp = tempfile::tempdir().expect("tempdir");

@@ -1360,12 +1360,19 @@ impl DeviceIdentityLock {
         {
             use std::os::windows::fs::OpenOptionsExt;
             options.share_mode(0);
-            let mut retries = 200;
+            // ERROR_SHARING_VIOLATION (32) is what the exclusive share mode
+            // reports while another engine holds the lock; std maps it to an
+            // uncategorised kind, so match the raw code. Concurrent boots on
+            // one machine queue up behind each other here.
+            const ERROR_SHARING_VIOLATION: i32 = 32;
+            let mut retries = 2000;
             let file = loop {
                 match options.open(&path) {
                     Ok(file) => break file,
                     Err(err)
-                        if err.kind() == std::io::ErrorKind::PermissionDenied && retries > 0 =>
+                        if (err.kind() == std::io::ErrorKind::PermissionDenied
+                            || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+                            && retries > 0 =>
                     {
                         retries -= 1;
                         std::thread::sleep(std::time::Duration::from_millis(5));

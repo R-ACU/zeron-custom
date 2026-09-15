@@ -1015,6 +1015,7 @@ async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
 // Terminals
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_e2e_replay_live_resize_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1114,6 +1115,7 @@ async fn terminal_e2e_replay_live_resize_exit() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_guards_input_size_and_cwd() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1139,6 +1141,7 @@ async fn terminal_guards_input_size_and_cwd() {
 // RPC dispatch over the in-memory transport
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rpc_dispatch_for_m5_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");

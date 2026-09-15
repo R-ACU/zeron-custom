@@ -727,6 +727,7 @@ async fn target_device_id_routes_over_the_relay() {
 
 /// M5: terminals are device-addressable — OpenTerminal/WriteTerminal forward as
 /// unary calls and SubscribeTerminal proxies its stream through the relay.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_stream_proxies_over_the_relay() {
     use base64::Engine as _;
