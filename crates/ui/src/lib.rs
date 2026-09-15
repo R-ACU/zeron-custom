@@ -45,6 +45,7 @@ pub mod pickers;
 pub mod popover;
 pub mod queue;
 pub mod rail;
+pub mod reasoning_slider;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -290,7 +291,9 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: None,
+                    // Windows shows the HWND text in the taskbar and Alt+Tab; the
+                    // caption itself is still custom-drawn.
+                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

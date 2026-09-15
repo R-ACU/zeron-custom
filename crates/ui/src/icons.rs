@@ -196,6 +196,7 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    (KIMI_MARK, "kimi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
 ];
 

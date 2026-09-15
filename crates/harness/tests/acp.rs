@@ -625,6 +625,20 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             zeron_proto::ReasoningLevel::Max,
         ]
     );
+
+    let kimi = AcpHarness::kimi();
+    assert_eq!(kimi.id(), HarnessId::Kimi);
+    assert_eq!(kimi.display_name(), "Kimi");
+    assert!(kimi.supports_steering());
+    assert_eq!(kimi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        kimi.reasoning_levels(),
+        &[
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::Max,
+        ]
+    );
 }
 
 #[tokio::test]

@@ -49,7 +49,14 @@ pub struct ComposerDefaults {
     /// Last model picked, per harness (restored on harness switch).
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
     /// Last reasoning level picked (global, like zeron's `reasoning` key).
+    /// Legacy: effort is per MODEL now ([`Self::effort_by_model`]); this is
+    /// only kept so an existing file still reads and round-trips.
     pub reasoning: Option<ReasoningLevel>,
+    /// Effort level per MODEL, keyed `"<harness>/<model id>"` (see
+    /// [`effort_key`]). A level is chosen for the model it was chosen on:
+    /// switching models restores that model's own effort instead of dragging
+    /// the last pick along (user request).
+    pub effort_by_model: HashMap<String, ReasoningLevel>,
     /// Last non-default model option picks (option id → choice id), per
     /// harness and model id. Model-scoped because each pick was validated
     /// against that model's catalog row, so it stays safe to send before the
@@ -69,6 +76,17 @@ pub struct ComposerDefaults {
     pub no_project: bool,
     /// Starred models (the picker's favorites rail), in starring order.
     pub favorites: Vec<FavoriteModel>,
+}
+
+/// The `effortByModel` key for one model: the harness's wire name and the
+/// model id, e.g. `"claude-code/claude-haiku-4-5"`. Derived from the serde
+/// representation so a newly added harness needs no change here.
+pub fn effort_key(harness: HarnessId, model: &str) -> String {
+    let harness = serde_json::to_value(harness)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{harness}/{model}")
 }
 
 impl ComposerDefaults {
@@ -141,6 +159,19 @@ impl ComposerDefaults {
             .or_default()
             .entry(model.to_string())
             .or_default()
+    }
+
+    /// The remembered effort level for one model, if it ever got a pick.
+    pub fn effort_for(&self, harness: HarnessId, model: &str) -> Option<ReasoningLevel> {
+        self.effort_by_model
+            .get(&effort_key(harness, model))
+            .copied()
+    }
+
+    /// Remember an effort pick for ONE model (never for the whole app).
+    pub fn remember_effort(&mut self, harness: HarnessId, model: &str, level: ReasoningLevel) {
+        self.effort_by_model
+            .insert(effort_key(harness, model), level);
     }
 
     /// The cached display label for a model id, if ever seen.
@@ -217,6 +248,40 @@ mod tests {
         assert_eq!(
             loaded.model_for(HarnessId::ClaudeCode).map(|m| &*m.label),
             Some("Fable 5")
+        );
+    }
+
+    #[test]
+    fn effort_is_remembered_per_model_and_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut defaults = ComposerDefaults::default();
+        defaults.remember_effort(
+            HarnessId::ClaudeCode,
+            "claude-opus-5",
+            ReasoningLevel::Max,
+        );
+        defaults.remember_effort(HarnessId::Codex, "gpt-5.2-codex", ReasoningLevel::Low);
+        // The key is "<harness>/<model id>", so the two never collide.
+        assert_eq!(
+            effort_key(HarnessId::ClaudeCode, "claude-opus-5"),
+            "claude-code/claude-opus-5"
+        );
+        assert!(defaults.effort_by_model.contains_key("codex/gpt-5.2-codex"));
+        // A model nobody picked for has no entry (it falls back to its own
+        // catalog default at the picker).
+        assert_eq!(
+            defaults.effort_for(HarnessId::ClaudeCode, "claude-haiku-4-5"),
+            None
+        );
+        defaults.save(dir.path()).unwrap();
+        let loaded = ComposerDefaults::load(dir.path());
+        assert_eq!(
+            loaded.effort_for(HarnessId::ClaudeCode, "claude-opus-5"),
+            Some(ReasoningLevel::Max)
+        );
+        assert_eq!(
+            loaded.effort_for(HarnessId::Codex, "gpt-5.2-codex"),
+            Some(ReasoningLevel::Low)
         );
     }
 

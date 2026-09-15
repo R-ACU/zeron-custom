@@ -552,6 +552,28 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
+    // Kimi Code CLI over ACP (`kimi acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::kimi() exactly. No `_session/steering`
+    // extension in `initialize` (turn-boundary steers); the effort ladder
+    // (low/high/max, no medium) applies per session via the `thinking`
+    // config option (category "thought_level").
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Kimi,
+            name: "Kimi".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::kimi().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::kimi()) as Arc<dyn Harness>)),
+    );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
     // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
@@ -655,6 +677,7 @@ mod tests {
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
+                HarnessId::Kimi,
                 HarnessId::Opencode
             ]
         );
@@ -720,6 +743,18 @@ mod tests {
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
                 ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+        let kimi = registry.resolve(HarnessId::Kimi).unwrap();
+        assert_eq!(kimi.id(), HarnessId::Kimi);
+        assert_eq!(kimi.display_name(), "Kimi");
+        assert_eq!(kimi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            kimi.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
                 ReasoningLevel::Max
             ]
         );

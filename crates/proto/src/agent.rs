@@ -16,6 +16,8 @@ pub enum HarnessId {
     Hermes,
     /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
     Pi,
+    /// Moonshot AI's Kimi Code CLI, driven over ACP (`kimi acp`).
+    Kimi,
     /// SST's opencode agent, driven natively over its own HTTP/SSE server
     /// protocol (`opencode serve` — the same wire the opencode desktop app
     /// speaks).

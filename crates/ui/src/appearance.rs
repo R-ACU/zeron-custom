@@ -61,6 +61,8 @@ pub struct AppearanceState {
     pub themes: ThemeSelection,
     pub accent: AccentSelection,
     pub surface: SurfacePreference,
+    /// Device-local "Glass strength" slider — see [`crate::settings::UiSettings::glass_strength`].
+    pub glass_strength: f32,
 }
 
 impl Global for AppearanceState {}
@@ -85,6 +87,11 @@ pub fn init(
     cx: &mut App,
 ) {
     let system = Appearance::from_window(cx.window_appearance());
+    // Settings are loaded before `appearance::init` runs (see `lib.rs` boot
+    // order), so the persisted slider position is available here without
+    // threading it through this function's signature.
+    let glass_strength = crate::settings::current(cx).glass_strength;
+    crate::theme::set_glass_strength(glass_strength);
     tracing::debug!(?mode, ?system, "appearance: initial");
     cx.set_global(AppearanceState {
         mode,
@@ -92,6 +99,7 @@ pub fn init(
         themes: themes.clone(),
         accent,
         surface,
+        glass_strength,
     });
     sync_ns_appearance(mode);
     let appearance = resolve(mode, system);
@@ -127,6 +135,13 @@ pub fn surface(cx: &App) -> SurfacePreference {
     cx.try_global::<AppearanceState>()
         .map(|state| state.surface)
         .unwrap_or_default()
+}
+
+/// The device-local glass-strength slider position (0.0..=1.0).
+pub fn glass_strength(cx: &App) -> f32 {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.glass_strength)
+        .unwrap_or(crate::theme::GLASS_STRENGTH_DEFAULT)
 }
 
 /// Change the user's preference, repaint if that changed the palette, and write
@@ -194,6 +209,38 @@ pub fn set_surface(surface: SurfacePreference, cx: &mut App) {
     apply(cx);
     settings::update(SavePolicy::Immediate, cx, |settings| {
         settings.surface = surface;
+    });
+}
+
+/// Change the device-local glass-strength slider and repaint immediately.
+///
+/// Unlike [`set_surface`], this never changes theme/appearance/accent/surface
+/// *identity*, so it cannot go through [`apply`]'s change-detection — that
+/// check only compares those four fields and would treat an identity-only-equal
+/// theme as unchanged, skipping both the rebuild and `refresh_windows`. Forcing
+/// a [`Theme::reinstall_selection`] (the same escape hatch
+/// [`apply_registry_change`] uses) guarantees the new alpha actually reaches
+/// the next frame.
+pub fn set_glass_strength(value: f32, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let value = value.clamp(0.0, 1.0);
+    let state = cx.global_mut::<AppearanceState>();
+    if (state.glass_strength - value).abs() < f32::EPSILON {
+        return;
+    }
+    state.glass_strength = value;
+    let wanted = resolve(state.mode, state.system);
+    let accent = state.accent;
+    let surface = state.surface;
+    let variant_id = state.themes.variant_id(model_appearance(wanted)).to_owned();
+    crate::theme::set_glass_strength(value);
+    Theme::reinstall_selection(wanted, &variant_id, accent, surface, cx);
+    cx.refresh_windows();
+    reapply_window_background(cx);
+    settings::update(SavePolicy::Immediate, cx, |settings| {
+        settings.glass_strength = value;
     });
 }
 

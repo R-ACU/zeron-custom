@@ -626,6 +626,10 @@ pub struct UiSettings {
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
+    /// Device-local "Glass strength" slider (0.0..=1.0, default 0.5): how much
+    /// of the desktop shows through frosted windows. Only takes effect when
+    /// [`Self::surface`] resolves to frosted; see `Theme::glass`.
+    pub glass_strength: f32,
     /// Optional device-local artwork behind the blank new-thread composer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
@@ -688,6 +692,7 @@ impl Default for UiSettings {
             files_show_all: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
+            glass_strength: crate::theme::GLASS_STRENGTH_DEFAULT,
             new_thread_composer_background: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             legacy_accent_color: None,
@@ -1615,6 +1620,7 @@ mod tests {
             files_show_all: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
+            glass_strength: 0.72,
             new_thread_composer_background: Some(NewThreadComposerBackground {
                 path: "/tmp/zeron/new-thread-background.png".into(),
                 name: "background.png".into(),
@@ -1629,6 +1635,7 @@ mod tests {
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
+        assert!(json.contains(r#""glassStrength": 0.72"#));
     }
 
     #[test]
@@ -1717,6 +1724,7 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.accent, zeron_theme::AccentSelection::ThemeDefault);
         assert_eq!(loaded.surface, zeron_theme::SurfacePreference::ThemeDefault);
+        assert_eq!(loaded.glass_strength, crate::theme::GLASS_STRENGTH_DEFAULT);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
         assert!(loaded.sound_completion_enabled);

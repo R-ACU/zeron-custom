@@ -379,6 +379,10 @@ pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
 /// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
 /// blend every interactive hover wash rides in the original.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
+/// Effort-slider fill/thumb glide: 180ms ease-out (§ composer picker).
+pub const EFFORT_SLIDE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+/// Effort-slider sparkle field: one 6s drift cycle across the filled track.
+pub const EFFORT_SPARKLE: MotionSpec = MotionSpec::new(6000, EASE);
 /// Zeron loader pulse period: 2.4s.
 pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
@@ -776,6 +780,128 @@ pub fn hover_blend(key: &str, rest: Hsla, hover: Hsla) -> Hsla {
 }
 
 // ---------------------------------------------------------------------------
+// Value tweens (a scalar gliding to a new target)
+// ---------------------------------------------------------------------------
+//
+// The hover store above tweens a fixed 0→1 progress. Sliders and meters need
+// the same manual-drive tween for an ARBITRARY scalar (a fill fraction, a
+// position): each render declares the target, the store glides the painted
+// value toward it over `spec`, and the caller keeps frames coming (a pulse
+// lease) while [`value_tween_active`] reports the glide unfinished.
+//
+// Same store discipline as the hover fades: keyed by a caller-chosen string,
+// explicit-now pure core, thread-local wrapper fed wall time.
+
+#[derive(Debug, Clone, Copy)]
+struct ValueEntry {
+    origin: f32,
+    target: f32,
+    started: Instant,
+    duration: Duration,
+    curve: CubicBezier,
+}
+
+impl ValueEntry {
+    fn value(&self, now: Instant) -> f32 {
+        if self.duration.is_zero() {
+            return self.target;
+        }
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed >= self.duration {
+            return self.target;
+        }
+        let raw = elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        lerp(self.origin, self.target, self.curve.eval(raw))
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.origin == self.target || now.saturating_duration_since(self.started) >= self.duration
+    }
+}
+
+/// Per-key scalar tween store. Pure core (explicit `now`), unit-testable.
+#[derive(Default)]
+pub struct ValueTweens {
+    entries: HashMap<String, ValueEntry>,
+}
+
+impl ValueTweens {
+    /// The painted value for `key` at `now`, gliding toward `target` over
+    /// `spec`. A changed target restarts the glide from wherever the last one
+    /// had reached, so a mid-flight retarget never jumps. Reduced motion (or a
+    /// zero-length spec) snaps.
+    pub fn value_at(
+        &mut self,
+        key: &str,
+        target: f32,
+        spec: &MotionSpec,
+        reduced: bool,
+        now: Instant,
+    ) -> f32 {
+        let duration = if reduced {
+            Duration::ZERO
+        } else {
+            spec.total().mul_f32(speed_scale())
+        };
+        let current = self.entries.get(key).map(|e| e.value(now));
+        let retarget = match self.entries.get(key) {
+            Some(entry) => entry.target != target,
+            None => true,
+        };
+        if retarget {
+            self.entries.insert(
+                key.to_string(),
+                ValueEntry {
+                    // First sight of a key paints its target: a slider that
+                    // just mounted must not animate in from zero.
+                    origin: current.unwrap_or(target),
+                    target,
+                    started: now,
+                    duration,
+                    curve: spec.curve,
+                },
+            );
+        }
+        self.entries
+            .get(key)
+            .map(|e| e.value(now))
+            .unwrap_or(target)
+    }
+
+    /// Whether `key`'s glide is still mid-flight at `now` (→ keep frames
+    /// coming). A settled entry is KEPT: it is the memory of where the value
+    /// currently sits, so the next retarget glides from there instead of
+    /// snapping (the slider's thumb must never teleport on its second move).
+    pub fn active_at(&mut self, key: &str, now: Instant) -> bool {
+        self.entries.get(key).is_some_and(|entry| !entry.settled(now))
+    }
+
+    /// Forget `key` (the element unmounted).
+    pub fn forget(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+}
+
+thread_local! {
+    static VALUE_TWEENS: RefCell<ValueTweens> = RefCell::new(ValueTweens::default());
+}
+
+/// The painted value for `key` this frame, gliding toward `target` over `spec`.
+pub fn value_tween(key: &str, target: f32, spec: &MotionSpec, reduced: bool) -> f32 {
+    VALUE_TWEENS.with(|tweens| {
+        tweens
+            .borrow_mut()
+            .value_at(key, target, spec, reduced, Instant::now())
+    })
+}
+
+/// True while `key`'s glide is unfinished. Pair it with a [`pulse_lease`] so the
+/// view keeps re-rendering until it lands.
+pub fn value_tween_active(key: &str) -> bool {
+    VALUE_TWEENS.with(|tweens| tweens.borrow_mut().active_at(key, Instant::now()))
+}
+
+// ---------------------------------------------------------------------------
 // Reduced motion
 // ---------------------------------------------------------------------------
 
@@ -1132,5 +1258,56 @@ mod tests {
         assert!(mid_fall > 0.1 && mid_fall < 1.0, "eases down");
         let mid_rise = gspin_opacity(0.96, 0.1);
         assert!(mid_rise > 0.1 && mid_rise < 1.0, "eases up");
+    }
+
+    #[test]
+    fn value_tween_snaps_on_first_sight_then_glides_to_a_new_target() {
+        let mut tweens = ValueTweens::default();
+        let t0 = Instant::now();
+        // First sight paints the target (no animate-in from zero).
+        assert_close(
+            tweens.value_at("slider", 0.5, &EFFORT_SLIDE, false, t0),
+            0.5,
+            1e-6,
+            "first sight",
+        );
+        assert!(!tweens.active_at("slider", t0), "settled on arrival");
+        // A new target glides from where the last one landed: the retarget
+        // frame still paints the old value, the next frames travel.
+        assert_close(
+            tweens.value_at("slider", 1.0, &EFFORT_SLIDE, false, t0),
+            0.5,
+            1e-6,
+            "retarget frame",
+        );
+        let mid = t0 + Duration::from_millis(90);
+        let painted = tweens.value_at("slider", 1.0, &EFFORT_SLIDE, false, mid);
+        assert!(
+            painted > 0.5 && painted < 1.0,
+            "mid-flight value {painted} between endpoints"
+        );
+        assert!(tweens.active_at("slider", mid), "still gliding");
+        let done = t0 + Duration::from_millis(400);
+        assert_close(
+            tweens.value_at("slider", 1.0, &EFFORT_SLIDE, false, done),
+            1.0,
+            1e-6,
+            "lands on target",
+        );
+        assert!(!tweens.active_at("slider", done), "glide finished");
+    }
+
+    #[test]
+    fn value_tween_reduced_motion_snaps() {
+        let mut tweens = ValueTweens::default();
+        let t0 = Instant::now();
+        tweens.value_at("slider", 0.0, &EFFORT_SLIDE, true, t0);
+        assert_close(
+            tweens.value_at("slider", 1.0, &EFFORT_SLIDE, true, t0),
+            1.0,
+            1e-6,
+            "reduced motion snaps",
+        );
+        assert!(!tweens.active_at("slider", t0), "nothing to animate");
     }
 }

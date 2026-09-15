@@ -9,6 +9,7 @@ use gpui::{
     ObjectFit, Render, SharedString, StyledImage as _, Subscription, Window, div, img, prelude::*,
     px,
 };
+use gpui_base::slider::{Slider, SliderEvent, SliderIndicator, SliderState, SliderThumb, SliderTrack};
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
     AccentPreset, AccentSelection, CustomThemeEntry, CustomThemeStatus, InstallMode,
@@ -51,10 +52,31 @@ pub struct AppearancePage {
     review_entry: Option<String>,
     library_error: Option<SharedString>,
     background_error: Option<SharedString>,
+    glass_strength_slider: Entity<SliderState>,
+    glass_strength_focus: FocusHandle,
+    _glass_strength_events: Subscription,
 }
 
 impl AppearancePage {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let initial_glass_strength = appearance::glass_strength(cx);
+        let glass_strength_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(0.05)
+                .default_value(initial_glass_strength)
+        });
+        let glass_strength_events = cx.subscribe(
+            &glass_strength_slider,
+            |_this: &mut Self, _, event, cx| {
+                let value = match event {
+                    SliderEvent::Change(value) | SliderEvent::Release(value) => value.start(),
+                };
+                appearance::set_glass_strength(value, cx);
+                cx.notify();
+            },
+        );
         Self {
             selected_font: typography::effective(cx),
             selected_size: typography::font_size(cx),
@@ -70,6 +92,9 @@ impl AppearancePage {
             review_entry: None,
             library_error: None,
             background_error: None,
+            glass_strength_slider,
+            glass_strength_focus: cx.focus_handle(),
+            _glass_strength_events: glass_strength_events,
         }
     }
 
@@ -251,6 +276,32 @@ impl AppearancePage {
             }
             _ => {}
         }
+    }
+
+    /// Left/right steps of 0.05, matching the mouse-drag step. A no-op while
+    /// the effective treatment isn't frosted — nothing for the slider to
+    /// scale, same gate the render path uses to disable it visually.
+    fn on_glass_strength_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if Theme::of(cx).surface_treatment != SurfaceTreatment::Frosted {
+            return;
+        }
+        let delta = match event.keystroke.key.as_str() {
+            "left" => -0.05,
+            "right" => 0.05,
+            _ => return,
+        };
+        let current = self.glass_strength_slider.read(cx).value().start();
+        let next = (current + delta).clamp(0.0, 1.0);
+        self.glass_strength_slider.update(cx, |state, cx| {
+            state.set_value(next, window, cx);
+        });
+        appearance::set_glass_strength(next, cx);
+        cx.notify();
     }
 
     fn open_import(&mut self, cx: &mut Context<Self>) {
@@ -541,6 +592,53 @@ fn surface_helper(surface: SurfacePreference, resolved: SurfaceTreatment) -> Str
     }
 }
 
+/// A small chip that makes the surface option's actual translucency visible at
+/// a glance: a checker backdrop (the classic "transparency grid" convention)
+/// under a swatch painted with that option's real resolved [`Theme::glass`]
+/// color. Opaque fully hides the checker; Frosted lets it bleed through by
+/// exactly as much as the window itself would. Without this the three options
+/// were indistinguishable in the row — the label was the only difference.
+fn surface_preview_swatch(theme: &Theme, surface: SurfacePreference) -> gpui::Div {
+    let sample = Theme::for_selection(
+        theme.appearance,
+        theme.variant_id.as_ref(),
+        theme.accent_selection,
+        surface,
+    );
+    // Illustrative alpha, not `sample.glass()`: the real value runs through
+    // `contrast_checked_glass_alpha`, which raises it high enough to keep shell
+    // text legible — often >0.85 — so a pixel-accurate swatch reads as solid
+    // either way and the three options were indistinguishable (user report).
+    // The swatch's job is to teach the concept (see-through vs solid), not
+    // reproduce the exact window alpha, so frosted deliberately exaggerates it
+    // against a higher-contrast checker.
+    let tone = match sample.surface_treatment {
+        SurfaceTreatment::Opaque => theme.surface.opacity(1.0),
+        SurfaceTreatment::Frosted => theme.surface.opacity(0.5),
+    };
+    let checker = theme.text.opacity(0.4);
+    div()
+        .flex_none()
+        .relative()
+        .size(px(16.0))
+        .rounded(px(4.0))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_row()
+                .child(div().flex_1().h_full().bg(checker))
+                .child(div().flex_1().h_full().bg(gpui::transparent_black()))
+                .child(div().flex_1().h_full().bg(checker))
+                .child(div().flex_1().h_full().bg(gpui::transparent_black())),
+        )
+        .child(div().absolute().inset_0().bg(tone))
+}
+
 fn surface_choice(
     theme: &Theme,
     surface: SurfacePreference,
@@ -574,10 +672,12 @@ fn surface_choice(
         })
         .flex()
         .items_center()
+        .gap(px(6.0))
         .cursor_pointer()
         .when(!selected, |control| {
             control.hover(|style| style.bg(theme.surface_raised_hover))
         })
+        .child(surface_preview_swatch(theme, surface))
         .child(surface_label(surface))
 }
 
@@ -1023,6 +1123,106 @@ impl AppearancePage {
             Appearance::Light => popover::reap_popup(cx, |page| &mut page.light_theme_menu),
             Appearance::Dark => popover::reap_popup(cx, |page| &mut page.dark_theme_menu),
         }
+    }
+
+    /// Track + fill + round thumb, styled to the page's look (hairline track,
+    /// accent fill, round accent thumb) since gpui-base's `Slider` primitives
+    /// are unstyled by design — see `gpui_base::slider`. Disabled (dimmed, no
+    /// drag/click/keys) whenever the effective treatment isn't frosted: there
+    /// is no acrylic for it to scale.
+    fn render_glass_strength_control(
+        &mut self,
+        theme: &Theme,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let state = self.glass_strength_slider.read(cx);
+        let percentage = state.percentage().end;
+        let value = state.value().start();
+        let thumb_size = 13.0;
+        let track_y = 9.0;
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .when(disabled, |el| el.opacity(0.45))
+            .child(
+                div()
+                    .id("appearance-glass-strength")
+                    .track_focus(&self.glass_strength_focus)
+                    .relative()
+                    .w(px(120.0))
+                    .h(px(20.0))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        this.on_glass_strength_key_down(event, window, cx)
+                    }))
+                    .child(
+                        Slider::new(&self.glass_strength_slider)
+                            .disabled(disabled)
+                            .w_full()
+                            .h_full()
+                            .child(
+                                SliderTrack::new(&self.glass_strength_slider)
+                                    .disabled(disabled)
+                                    .relative()
+                                    .w_full()
+                                    .h_full()
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(track_y))
+                                            .left_0()
+                                            .w_full()
+                                            .h(px(1.0))
+                                            .bg(theme.border),
+                                    )
+                                    .child(
+                                        SliderIndicator::new(&self.glass_strength_slider)
+                                            .absolute()
+                                            .top(px(track_y))
+                                            .left_0()
+                                            .w_full()
+                                            .h(px(1.0))
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .right(gpui::relative(1.0 - percentage))
+                                                    .bg(theme.accent),
+                                            ),
+                                    )
+                                    .child(
+                                        SliderThumb::new(&self.glass_strength_slider)
+                                            .disabled(disabled)
+                                            .absolute()
+                                            .top(px(track_y - thumb_size / 2.0 + 0.5))
+                                            .left(gpui::relative(percentage))
+                                            .ml(px(-thumb_size / 2.0))
+                                            .size(px(thumb_size))
+                                            .rounded_full()
+                                            .bg(theme.accent)
+                                            .border_2()
+                                            .border_color(theme.surface_dialog),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(32.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "{}%",
+                        (value * 100.0).round() as i32
+                    ))),
+            )
+            .into_any_element()
     }
 
     fn render_theme_selector(
@@ -2127,6 +2327,36 @@ impl Render for AppearancePage {
                         .items_center()
                         .gap(px(6.0))
                         .children(surface_controls),
+                )
+                .into_any_element(),
+        );
+        let glass_strength_disabled = theme.surface_treatment != SurfaceTreatment::Frosted;
+        let glass_strength_control =
+            self.render_glass_strength_control(&theme, glass_strength_disabled, cx);
+        settings_rows.push(
+            widgets::card_row(&theme, false)
+                .child(widgets::row_tile(&theme, icons::WIDGET))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::row_title(&theme, "Glass strength"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![
+                                div()
+                                    .child(SharedString::from(
+                                        "How much of the desktop shows through frosted windows.",
+                                    ))
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .ml(px(10.0))
+                        .child(glass_strength_control),
                 )
                 .into_any_element(),
         );

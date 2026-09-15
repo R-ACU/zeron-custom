@@ -2,8 +2,9 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
-//! ([`AcpHarness::hermes`], `hermes acp`) — plus pi
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`) and Kimi ([`AcpHarness::kimi`],
+//! `kimi acp`) — plus pi
 //! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
 //! driver exists. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -435,6 +436,104 @@ fn pi_spec() -> AcpAgentSpec {
     }
 }
 
+fn kimi_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".kimi-code").join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+fn kimi_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Kimi,
+        display_name: "Kimi",
+        executable: "kimi",
+        env_override: "KIMI_ACP_EXECUTABLE",
+        args: &["acp"],
+        // Native ACP server — no adapter package in between.
+        npm_package: None,
+        extra_paths: kimi_install_paths,
+        cli_executable: "kimi",
+        cli_extra_paths: kimi_install_paths,
+        install_hint: "kimi (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.kimi-code/bin, /opt/homebrew/bin, and /usr/local/bin; install with \
+             the Kimi Code CLI installer (https://moonshotai.github.io/kimi-code/), \
+             then `kimi login`; set KIMI_ACP_EXECUTABLE to override)",
+        // Verified live (0.42.0): `session/new` advertises the model catalog
+        // through the `model` config option (category "model"), so the wire
+        // is authoritative — this static list only enriches matching ids
+        // with a label/description when the agent's own names are terse.
+        models: || {
+            vec![
+                Model {
+                    id: "kimi-code/k3-256k".into(),
+                    label: "K3-256k".into(),
+                    description: Some("Moonshot's K3 — 256k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                        ReasoningLevel::Max,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "kimi-code/k3".into(),
+                    label: "K3".into(),
+                    description: Some("Moonshot's K3".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                        ReasoningLevel::Max,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "kimi-code/kimi-for-coding".into(),
+                    label: "K2.8 Preview".into(),
+                    description: Some("Kimi's coding-tuned preview model".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                        ReasoningLevel::Max,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "kimi-code/kimi-for-coding-highspeed".into(),
+                    label: "K2.7 Code Highspeed".into(),
+                    description: Some("Faster K2.7 Code — same tuning, lower latency".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                        ReasoningLevel::Max,
+                    ],
+                    options: Vec::new(),
+                },
+            ]
+        },
+        // No `_session/steering` extension advertised in `initialize` —
+        // steers deliver at turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Verified live: the session's `thinking` config option (category
+        // "thought_level") advertises low/high/max, no medium tier.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::High,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+    }
+}
+
 /// Background-install managed npm adapters for agents whose CLI is present
 /// on this device, so a first chat never pays (or trips over) an npm run.
 /// Skips agents whose adapter is already resolvable; failures are logged and
@@ -553,6 +652,11 @@ impl AcpHarness {
     /// pi's RPC mode.
     pub fn pi() -> Self {
         Self::with_spec(pi_spec())
+    }
+
+    /// Kimi Code CLI (`kimi acp`) — Moonshot AI's native ACP server.
+    pub fn kimi() -> Self {
+        Self::with_spec(kimi_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.

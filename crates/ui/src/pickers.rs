@@ -33,6 +33,15 @@ const MAX_REF_ROWS: usize = 300;
 
 const FOOTER_CHIP_RADIUS: f32 = 6.0;
 
+/// Width of the harness/model popover card (t3 ModelPickerContent, shrunk to
+/// its tabbed layout).
+const MODEL_POPOVER_WIDTH: f32 = 304.0;
+
+/// The effort slider's painted track width: the popover minus its 1px border,
+/// the tray's 6px inset and the card's 12px padding on each side. Fixed rather
+/// than measured so the first painted frame is already correct.
+const EFFORT_TRACK_WIDTH: f32 = MODEL_POPOVER_WIDTH - 2.0 * (1.0 + 6.0 + 12.0);
+
 /// Both sides of the composer handoff share one leading-aligned workspace
 /// cluster. Available width belongs after the pair, never between its labels.
 fn workspace_footer_row() -> gpui::Div {
@@ -180,6 +189,26 @@ pub fn default_reasoning(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
     ladder.first().copied()
 }
 
+/// The level a model starts on when it has never been used: the catalog
+/// default for its ladder, falling back to the ladder's middle rung when the
+/// catalog names none. `None` only for ladder-less models.
+pub fn default_effort(ladder: &[ReasoningLevel]) -> Option<ReasoningLevel> {
+    default_reasoning(ladder).or_else(|| ladder.get(ladder.len() / 2).copied())
+}
+
+/// The effort a model should show: its own remembered pick when the ladder
+/// still offers it, else the model's default. Pure: the per-model memory map
+/// lives in the sticky composer defaults.
+pub fn resolve_effort(
+    remembered: Option<ReasoningLevel>,
+    ladder: &[ReasoningLevel],
+) -> Option<ReasoningLevel> {
+    match remembered {
+        Some(level) if ladder.contains(&level) => Some(level),
+        _ => default_effort(ladder),
+    }
+}
+
 /// Clamp a picked/remembered level to what the model actually offers: keep it
 /// when the ladder lists it, else fall to the model's default (never a stale
 /// or foreign level — zeron use-run-config.ts's derived-model discipline).
@@ -243,6 +272,39 @@ pub fn traits_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+/// The composer pill's summary: the effective EFFORT level plus every model
+/// option that departs from its default ("Low", "High · 1M · Fast"). Unlike
+/// [`traits_summary`], which spells out every option's effective choice for
+/// the picker, defaults stay silent here. A pill reading "Haiku 4.5 · Low ·
+/// Off" spent its second half on a thinking toggle sitting at its default
+/// (user report). `None` when there is nothing to say.
+pub fn pill_traits_summary(
+    model: Option<&Model>,
+    reasoning: Option<ReasoningLevel>,
+    selections: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(level) = reasoning {
+        parts.push(reasoning_label(level).to_string());
+    }
+    if let Some(model) = model {
+        for option in &model.options {
+            let Some(choice_id) = selections
+                .get(&option.id)
+                .and_then(|v| v.as_str())
+                .filter(|id| *id != option.default_choice)
+                .filter(|id| option.choices.iter().any(|c| c.id == *id))
+            else {
+                continue;
+            };
+            if let Some(choice) = option.choices.iter().find(|c| c.id == choice_id) {
+                parts.push(choice.label.clone());
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// Keep only the picks `model` still offers. Remembered picks outlive the
@@ -505,6 +567,9 @@ pub struct Pickers {
     catalog_rev: u64,
     /// Hover/drag state of the floating model-list scrollbar.
     model_bar: popover::MenuScrollbarState,
+    /// Painted bounds of the effort slider's track, written during prepaint:
+    /// the only thing a pointer x needs to be mapped onto a rung.
+    effort_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     /// One-shot mute for the next Edited event's highlight reset — armed by
@@ -659,6 +724,7 @@ impl Pickers {
             model_rows_cache: std::cell::RefCell::new(None),
             catalog_rev: 0,
             model_bar: popover::MenuScrollbarState::default(),
+            effort_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             search,
             search_reset_muted: false,
             focus: cx.focus_handle(),
@@ -755,15 +821,27 @@ impl Pickers {
         self.defaults.model_for(harness).map(|m| m.id.as_str())
     }
 
-    /// Effective reasoning — always concrete once the model is known: the
-    /// draft pick / chat config / remembered default, clamped to the selected
-    /// model's ladder, falling back to the model's default level.
+    /// The effort remembered FOR THE SELECTED MODEL (the `effortByModel` map),
+    /// falling back to the legacy global pick so an existing install keeps its
+    /// level on the model it was last used on.
+    fn remembered_effort(&self, cx: &App) -> Option<ReasoningLevel> {
+        let harness = self.effective_harness(cx)?;
+        let model = self
+            .selected_model(cx)
+            .map(|m| m.id.as_str())
+            .or_else(|| self.effective_model_id(cx))?;
+        self.defaults.effort_for(harness, model)
+    }
+
+    /// Effective effort, always concrete once the model is known: the draft
+    /// pick / chat config, else the level remembered for THIS model, else the
+    /// model's default, clamped to the selected model's ladder.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
         let explicit = self.config.reasoning.or_else(|| {
             match self.state.read(cx).selected_chat_row() {
                 Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
-                // New chat: the remembered last-used level.
-                None => self.defaults.reasoning,
+                // New chat: whatever this model was last run at.
+                None => self.remembered_effort(cx),
             }
         });
         if self.selected_model(cx).is_none() {
@@ -771,7 +849,7 @@ impl Pickers {
             // to clamp against); it resolves to a concrete level on load.
             return explicit;
         }
-        clamp_reasoning(explicit, &self.trait_ladder(cx))
+        resolve_effort(explicit, &self.trait_ladder(cx))
     }
 
     /// The selected model — concrete from the moment the list loads: the
@@ -1399,13 +1477,30 @@ impl Pickers {
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
         // a model is the expected flow. Esc, click-out, or the chip close it.
+        // Effort sticks to the MODEL: the level the new model was last run at
+        // (or its catalog default), never the one the previous model carried.
+        let restored = self.effective_harness(cx).and_then(|harness| {
+            let ladder = self.model_ladder(Some(harness), &model_id);
+            if ladder.is_empty() {
+                return None;
+            }
+            resolve_effort(self.defaults.effort_for(harness, &model_id), &ladder)
+        });
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
-            self.update_chat_config(cx, move |config| config.model = Some(model_id));
+            self.update_chat_config(cx, move |config| {
+                config.model = Some(model_id);
+                if let Some(level) = restored {
+                    config.reasoning = Some(level);
+                }
+            });
         } else {
             // New chat: draft pick + sticky last-used memory for this harness.
             self.config.model = Some(model_id.clone());
+            // Drop the previous model's effort; this model's own level
+            // (remembered or default) takes over.
+            self.config.reasoning = restored;
             if let Some(harness) = self.effective_harness(cx) {
                 let label = self
                     .models
@@ -1422,15 +1517,60 @@ impl Pickers {
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
-        // Always a concrete selection (no toggle-back-to-default).
+        // The pick belongs to the model it was made on, so only that entry is
+        // written, so every other model keeps its own effort (user request).
+        let target = self.effective_harness(cx).zip(
+            self.selected_model(cx)
+                .map(|m| m.id.clone())
+                .or_else(|| self.effective_model_id(cx).map(str::to_string)),
+        );
+        if let Some((harness, model)) = target {
+            self.defaults.remember_effort(harness, &model, level);
+            self.save_defaults();
+        }
+        // Always a concrete selection (no toggle-back-to-default). The chat
+        // config still carries the level so the run request is unchanged.
         if self.state.read(cx).selected_chat.is_some() {
             self.update_chat_config(cx, move |config| config.reasoning = Some(level));
         } else {
             self.config.reasoning = Some(level);
-            self.defaults.reasoning = Some(level);
-            self.save_defaults();
         }
         cx.notify();
+    }
+
+    /// Step the effort slider by `delta` rungs (keyboard ←/→ on the open
+    /// picker). No-op for ladder-less models.
+    fn step_reasoning(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let ladder = self.trait_ladder(cx);
+        if ladder.is_empty() {
+            return false;
+        }
+        let current = self
+            .effective_reasoning(cx)
+            .and_then(|level| ladder.iter().position(|l| *l == level))
+            .unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, ladder.len() as isize - 1) as usize;
+        if next as isize == current {
+            return true; // consumed: the slider is already at that end
+        }
+        self.pick_reasoning(ladder[next], cx);
+        true
+    }
+
+    /// Snap the slider to the rung under `x` (track-relative px) and pick it.
+    fn pick_reasoning_at(&mut self, x: f32, width: f32, cx: &mut Context<Self>) {
+        let ladder = self.trait_ladder(cx);
+        if ladder.is_empty() {
+            return;
+        }
+        let ix = crate::reasoning_slider::snap_step(x, width, ladder.len());
+        let Some(level) = ladder.get(ix).copied() else {
+            return;
+        };
+        if self.effective_reasoning(cx) == Some(level) {
+            return; // already there: no write, no repaint churn while dragging
+        }
+        self.pick_reasoning(level, cx);
     }
 
     fn pick_option(
@@ -1551,16 +1691,32 @@ impl Pickers {
         let Some(model) = self.selected_model(cx) else {
             return Vec::new();
         };
-        if !model.reasoning_levels.is_empty() {
-            return model.reasoning_levels.clone();
+        let harness = self.effective_harness(cx);
+        self.model_ladder(harness, &model.id)
+    }
+
+    /// The ladder for ONE model id under `harness`, resolved like
+    /// [`Self::trait_ladder`] (model levels, else the harness's advertised
+    /// ones), for a model that is not the selected one yet (the effort a
+    /// just-picked model restores to).
+    fn model_ladder(&self, harness: Option<HarnessId>, model_id: &str) -> Vec<ReasoningLevel> {
+        let Some(harness) = harness else {
+            return Vec::new();
+        };
+        let levels = self
+            .models
+            .get(&harness)
+            .and_then(|l| l.ready())
+            .and_then(|models| models.iter().find(|m| m.id == model_id))
+            .map(|m| m.reasoning_levels.clone())
+            .unwrap_or_default();
+        if !levels.is_empty() {
+            return levels;
         }
-        self.effective_harness(cx)
-            .and_then(|h| {
-                self.harnesses
-                    .ready()
-                    .and_then(|list| list.iter().find(|d| d.id == h))
-                    .map(|d| d.reasoning_levels.clone())
-            })
+        self.harnesses
+            .ready()
+            .and_then(|list| list.iter().find(|d| d.id == harness))
+            .map(|d| d.reasoning_levels.clone())
             .unwrap_or_default()
     }
 
@@ -2169,12 +2325,33 @@ impl Pickers {
             cx.notify();
             return;
         }
+        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
+        // ←/→ step the effort slider (the ladder rows it replaced were walked
+        // with ↑/↓, which still belong to the model list). Only while the
+        // search box holds no text: there the arrows are caret motion.
+        if self.open_kind() == Some(PickerKind::HarnessModel)
+            && !event.keystroke.modifiers.platform
+            && !event.keystroke.modifiers.control
+            && (!search_focused || self.search.read(cx).text().is_empty())
+        {
+            let delta = match event.keystroke.key.as_str() {
+                "left" => Some(-1),
+                "right" => Some(1),
+                _ => None,
+            };
+            if let Some(delta) = delta
+                && self.step_reasoning(delta, cx)
+            {
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
         let key = popover::classify_key(
             event.keystroke.key.as_str(),
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.control,
         );
-        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         match key {
             MenuKey::Escape => {
                 self.animate_close(cx);
@@ -3404,6 +3581,26 @@ impl Pickers {
             }
         };
 
+        // Small-caps group header naming what the list is showing: the
+        // viewed harness (its tab is the grouping) or the starred mix.
+        let group_label = if favorites_view {
+            SharedString::from("Favorites")
+        } else {
+            descriptors
+                .iter()
+                .find(|d| Some(d.id) == effective)
+                .map(|d| SharedString::from(d.name.clone()))
+                .unwrap_or_else(|| SharedString::from("Models"))
+        };
+        let group_header = div()
+            .flex_none()
+            .px(px(12.0))
+            .pt(px(6.0))
+            .text_size(crate::typography::ui_rems(10.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_muted.opacity(0.6))
+            .child(SharedString::from(popover::tracked_upper(&group_label)));
+
         let model_scrollbar = self.render_model_scrollbar(&theme, cx);
         let list_host = div()
             .id("model-list-scroll-host")
@@ -3432,15 +3629,16 @@ impl Pickers {
             // scroll content without consuming any list width.
             .children(model_scrollbar);
 
-        // ── traits tray: the reasoning ladder + model options PINNED under
-        //    the list (the separate Traits popover folded in here — user
-        //    request). Hidden entirely when the selected model has neither.
-        let has_tray = !self.trait_ladder(cx).is_empty()
-            || self
-                .selected_model(cx)
-                .is_some_and(|m| !m.options.is_empty());
-        let tray: Option<AnyElement> = has_tray.then(|| {
-            let sections = self.render_traits_sections(cx);
+        // ── traits tray: the EFFORT card (model name + slider) plus the
+        //    model's advertised options, PINNED under the list (the separate
+        //    Traits popover folded in here, user request). Hidden entirely
+        //    until a model resolves.
+        let effort_card = self.render_effort_card(cx);
+        let has_options = self
+            .selected_model(cx)
+            .is_some_and(|m| !m.options.is_empty());
+        let tray: Option<AnyElement> = (effort_card.is_some() || has_options).then(|| {
+            let sections = has_options.then(|| self.render_traits_sections(cx));
             div()
                 .id("model-traits-tray")
                 .flex_none()
@@ -3448,11 +3646,11 @@ impl Pickers {
                 .border_color(crate::theme::hairline(0.08))
                 // Long option stacks scroll inside the tray rather than
                 // growing the card past the viewport.
-                .max_h(px(236.0))
+                .max_h(px(300.0))
                 .overflow_y_scroll()
-                .px(px(6.0))
                 .pb(px(6.0))
-                .child(sections)
+                .children(effort_card)
+                .child(div().px(px(6.0)).children(sections))
                 .into_any_element()
         });
 
@@ -3461,6 +3659,7 @@ impl Pickers {
             .flex_col()
             .child(tabs)
             .child(search_row)
+            .child(group_header)
             .child(list_host)
             .children(tray)
             .into_any_element()
@@ -3664,56 +3863,175 @@ impl Pickers {
         div().pb(px(2.0)).child(el).into_any_element()
     }
 
-    /// The traits dropdown body (t3code TraitsPicker): the reasoning ladder
-    /// plus every advertised model option as headed sections of menu ROWS —
-    /// label, a "Default" badge on the section's default choice, and the
-    /// trailing check on the selected row. Sections split by hairline
-    /// separators. Selecting keeps the menu open for multi-adjust.
+    /// The EFFORT card pinned under the model list (user request, modeled on
+    /// ChatGPT's model sheet): the selected model's name with its tier word in
+    /// the provider color, the current level named right-aligned above a
+    /// horizontal slider, and the ladder's rungs as ticks beneath it. Models
+    /// without a ladder (Claude Haiku) get a one-line note instead.
+    fn render_effort_card(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let model = self.selected_model(cx).cloned()?;
+        let harness = self.effective_harness(cx);
+        let levels = self.trait_ladder(cx);
+        let current = self.effective_reasoning(cx);
+        let current_ix = current
+            .and_then(|level| levels.iter().position(|l| *l == level))
+            .unwrap_or(0);
+        let (tier, rest) = crate::reasoning_slider::split_tier(&model.label);
+        let tier: SharedString = tier.to_string().into();
+        let rest: SharedString = rest.to_string().into();
+
+        // Name row: centered, the tier word in the provider color.
+        let name = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .text_size(crate::typography::ui_rems(15.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(
+                div()
+                    .text_color(crate::reasoning_slider::provider_ink(harness, &theme))
+                    .child(tier),
+            )
+            .child(div().text_color(theme.text).child(rest));
+
+        let body: AnyElement = if levels.is_empty() {
+            div()
+                .w_full()
+                .pt(px(8.0))
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_muted.opacity(0.7))
+                .text_center()
+                .child(SharedString::from(crate::reasoning_slider::NO_EFFORT_HINT))
+                .into_any_element()
+        } else {
+            let width = EFFORT_TRACK_WIDTH;
+            // Sparkles ride the top rung only - the special effect marking
+            // the ladder's ceiling.
+            let at_max = current_ix + 1 == levels.len();
+            let sparkle_t = (at_max && !motion::reduced_motion(cx))
+                .then(|| motion::pulse_delta(&motion::EFFORT_SPARKLE, cx.entity_id(), cx));
+            let slider = crate::reasoning_slider::EffortSlider {
+                id: "effort",
+                levels: levels.clone(),
+                current: current_ix,
+                harness,
+                width,
+                sparkle_t,
+                bounds: self.effort_bounds.clone(),
+            }
+            .render(&theme, cx);
+            let caption = div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .justify_between()
+                .pb(px(6.0))
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted.opacity(0.6))
+                        .child(SharedString::from(popover::tracked_upper(
+                            crate::reasoning_slider::EFFORT_LABEL,
+                        ))),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(SharedString::from(
+                            current.map(reasoning_label).unwrap_or(""),
+                        )),
+                );
+            div()
+                .w_full()
+                .pt(px(10.0))
+                .flex()
+                .flex_col()
+                .child(caption)
+                .child(
+                    div()
+                        .id("effort-slider")
+                        .w(px(width))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(Self::on_effort_mouse_down),
+                        )
+                        .on_drag(crate::reasoning_slider::EffortDrag, |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| crate::reasoning_slider::EffortDragGhost)
+                        })
+                        .child(slider),
+                )
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .m(px(6.0))
+                .p(px(12.0))
+                .rounded(px(10.0))
+                .bg(crate::theme::ink(0.04))
+                .border_1()
+                .border_color(crate::theme::hairline(0.07))
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(name)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// A press anywhere on the slider row snaps to the nearest rung (and
+    /// starts the drag - `on_drag_move` on the picker root continues it).
+    fn on_effort_mouse_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        self.drag_effort_to(event.position.x, cx);
+        cx.stop_propagation();
+    }
+
+    fn on_effort_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<crate::reasoning_slider::EffortDrag>,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drag_effort_to(event.event.position.x, cx);
+    }
+
+    /// Map a window-space pointer x onto the track and pick that rung.
+    fn drag_effort_to(&mut self, pointer_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(bounds) = self.effort_bounds.get() else {
+            return; // never painted - nothing to map against
+        };
+        let width = f32::from(bounds.size.width);
+        let x = f32::from(pointer_x - bounds.left());
+        self.pick_reasoning_at(x, width, cx);
+    }
+
+    /// The advertised model options under the effort card (t3code
+    /// TraitsPicker): each option as a headed section of menu ROWS - label, a
+    /// "Default" badge on the section's default choice, and the trailing check
+    /// on the selected row. Selecting keeps the menu open for multi-adjust.
     fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
             return popover::skeleton_menu_rows("traits-skeleton", &theme, 3, cx.entity_id(), cx);
         };
-        let levels = self.trait_ladder(cx);
-        // Display the effective level (draft pick or the chat's config), so
-        // the ladder check mirrors the chip summary.
-        let current = self.effective_reasoning(cx);
 
         let mut sections: Vec<AnyElement> = Vec::new();
-        if !levels.is_empty() {
-            let default_level = default_reasoning(&levels);
-            sections.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    // 2px row gap — the menu-column rhythm everywhere else
-                    // (model list, device switcher); without it adjacent
-                    // hover/selected washes fuse into one blob (user report).
-                    .gap(px(2.0))
-                    .child(popover::menu_heading(&theme, "Reasoning"))
-                    .children(levels.into_iter().enumerate().map(|(ix, level)| {
-                        let is_active = current == Some(level);
-                        let is_default = default_level == Some(level);
-                        let mut row =
-                            popover::menu_row(&theme, is_active, format!("trait-reasoning-{ix}"))
-                                .py(px(5.0))
-                                .rounded(px(6.0))
-                                .text_size(crate::typography::ui_rems(12.5))
-                                .id(("reasoning-row", ix))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_reasoning(level, cx);
-                                }))
-                                .child(SharedString::from(reasoning_label(level)));
-                        row = row.child(div().flex_1());
-                        if is_default {
-                            row = row.child(default_badge(&theme));
-                        }
-                        row
-                    }))
-                    .into_any_element(),
-            );
-        }
-
         let selections = self.explicit_options(cx);
         for (opt_ix, option) in model.options.iter().enumerate() {
             if !sections.is_empty() {
@@ -4014,6 +4332,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
+        HarnessId::Kimi => (crate::icons::KIMI_MARK, None),
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
     }
@@ -4234,7 +4553,7 @@ impl Render for Pickers {
             ),
         };
         let explicit_options = self.explicit_options(cx);
-        let traits_set = traits_summary(
+        let traits_set = pill_traits_summary(
             self.selected_model(cx),
             self.effective_reasoning(cx),
             &explicit_options,
@@ -4261,7 +4580,7 @@ impl Render for Pickers {
                     PickerKind::HarnessModel,
                     // Compact single-harness pane (t3 ModelPickerContent
                     // shrunk to its tabbed layout).
-                    self.popover_frame_flush(304.0, content, cx),
+                    self.popover_frame_flush(MODEL_POPOVER_WIDTH, content, cx),
                 ))
             }
             None => None,
@@ -4279,14 +4598,14 @@ impl Render for Pickers {
             .min_w_0()
             .gap(px(4.0));
         // ONE chip for the whole run identity (user request): brand icon +
-        // model name, then the joined traits summary ("Medium", "High · 1M ·
-        // Fast", "Agent · Balance") as the chip's muted second tone — the
-        // run's configuration reads without opening anything, and the suffix
-        // brightens only when something departs from its default. No suffix
-        // when the model has neither a ladder nor options (e.g. Hermes).
+        // model name, then the effort level and every option that DEPARTS
+        // from its default, joined with " · " ("· Low", "· High · 1M · Fast").
+        // Defaults-as-chosen used to be spelled out too, which put a
+        // meaningless "· Off" (Haiku's thinking toggle at its default) on the
+        // pill; the level plus the real departures reads clearer.
         let chip_suffix = traits_set.map(|summary| {
             (
-                SharedString::from(summary),
+                SharedString::from(format!("· {summary}")),
                 traits_active.then(|| theme.text.opacity(0.85)),
             )
         });
@@ -4332,6 +4651,9 @@ impl Render for Pickers {
             // GPUI dispatches this captured stream while the thumb is dragged,
             // including when the pointer has left the model popover.
             .on_drag_move(cx.listener(Self::on_model_scrollbar_drag_move))
+            // Same for a held slider thumb: the pointer routinely leaves the
+            // track mid-drag and the rung must keep following it.
+            .on_drag_move(cx.listener(Self::on_effort_drag_move))
             .child(left)
             .child(right)
     }
@@ -4560,6 +4882,131 @@ mod tests {
             let resolved = pickers.resolved(cx);
             assert_eq!(resolved.model.as_deref(), Some("opus"));
             assert_eq!(resolved.model_options.get("contextWindow"), Some(&one_m));
+        });
+    }
+
+    fn ladder_model(id: &str, label: &str, ladder: &[ReasoningLevel]) -> Model {
+        let mut model = bare_model(id, label);
+        model.reasoning_levels = ladder.to_vec();
+        model
+    }
+
+    /// The effort level belongs to the MODEL it was chosen on: A to B to A
+    /// restores A's level, and a model nobody has touched starts at its own
+    /// catalog default (user request).
+    #[gpui::test]
+    fn effort_sticks_to_the_model_it_was_chosen_on(cx: &mut gpui::TestAppContext) {
+        use ReasoningLevel::*;
+        let opus = ladder_model("opus", "Opus 5", &[Low, Medium, High, Max]);
+        let sonnet = ladder_model("sonnet", "Sonnet 5", &[Minimal, Low, Medium, High]);
+        // No ladder at all (Haiku): nothing to remember, nothing to show.
+        let haiku = bare_model("haiku", "Haiku 4.5");
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults.harness = Some(HarnessId::ClaudeCode);
+            pickers.models.insert(
+                HarnessId::ClaudeCode,
+                Loadable::Ready(vec![opus.clone(), sonnet.clone(), haiku.clone()]),
+            );
+
+            // Never seen: the catalog default (High) for both ladders.
+            pickers.pick_model("opus".into(), cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(High));
+            pickers.pick_reasoning(Low, cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Low));
+
+            // A different model starts at ITS default, not at Opus's pick.
+            pickers.pick_model("sonnet".into(), cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(High));
+            pickers.pick_reasoning(Minimal, cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Minimal));
+
+            // Back and forth: each model keeps its own.
+            pickers.pick_model("opus".into(), cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Low));
+            pickers.pick_model("sonnet".into(), cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Minimal));
+
+            // Only the picked model's entry is ever written.
+            assert_eq!(
+                pickers.defaults.effort_for(HarnessId::ClaudeCode, "opus"),
+                Some(Low)
+            );
+            assert_eq!(
+                pickers.defaults.effort_for(HarnessId::ClaudeCode, "sonnet"),
+                Some(Minimal)
+            );
+            assert_eq!(
+                pickers.defaults.effort_for(HarnessId::ClaudeCode, "haiku"),
+                None
+            );
+
+            // A ladder-less model has no effort at all (and no slider).
+            pickers.pick_model("haiku".into(), cx);
+            assert_eq!(pickers.effective_reasoning(cx), None);
+            assert!(pickers.trait_ladder(cx).is_empty());
+
+            // The run request still carries the level (chat config parity).
+            pickers.pick_model("opus".into(), cx);
+            assert_eq!(pickers.resolved(cx).reasoning, Some(Low));
+        });
+    }
+
+    /// Left/right walk the ladder and stop at its ends rather than wrapping.
+    #[gpui::test]
+    fn arrow_keys_step_the_effort_slider_and_clamp(cx: &mut gpui::TestAppContext) {
+        use ReasoningLevel::*;
+        let opus = ladder_model("opus", "Opus 5", &[Low, Medium, High, Max]);
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults.harness = Some(HarnessId::ClaudeCode);
+            pickers
+                .models
+                .insert(HarnessId::ClaudeCode, Loadable::Ready(vec![opus.clone()]));
+            pickers.pick_model("opus".into(), cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(High));
+            assert!(pickers.step_reasoning(1, cx));
+            assert_eq!(pickers.effective_reasoning(cx), Some(Max));
+            // Already at the top rung: consumed, but nothing moves.
+            assert!(pickers.step_reasoning(1, cx));
+            assert_eq!(pickers.effective_reasoning(cx), Some(Max));
+            assert!(pickers.step_reasoning(-1, cx));
+            assert!(pickers.step_reasoning(-1, cx));
+            assert!(pickers.step_reasoning(-1, cx));
+            assert_eq!(pickers.effective_reasoning(cx), Some(Low));
+            assert!(pickers.step_reasoning(-1, cx));
+            assert_eq!(pickers.effective_reasoning(cx), Some(Low));
+        });
+    }
+
+    /// A press on the track snaps to the nearest rung - the same code path the
+    /// old ladder rows used, so persistence is unchanged.
+    #[gpui::test]
+    fn pressing_the_track_snaps_to_the_nearest_rung(cx: &mut gpui::TestAppContext) {
+        use ReasoningLevel::*;
+        let opus = ladder_model("opus", "Opus 5", &[Low, Medium, High, Max]);
+        let state = cx.new(|_| AppState::new());
+        let pickers = cx.new(|cx| Pickers::new(state, cx));
+        pickers.update(cx, |pickers, cx| {
+            pickers.defaults.harness = Some(HarnessId::ClaudeCode);
+            pickers
+                .models
+                .insert(HarnessId::ClaudeCode, Loadable::Ready(vec![opus.clone()]));
+            pickers.pick_model("opus".into(), cx);
+            let width = EFFORT_TRACK_WIDTH;
+            pickers.pick_reasoning_at(0.0, width, cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Low));
+            pickers.pick_reasoning_at(width * 0.4, width, cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Medium));
+            pickers.pick_reasoning_at(width * 2.0, width, cx);
+            assert_eq!(pickers.effective_reasoning(cx), Some(Max));
+            // And the pick landed in the per-model memory, not a global slot.
+            assert_eq!(
+                pickers.defaults.effort_for(HarnessId::ClaudeCode, "opus"),
+                Some(Max)
+            );
         });
     }
 
@@ -5014,6 +5461,57 @@ mod tests {
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
         assert!(default_model(&[]).is_none());
+    }
+
+    #[test]
+    fn default_effort_falls_back_to_the_ladders_middle_rung() {
+        use ReasoningLevel::*;
+        // The catalog default wins wherever it names one.
+        assert_eq!(default_effort(&[Low, Medium, High, Max]), Some(High));
+        // Ladder-less models have no effort.
+        assert_eq!(default_effort(&[]), None);
+        // A remembered level is kept only while the ladder offers it.
+        assert_eq!(resolve_effort(Some(Low), &[Low, Medium, High]), Some(Low));
+        assert_eq!(resolve_effort(Some(Max), &[Low, Medium, High]), Some(High));
+        assert_eq!(resolve_effort(None, &[Low, Medium, High]), Some(High));
+        assert_eq!(resolve_effort(Some(Low), &[]), None);
+    }
+
+    #[test]
+    fn pill_summary_names_the_effort_and_hides_default_options() {
+        let mut model = bare_model("haiku", "Haiku 4.5");
+        model.options.push(ModelOption {
+            id: "thinking".into(),
+            label: "Thinking".into(),
+            choices: vec![
+                ModelOptionChoice {
+                    id: "off".into(),
+                    label: "Off".into(),
+                },
+                ModelOptionChoice {
+                    id: "on".into(),
+                    label: "On".into(),
+                },
+            ],
+            default_choice: "off".into(),
+        });
+        let none = serde_json::Map::new();
+        // The default toggle stays silent: the pill reads "Haiku 4.5 - Low",
+        // never "Haiku 4.5 Low - Off" (user report).
+        assert_eq!(
+            pill_traits_summary(Some(&model), Some(ReasoningLevel::Low), &none),
+            Some("Low".to_string())
+        );
+        // A real departure is still named.
+        let mut on = serde_json::Map::new();
+        on.insert("thinking".into(), serde_json::Value::String("on".into()));
+        assert_eq!(
+            pill_traits_summary(Some(&model), Some(ReasoningLevel::Low), &on),
+            Some("Low \u{b7} On".to_string())
+        );
+        // Nothing to say at all.
+        assert_eq!(pill_traits_summary(Some(&model), None, &none), None);
+        assert_eq!(pill_traits_summary(None, None, &none), None);
     }
 
     #[test]

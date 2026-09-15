@@ -273,6 +273,56 @@ pub(crate) fn bump_style_generation() {
     STYLE_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Process-wide mirror of the device-local "glass strength" slider (Settings >
+/// Appearance), independent from appearance/theme/accent/surface selection —
+/// same rationale as [`CURRENT_APPEARANCE`]: [`Theme::glass`] is called from
+/// contexts that only hold `&self`, not `cx`, so the live value has to be
+/// readable without a gpui global lookup. Stored as raw bits because `AtomicF32`
+/// does not exist; [`glass_strength`]/[`set_glass_strength`] are the only
+/// readers/writers. Bit pattern of `0.5f32`.
+static GLASS_STRENGTH_BITS: AtomicU32 = AtomicU32::new(0x3f00_0000);
+
+/// Default slider position. Chosen so it reproduces [`Theme::GLASS_ALPHA`] /
+/// [`Theme::GLASS_ALPHA_LIGHT`] unchanged — installing the app or resetting the
+/// slider must not shift the tuned default look.
+pub const GLASS_STRENGTH_DEFAULT: f32 = 0.5;
+/// Alpha at slider `0.0`: nearly opaque, barely see-through.
+const GLASS_STRENGTH_NEAR_OPAQUE_ALPHA: f32 = 0.97;
+/// Alpha at slider `1.0`: very transparent.
+const GLASS_STRENGTH_TRANSPARENT_ALPHA: f32 = 0.45;
+
+/// The glass-strength slider's current position (0.0..=1.0).
+pub fn glass_strength() -> f32 {
+    f32::from_bits(GLASS_STRENGTH_BITS.load(Ordering::Relaxed))
+}
+
+/// Set the glass-strength slider's position. Callers that want a repaint
+/// (every UI caller) must also rebuild the [`Theme`] global and call
+/// `appearance::reapply_window_background`, exactly like any other appearance
+/// change — this only updates the value the next [`Theme::glass`] call reads.
+pub fn set_glass_strength(value: f32) {
+    GLASS_STRENGTH_BITS.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
+/// Map a `0.0..=1.0` glass-strength slider position onto a glass tint alpha.
+///
+/// Piecewise-linear through three anchors: `0.0` → nearly opaque
+/// ([`GLASS_STRENGTH_NEAR_OPAQUE_ALPHA`]), [`GLASS_STRENGTH_DEFAULT`] → `base`
+/// (today's tuned [`Theme::GLASS_ALPHA`] / [`Theme::GLASS_ALPHA_LIGHT`]), `1.0`
+/// → very transparent ([`GLASS_STRENGTH_TRANSPARENT_ALPHA`]). Anchoring the
+/// midpoint on `base` rather than a fixed number means the slider's default
+/// reproduces the existing tuned look exactly, in both appearances.
+pub fn glass_alpha_from_strength(strength: f32, base: f32) -> f32 {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= GLASS_STRENGTH_DEFAULT {
+        let t = strength / GLASS_STRENGTH_DEFAULT;
+        GLASS_STRENGTH_NEAR_OPAQUE_ALPHA + (base - GLASS_STRENGTH_NEAR_OPAQUE_ALPHA) * t
+    } else {
+        let t = (strength - GLASS_STRENGTH_DEFAULT) / (1.0 - GLASS_STRENGTH_DEFAULT);
+        base + (GLASS_STRENGTH_TRANSPARENT_ALPHA - base) * t
+    }
+}
+
 fn model_appearance(appearance: zeron_theme::Appearance) -> Appearance {
     match appearance {
         zeron_theme::Appearance::Dark => Appearance::Dark,
@@ -336,6 +386,15 @@ fn harden_model_foreground(
 pub(crate) fn lock_appearance() -> std::sync::MutexGuard<'static, ()> {
     static APPEARANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     APPEARANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`GLASS_STRENGTH_BITS`] is process-wide like [`CURRENT_APPEARANCE`]; any
+/// test that calls [`set_glass_strength`] must hold this lock and restore
+/// [`GLASS_STRENGTH_DEFAULT`] before releasing it.
+#[cfg(test)]
+pub(crate) fn lock_glass_strength() -> std::sync::MutexGuard<'static, ()> {
+    static GLASS_STRENGTH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GLASS_STRENGTH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Point the context-free paint helpers at an appearance. Called by
@@ -850,6 +909,9 @@ impl Theme {
             Appearance::Dark => Self::GLASS_ALPHA,
             Appearance::Light => Self::GLASS_ALPHA_LIGHT,
         };
+        // Device-local "Glass strength" slider (Settings > Appearance) scales
+        // the tuned base alpha; contrast checking below may still raise it.
+        let base = glass_alpha_from_strength(glass_strength(), base);
         self.surface
             .opacity(self.contrast_checked_glass_alpha(base))
     }
@@ -1949,6 +2011,86 @@ mod tests {
         );
         assert_eq!(opaque_zeron.surface_treatment, SurfaceTreatment::Opaque);
         assert_eq!(opaque_zeron.glass(), opaque_zeron.surface);
+    }
+
+    #[test]
+    fn glass_strength_default_reproduces_the_tuned_base_alpha() {
+        for base in [0.80_f32, 1.0, 0.62] {
+            assert!(
+                (glass_alpha_from_strength(GLASS_STRENGTH_DEFAULT, base) - base).abs() < 1e-6,
+                "default strength should reproduce base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn glass_strength_extremes_hit_the_anchor_alphas() {
+        let base = 0.80_f32;
+        assert!((glass_alpha_from_strength(0.0, base) - 0.97).abs() < 1e-6);
+        assert!((glass_alpha_from_strength(1.0, base) - 0.45).abs() < 1e-6);
+        // Out-of-range input clamps rather than extrapolating.
+        assert_eq!(glass_alpha_from_strength(-1.0, base), glass_alpha_from_strength(0.0, base));
+        assert_eq!(glass_alpha_from_strength(2.0, base), glass_alpha_from_strength(1.0, base));
+    }
+
+    #[test]
+    fn glass_strength_is_monotonically_decreasing() {
+        let base = 0.80_f32;
+        let mut previous = glass_alpha_from_strength(0.0, base);
+        let mut strength = 0.05_f32;
+        while strength <= 1.0 {
+            let alpha = glass_alpha_from_strength(strength, base);
+            assert!(
+                alpha <= previous + 1e-6,
+                "alpha should never rise as strength increases ({strength} -> {alpha}, was {previous})"
+            );
+            previous = alpha;
+            strength += 0.05;
+        }
+    }
+
+    #[test]
+    fn glass_strength_is_piecewise_linear_around_the_midpoint() {
+        let base = 0.80_f32;
+        // Slope from 0.0 to 0.5: (base - 0.97) / 0.5.
+        let quarter = glass_alpha_from_strength(0.25, base);
+        let expected_quarter = 0.97 + (base - 0.97) * 0.5;
+        assert!((quarter - expected_quarter).abs() < 1e-5);
+        // Slope from 0.5 to 1.0: (0.45 - base) / 0.5.
+        let three_quarter = glass_alpha_from_strength(0.75, base);
+        let expected_three_quarter = base + (0.45 - base) * 0.5;
+        assert!((three_quarter - expected_three_quarter).abs() < 1e-5);
+    }
+
+    #[test]
+    fn theme_glass_reacts_live_to_the_glass_strength_global() {
+        let _guard = lock_glass_strength();
+        let frosted = Theme::dark();
+        assert_eq!(frosted.surface_treatment, SurfaceTreatment::Frosted);
+
+        set_glass_strength(GLASS_STRENGTH_DEFAULT);
+        let default_alpha = frosted.glass().a;
+
+        set_glass_strength(0.0);
+        let near_opaque_alpha = frosted.glass().a;
+        assert!(near_opaque_alpha > default_alpha);
+
+        set_glass_strength(1.0);
+        let transparent_alpha = frosted.glass().a;
+        assert!(transparent_alpha < default_alpha);
+
+        set_glass_strength(GLASS_STRENGTH_DEFAULT);
+
+        // Opaque treatment ignores the slider entirely — no acrylic to scale.
+        let mut opaque = frosted.clone();
+        opaque.surface_treatment = SurfaceTreatment::Opaque;
+        set_glass_strength(0.0);
+        let opaque_at_zero = opaque.glass();
+        set_glass_strength(1.0);
+        let opaque_at_one = opaque.glass();
+        assert_eq!(opaque_at_zero, opaque_at_one);
+        assert_eq!(opaque_at_zero, opaque.surface);
+        set_glass_strength(GLASS_STRENGTH_DEFAULT);
     }
 
     #[test]
