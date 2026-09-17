@@ -9,10 +9,11 @@
 //! releases published before the manifest existed.
 //!
 //! Windows (this fork) has no artifacts in the R2 bucket; instead every
-//! consumer goes to the GitHub releases of the private fork
-//! (`R-ACU/zeron-windows`, overridable via `ZERON_UPDATE_REPO`, zips built by
-//! `scripts/package-windows.ps1`): `fetch_latest` reads `releases/latest` with
-//! a `gh auth token` credential, the zip is staged under
+//! consumer goes to the GitHub releases of the Windows fork
+//! (`R-ACU/zeron-custom`, overridable via `ZERON_UPDATE_REPO`, zips built by
+//! `scripts/package-windows.ps1`): `fetch_latest` reads `releases/latest` —
+//! no credential needed while that repo is public, a `gh auth token` is used
+//! when one is available so a private override repo works too. The zip is staged under
 //! `{data_dir}/updates/<ver>`, and the swap into `%LOCALAPPDATA%\Programs\Zeron`
 //! is performed by a detached copy of the exe running the hidden
 //! `apply-update` subcommand once the app has exited.
@@ -98,7 +99,7 @@ pub fn platform_key() -> (&'static str, &'static str) {
 
 /// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI
 /// builds). Windows artifacts ship as a zip built by `scripts/package-windows.ps1`
-/// and published on the private fork's GitHub releases (see the module doc).
+/// and published on the Windows fork's GitHub releases (see the module doc).
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
     if os == "windows" {
@@ -135,7 +136,7 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 
 /// Fetch the newest release metadata: `manifest.json`, falling back to
 /// `latest.txt` (version only, no checksums) for pre-manifest releases.
-/// Windows reads the private fork's GitHub releases instead (see the module
+/// Windows reads the Windows fork's GitHub releases instead (see the module
 /// doc) — the edge bucket carries no Windows artifacts.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
     if cfg!(windows) {
@@ -187,12 +188,12 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 }
 
 // ---------------------------------------------------------------------------
-// Windows release source — the private fork's GitHub releases
+// Windows release source — the Windows fork's GitHub releases
 // ---------------------------------------------------------------------------
 
 /// GitHub repo whose releases carry the Windows builds; `ZERON_UPDATE_REPO`
 /// overrides (a test/staging fork).
-const DEFAULT_UPDATE_REPO: &str = "R-ACU/zeron-windows";
+const DEFAULT_UPDATE_REPO: &str = "R-ACU/zeron-custom";
 
 fn windows_update_repo() -> String {
     std::env::var("ZERON_UPDATE_REPO")
@@ -202,7 +203,7 @@ fn windows_update_repo() -> String {
         .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_string())
 }
 
-/// GitHub credential for the private update repo, from the GitHub CLI's own
+/// Optional GitHub credential (only a private override repo needs one), from the GitHub CLI's own
 /// login. Trying `gh` by name lets CreateProcess search PATH (equivalent to a
 /// `where gh` lookup); the default install location is the fallback. Plain
 /// sync `Command` so this works from async and sync callers alike.
@@ -238,7 +239,7 @@ fn gh_token() -> anyhow::Result<String> {
         }
     }
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("the GitHub CLI (`gh`) is not installed"));
-    Err(err.context("no GitHub token for the private Windows update repo — run `gh auth login`"))
+    Err(err.context("no GitHub token available — run `gh auth login` if the update repo is private"))
 }
 
 /// `releases/latest` of the fork → [`Manifest`]. Without a gh token the
@@ -258,7 +259,7 @@ async fn fetch_latest_windows() -> anyhow::Result<Manifest> {
         .with_context(|| format!("fetching {url}"))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         let hint = if token.is_none() {
-            " — no gh token available; run `gh auth login`, the repo is private"
+            " — if that repo is private, run `gh auth login` so the updater can read it"
         } else {
             ""
         };
@@ -275,7 +276,8 @@ async fn fetch_latest_windows() -> anyhow::Result<Manifest> {
 
 /// Map a GitHub `releases/latest` JSON body to a [`Manifest`]: the tag (sans
 /// `v`) is the version, and the one asset named [`headless_artifact`] becomes
-/// the single file entry — its API `url` (private assets 404 on the browser
+/// the single file entry — its API `url` (works for public and private assets,
+/// unlike the browser
 /// URL without a session) and the sha256 out of its `digest`.
 fn windows_manifest_from_release(body: &str) -> anyhow::Result<Manifest> {
     #[derive(Deserialize)]
@@ -419,7 +421,7 @@ fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
 /// present. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind. Source: `{edge}/releases/<file>`,
 /// except on Windows when the manifest carries the GitHub asset API URL for
-/// `file` (private repo: octet-stream accept + gh token).
+/// `file` (asset API: octet-stream accept, plus a gh token when one exists).
 pub async fn download_release_file(
     edge_url: &str,
     manifest: &Manifest,
@@ -1373,7 +1375,7 @@ mod tests {
     fn windows_release_json_maps_to_manifest() {
         let name = headless_artifact("0.2.66");
         let body = format!(
-            r#"{{"tag_name":"v0.2.66","assets":[{{"name":"{name}","url":"https://api.github.com/repos/R-ACU/zeron-windows/releases/assets/123","digest":"sha256:deadbeef"}},{{"name":"unrelated-source.tar.gz","url":"https://api.github.com/repos/R-ACU/zeron-windows/releases/assets/124","digest":null}}]}}"#
+            r#"{{"tag_name":"v0.2.66","assets":[{{"name":"{name}","url":"https://api.github.com/repos/R-ACU/zeron-custom/releases/assets/123","digest":"sha256:deadbeef"}},{{"name":"unrelated-source.tar.gz","url":"https://api.github.com/repos/R-ACU/zeron-custom/releases/assets/124","digest":null}}]}}"#
         );
         let manifest = windows_manifest_from_release(&body).unwrap();
         assert_eq!(manifest.version, "0.2.66");
@@ -1382,7 +1384,7 @@ mod tests {
         assert_eq!(meta.sha256.as_deref(), Some("deadbeef"));
         assert_eq!(
             meta.url.as_deref(),
-            Some("https://api.github.com/repos/R-ACU/zeron-windows/releases/assets/123")
+            Some("https://api.github.com/repos/R-ACU/zeron-custom/releases/assets/123")
         );
     }
 

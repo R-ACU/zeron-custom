@@ -6898,9 +6898,9 @@ impl Shell {
                 .child(popover::menu_row(theme, false, "update-release-notes")
                     .id("update-release-notes").cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        // Windows builds release from the private fork.
+                        // Windows builds release from the Windows fork.
                         cx.open_url(if cfg!(windows) {
-                            "https://github.com/R-ACU/zeron-windows/releases"
+                            "https://github.com/R-ACU/zeron-custom/releases"
                         } else {
                             "https://github.com/zeronsh/zeron/releases"
                         });

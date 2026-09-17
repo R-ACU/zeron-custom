@@ -1,13 +1,13 @@
-# Publish a Windows release to the private fork: package the zip (via
+# Publish a Windows release to the Windows fork: package the zip (via
 # scripts\package-windows.ps1) and create the GitHub release the in-app
 # updater reads (zeron-update fetches releases/latest from this repo).
 #
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\release-windows.ps1 [-SkipBuild] [-Notes "..."] [-Draft]
-# Requires: gh (authenticated — the repo is private) and a bumped
+# Requires: gh (authenticated, for the upload) and a bumped
 # [workspace.package] version in Cargo.toml (the release tag is v<version>).
 
 param(
-    [string]$Repo = "R-ACU/zeron-windows",
+    [string]$Repo = "R-ACU/zeron-custom",
     [switch]$SkipBuild,
     [string]$Notes = "Windows build.",
     [switch]$Draft
