@@ -58,6 +58,26 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Hidden helper of the Windows self-update: `zeron_update::spawn_windows_apply`
+    /// runs a temp copy of this exe with these args to swap the staged files
+    /// into the install dir once the app has exited. Like every subcommand it
+    /// never touches the single-instance forwarding — that only guards the
+    /// default headed launch (see `single_instance.rs`).
+    #[command(hide = true)]
+    ApplyUpdate {
+        /// Directory the staged release was unpacked into.
+        #[arg(long)]
+        staged: std::path::PathBuf,
+        /// Install dir to swap the staged files into.
+        #[arg(long)]
+        target: std::path::PathBuf,
+        /// Process to wait for before swapping (the quitting app's pid).
+        #[arg(long)]
+        wait_pid: Option<u32>,
+        /// Start the app again after a successful swap.
+        #[arg(long)]
+        relaunch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -221,6 +241,12 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
         }
+        Some(Command::ApplyUpdate {
+            staged,
+            target,
+            wait_pid,
+            relaunch,
+        }) => zeron_update::apply_update_command(&staged, &target, wait_pid, relaunch),
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
             DaemonCommand::Uninstall => daemon::uninstall(),

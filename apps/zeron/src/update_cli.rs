@@ -57,6 +57,24 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
             Ok(())
         }
+        InstallKind::WinManaged { install_dir } => {
+            println!(
+                "downloading {}…",
+                zeron_update::headless_artifact(&manifest.version)
+            );
+            let data_dir = std::env::var_os("ZERON_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(super::dirs_data_dir);
+            let staged = zeron_update::stage_windows(&manifest, &data_dir).await?;
+            // No wait-pid: the CLI exits right here; the helper force-closes a
+            // still-running instance after a grace period instead.
+            zeron_update::spawn_windows_apply(&staged, &install_dir, None, true)?;
+            println!(
+                "staged {} — running Zeron instances will be closed and the app relaunched to finish.",
+                manifest.version
+            );
+            Ok(())
+        }
         InstallKind::Unmanaged if cfg!(windows) => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\

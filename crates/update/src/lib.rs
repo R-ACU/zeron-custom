@@ -1,12 +1,21 @@
 //! zeron-update — release checking and self-update, shared by the engine (the
 //! background checker + `ApplyUpdate`), the CLI (`zeron update`), and the UI
-//! (the sidebar update strip + macOS bundle swap).
+//! (the sidebar update button + macOS bundle swap).
 //!
 //! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
 //! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
 //! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
 //! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
 //! releases published before the manifest existed.
+//!
+//! Windows (this fork) has no artifacts in the R2 bucket; instead every
+//! consumer goes to the GitHub releases of the private fork
+//! (`R-ACU/zeron-windows`, overridable via `ZERON_UPDATE_REPO`, zips built by
+//! `scripts/package-windows.ps1`): `fetch_latest` reads `releases/latest` with
+//! a `gh auth token` credential, the zip is staged under
+//! `{data_dir}/updates/<ver>`, and the swap into `%LOCALAPPDATA%\Programs\Zeron`
+//! is performed by a detached copy of the exe running the hidden
+//! `apply-update` subcommand once the app has exited.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
@@ -15,6 +24,9 @@
 //!   natively.
 //! - **MacApp** (running out of an app bundle): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
+//! - **WinManaged** (`%LOCALAPPDATA%\Programs\Zeron` per-user install from
+//!   `scripts/install.ps1`): stage the release zip, then a detached helper
+//!   swaps the files after the app exits and relaunches it.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
 
 use std::collections::BTreeMap;
@@ -61,6 +73,10 @@ pub struct Manifest {
 pub struct FileMeta {
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Direct download URL (the GitHub asset API URL for Windows releases);
+    /// absent means fetch from `{edge}/releases/<name>`.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
@@ -81,9 +97,8 @@ pub fn platform_key() -> (&'static str, &'static str) {
 }
 
 /// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI
-/// builds). Windows artifacts ship as a zip (see `.github/workflows/release.yml`);
-/// there is currently no Windows CI target, so this name is aspirational until
-/// that lands, but `zeron update` must already report Windows accurately.
+/// builds). Windows artifacts ship as a zip built by `scripts/package-windows.ps1`
+/// and published on the private fork's GitHub releases (see the module doc).
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
     if os == "windows" {
@@ -120,7 +135,12 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 
 /// Fetch the newest release metadata: `manifest.json`, falling back to
 /// `latest.txt` (version only, no checksums) for pre-manifest releases.
+/// Windows reads the private fork's GitHub releases instead (see the module
+/// doc) — the edge bucket carries no Windows artifacts.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
+    if cfg!(windows) {
+        return fetch_latest_windows().await;
+    }
     let base = edge_url.trim_end_matches('/');
     let client = http_client()?;
     let manifest_url = format!("{base}/releases/manifest.json");
@@ -167,6 +187,138 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 }
 
 // ---------------------------------------------------------------------------
+// Windows release source — the private fork's GitHub releases
+// ---------------------------------------------------------------------------
+
+/// GitHub repo whose releases carry the Windows builds; `ZERON_UPDATE_REPO`
+/// overrides (a test/staging fork).
+const DEFAULT_UPDATE_REPO: &str = "R-ACU/zeron-windows";
+
+fn windows_update_repo() -> String {
+    std::env::var("ZERON_UPDATE_REPO")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_string())
+}
+
+/// GitHub credential for the private update repo, from the GitHub CLI's own
+/// login. Trying `gh` by name lets CreateProcess search PATH (equivalent to a
+/// `where gh` lookup); the default install location is the fallback. Plain
+/// sync `Command` so this works from async and sync callers alike.
+fn gh_token() -> anyhow::Result<String> {
+    let candidates = ["gh", r"C:\Program Files\GitHub CLI\gh.exe"];
+    let mut last_err: Option<anyhow::Error> = None;
+    for program in candidates {
+        match std::process::Command::new(program)
+            .args(["auth", "token"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !token.is_empty() {
+                    return Ok(token);
+                }
+                last_err = Some(anyhow::anyhow!("`{program} auth token` returned an empty token"));
+            }
+            Ok(output) => {
+                last_err = Some(anyhow::anyhow!(
+                    "`{program} auth token` failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Err(err) => {
+                // NotFound = `gh` not on PATH — try the install-location
+                // candidate without recording a misleading spawn error.
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    last_err = Some(err.into());
+                }
+            }
+        }
+    }
+    let err = last_err.unwrap_or_else(|| anyhow::anyhow!("the GitHub CLI (`gh`) is not installed"));
+    Err(err.context("no GitHub token for the private Windows update repo — run `gh auth login`"))
+}
+
+/// `releases/latest` of the fork → [`Manifest`]. Without a gh token the
+/// request is still tried (a public override repo works); a 404 then just
+/// reads as "no releases yet (or no access)".
+async fn fetch_latest_windows() -> anyhow::Result<Manifest> {
+    let repo = windows_update_repo();
+    let token = gh_token().ok();
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let mut request = http_client()?.get(&url);
+    if let Some(token) = &token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let hint = if token.is_none() {
+            " — no gh token available; run `gh auth login`, the repo is private"
+        } else {
+            ""
+        };
+        bail!("no releases yet (or no access) for {repo}{hint}");
+    }
+    let body = resp
+        .error_for_status()
+        .with_context(|| format!("fetching {url}"))?
+        .text()
+        .await
+        .context("reading the GitHub release response")?;
+    windows_manifest_from_release(&body)
+}
+
+/// Map a GitHub `releases/latest` JSON body to a [`Manifest`]: the tag (sans
+/// `v`) is the version, and the one asset named [`headless_artifact`] becomes
+/// the single file entry — its API `url` (private assets 404 on the browser
+/// URL without a session) and the sha256 out of its `digest`.
+fn windows_manifest_from_release(body: &str) -> anyhow::Result<Manifest> {
+    #[derive(Deserialize)]
+    struct GhRelease {
+        tag_name: String,
+        #[serde(default)]
+        assets: Vec<GhAsset>,
+    }
+    #[derive(Deserialize)]
+    struct GhAsset {
+        name: String,
+        url: String,
+        /// `"sha256:<hex>"`, absent on older uploads.
+        #[serde(default)]
+        digest: Option<String>,
+    }
+    let release: GhRelease =
+        serde_json::from_str(body).context("parsing the GitHub release JSON")?;
+    let version = release.tag_name.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        bail!("release tag {:?} carries no version", release.tag_name);
+    }
+    let artifact = headless_artifact(&version);
+    let Some(asset) = release.assets.into_iter().find(|a| a.name == artifact) else {
+        bail!("release v{version} has no Windows build (missing {artifact})");
+    };
+    let sha256 = asset
+        .digest
+        .as_deref()
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .map(str::to_string);
+    let mut files = BTreeMap::new();
+    files.insert(
+        artifact,
+        FileMeta {
+            sha256,
+            url: Some(asset.url),
+        },
+    );
+    Ok(Manifest { version, files })
+}
+
+// ---------------------------------------------------------------------------
 // Install-kind detection
 // ---------------------------------------------------------------------------
 
@@ -178,14 +330,17 @@ pub enum InstallKind {
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
+    /// `%LOCALAPPDATA%\Programs\Zeron` per-user install (`scripts/install.ps1`)
+    /// — updates stage the release zip and a detached helper swaps it in.
+    WinManaged { install_dir: PathBuf },
     /// Source build or hand-copied binary — updates are report-only.
     Unmanaged,
 }
 
 /// The user's home directory for the `~/.zeron/app` managed-install layout.
 /// Windows has no `HOME` by convention; `USERPROFILE` is its equivalent. No
-/// Windows installer creates that layout yet, so this naturally resolves to
-/// [`InstallKind::Unmanaged`] there — see `detect_install`.
+/// Windows installer creates that layout; Windows-managed installs are
+/// detected via `LOCALAPPDATA` instead — see `detect_install`.
 fn install_home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var).map(PathBuf::from)
@@ -195,10 +350,29 @@ pub fn detect_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
-    detect_install_from(&exe, install_home_dir().as_deref())
+    let local_app_data = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        None
+    };
+    detect_install_from(&exe, install_home_dir().as_deref(), local_app_data.as_deref())
 }
 
-fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
+fn detect_install_from(
+    exe: &Path,
+    home: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> InstallKind {
+    if cfg!(windows)
+        && let Some(local_app_data) = local_app_data
+    {
+        // install.ps1's per-user target. Case-insensitive: Windows path
+        // casing is not stable across callers.
+        let install_dir = local_app_data.join("Programs").join("Zeron");
+        if path_starts_with_ci(exe, &install_dir) {
+            return InstallKind::WinManaged { install_dir };
+        }
+    }
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
         let app_root = home.join(".zeron").join("app");
@@ -218,20 +392,40 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
     InstallKind::Unmanaged
 }
 
+/// `path.starts_with(prefix)` with ASCII-case-insensitive components
+/// (Windows file system semantics).
+fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
+    let mut components = path.components();
+    for want in prefix.components() {
+        let Some(got) = components.next() else {
+            return false;
+        };
+        if !got
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&want.as_os_str().to_string_lossy())
+        {
+            return false;
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
+/// Stream the release artifact to `dest`, verifying the manifest sha256 when
 /// present. Writes through a `.partial` sidecar so an interrupted download never
-/// leaves a plausible-looking artifact behind.
+/// leaves a plausible-looking artifact behind. Source: `{edge}/releases/<file>`,
+/// except on Windows when the manifest carries the GitHub asset API URL for
+/// `file` (private repo: octet-stream accept + gh token).
 pub async fn download_release_file(
     edge_url: &str,
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
         tracing::warn!(
@@ -239,14 +433,44 @@ pub async fn download_release_file(
             "no checksum in release metadata; skipping verification"
         );
     }
-    let partial = dest.with_extension("partial");
-    let resp = http_client()?
+    let client = http_client()?;
+    if cfg!(windows)
+        && let Some(url) = manifest.files.get(file).and_then(|m| m.url.clone())
+    {
+        let mut request = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream");
+        if let Ok(token) = gh_token() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request
+            .send()
+            .await
+            .with_context(|| format!("downloading {url}"))?
+            .error_for_status()
+            .with_context(|| format!("downloading {url}"))?;
+        return stream_download(resp, file, dest, expected).await;
+    }
+    let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
+    let resp = client
         .get(&url)
         .send()
         .await
         .with_context(|| format!("downloading {url}"))?
         .error_for_status()
         .with_context(|| format!("downloading {url}"))?;
+    stream_download(resp, file, dest, expected).await
+}
+
+/// Shared body of [`download_release_file`]: stream `resp` into `dest` through
+/// the `.partial` sidecar, verifying `expected` (sha256) when known.
+async fn stream_download(
+    resp: reqwest::Response,
+    file: &str,
+    dest: &Path,
+    expected: Option<&str>,
+) -> anyhow::Result<()> {
+    let partial = dest.with_extension("partial");
     let mut out = tokio::fs::File::create(&partial)
         .await
         .with_context(|| format!("creating {}", partial.display()))?;
@@ -493,6 +717,285 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Windows managed installs — staged zip + detached swap helper
+// ---------------------------------------------------------------------------
+
+/// Download the release zip into `{data_dir}/updates/<ver>/` and unpack it
+/// there (idempotent — an already-unpacked `zeron.exe` is reused). Returns the
+/// staged dir; the swap into the install dir happens after the app exits (see
+/// [`spawn_windows_apply`]).
+pub async fn stage_windows(manifest: &Manifest, data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let version = &manifest.version;
+    let dir = data_dir.join("updates").join(version);
+    if dir.join("zeron.exe").exists() {
+        return Ok(dir);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let file = headless_artifact(version);
+    let zip = dir.join(&file);
+    // The Windows manifest carries the GitHub asset URL, so the edge base is
+    // never consulted for this download.
+    download_release_file("", manifest, &file, &zip).await?;
+    // bsdtar ships with Windows 10+ and reads zip fine.
+    run("tar", &["-xf", &zip.to_string_lossy(), "-C", &dir.to_string_lossy()])?;
+    std::fs::remove_file(&zip).ok();
+    if !dir.join("zeron.exe").exists() {
+        bail!("release zip {file} did not contain zeron.exe");
+    }
+    Ok(dir)
+}
+
+/// Spawn the detached swap helper: a fresh temp copy of THIS exe (a running
+/// exe can be copied but not replaced, and a new temp path per pid never
+/// collides with a previous still-running helper) executing the hidden
+/// `apply-update` subcommand. Not waited on — the caller quits right after.
+pub fn spawn_windows_apply(
+    staged: &Path,
+    install_dir: &Path,
+    wait_pid: Option<u32>,
+    relaunch: bool,
+) -> anyhow::Result<()> {
+    let temp = std::env::temp_dir().join("zeron-update");
+    std::fs::create_dir_all(&temp).with_context(|| format!("creating {}", temp.display()))?;
+    let helper = temp.join(format!("apply-{}.exe", std::process::id()));
+    std::fs::copy(
+        std::env::current_exe().context("resolving the running exe")?,
+        &helper,
+    )
+    .with_context(|| format!("copying the update helper to {}", helper.display()))?;
+    let mut command = std::process::Command::new(&helper);
+    command
+        .arg("apply-update")
+        .arg("--staged")
+        .arg(staged)
+        .arg("--target")
+        .arg(install_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(pid) = wait_pid {
+        command.arg("--wait-pid").arg(pid.to_string());
+    }
+    if relaunch {
+        command.arg("--relaunch");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    command.spawn().context("spawning the update helper")?;
+    Ok(())
+}
+
+/// Body of the hidden `zeron apply-update` subcommand the helper copy runs —
+/// sync and pure std, that process has no tokio runtime. Steps: wait for the
+/// calling app to exit, stop the background engine, wait out the exe lock,
+/// swap `staged` over `target`, restart the engine task, relaunch.
+pub fn apply_update_command(
+    staged: &Path,
+    target: &Path,
+    wait_pid: Option<u32>,
+    relaunch: bool,
+) -> anyhow::Result<()> {
+    apply_log(&format!(
+        "apply-update started (staged: {}, target: {}, wait_pid: {wait_pid:?}, relaunch: {relaunch})",
+        staged.display(),
+        target.display()
+    ));
+    let result = apply_update_inner(staged, target, wait_pid, relaunch);
+    match &result {
+        Ok(()) => apply_log("apply-update finished"),
+        Err(err) => apply_log(&format!("apply-update failed: {err:#}")),
+    }
+    result
+}
+
+fn apply_update_inner(
+    staged: &Path,
+    target: &Path,
+    wait_pid: Option<u32>,
+    relaunch: bool,
+) -> anyhow::Result<()> {
+    if let Some(pid) = wait_pid {
+        wait_for_process_exit(pid)?;
+    }
+    let exe = target.join("zeron.exe");
+    // Release the background engine's lock on the exe (best effort — no
+    // daemon may be installed or running).
+    match std::process::Command::new(&exe).args(["daemon", "stop"]).output() {
+        Ok(output) if output.status.success() => apply_log("engine daemon stopped"),
+        Ok(output) => apply_log(&format!(
+            "`zeron daemon stop` exited with {}; continuing",
+            output.status
+        )),
+        Err(err) => apply_log(&format!("could not run `zeron daemon stop` ({err}); continuing")),
+    }
+    wait_for_exe_unlock(&exe, wait_pid.is_none())?;
+    swap_windows_install(staged, target)?;
+    restart_windows_daemon_task();
+    if relaunch {
+        match std::process::Command::new(&exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => apply_log("relaunched the app"),
+            // The swap itself already succeeded — a failed relaunch is not an
+            // update failure.
+            Err(err) => apply_log(&format!("relaunch failed: {err}")),
+        }
+    }
+    Ok(())
+}
+
+/// Append one line to `%TEMP%\zeron-update\apply.log` and stderr. Best effort
+/// everywhere: logging must never crash the helper.
+fn apply_log(message: &str) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{secs}] {message}");
+    eprintln!("{line}");
+    let path = std::env::temp_dir().join("zeron-update").join("apply.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Poll `tasklist` until `pid` is gone (up to 10 min).
+fn wait_for_process_exit(pid: u32) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+    while process_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            bail!("process {pid} still running after 10 minutes");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// Locale-independent liveness: `tasklist /FI "PID eq N" /FO CSV /NH` prints a
+/// quoted CSV row per matching process, but only a localized INFO line (no
+/// quotes) when the pid is gone.
+fn process_alive(pid: u32) -> bool {
+    let filter = format!("PID eq {pid}");
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.starts_with('"'))
+}
+
+/// Wait until `exe` opens for writing (a running process holds it locked).
+/// `zeron update` from the CLI passes `kill_after_grace`: the user explicitly
+/// asked, so a still-running instance is force-killed after 30 s (mirrors
+/// scripts/install.ps1). Still locked at 120 s: give up.
+fn wait_for_exe_unlock(exe: &Path, kill_after_grace: bool) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let mut killed = false;
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(exe) {
+            Ok(_) => return Ok(()),
+            // Nothing to swap over — the copy lays the exe down fresh.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                let elapsed = start.elapsed();
+                if elapsed >= std::time::Duration::from_secs(120) {
+                    return Err(err)
+                        .context(format!("{} is still locked after 120 s", exe.display()));
+                }
+                if kill_after_grace && !killed && elapsed >= std::time::Duration::from_secs(30) {
+                    killed = true;
+                    apply_log("exe still locked after 30 s; running taskkill /IM zeron.exe /F");
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/IM", "zeron.exe", "/F"])
+                        .output();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// Replace `target`'s contents with the staged ones: move `zeron.exe` aside
+/// (restored on any copy error), copy everything over, drop the backup.
+fn swap_windows_install(staged: &Path, target: &Path) -> anyhow::Result<()> {
+    let exe = target.join("zeron.exe");
+    let old = target.join("zeron.exe.old");
+    let _ = std::fs::remove_file(&old);
+    let had_exe = exe.exists();
+    if had_exe {
+        std::fs::rename(&exe, &old).context("moving the current zeron.exe aside")?;
+    }
+    if let Err(err) = copy_dir_contents(staged, target) {
+        if had_exe {
+            let _ = std::fs::rename(&old, &exe);
+        }
+        return Err(err.context("copying the staged update into place"));
+    }
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
+/// Recursive copy of `from`'s CONTENTS into `to`, overwriting. `install.ps1`
+/// belongs to the package, not the install dir.
+fn copy_dir_contents(from: &Path, to: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().eq_ignore_ascii_case("install.ps1") {
+            continue;
+        }
+        let dest = to.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_contents(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)
+                .with_context(|| format!("copying {}", dest.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Restart the `Zeron` Scheduled Task (the background engine) if installed.
+/// Exit codes only — schtasks output is localized. Failures are logged, never
+/// fatal: the daemon can also be restarted by hand.
+fn restart_windows_daemon_task() {
+    let installed = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "Zeron"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !installed {
+        apply_log("no Zeron scheduled task; skipping daemon restart");
+        return;
+    }
+    for args in [["/End", "/TN", "Zeron"], ["/Run", "/TN", "Zeron"]] {
+        match std::process::Command::new("schtasks").args(args).output() {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => apply_log(&format!("schtasks {} exited with {}", args[0], output.status)),
+            Err(err) => apply_log(&format!("could not run schtasks {}: {err}", args[0])),
+        }
+    }
+    apply_log("Zeron scheduled task restarted");
+}
+
+// ---------------------------------------------------------------------------
 // Engine-side checker
 // ---------------------------------------------------------------------------
 
@@ -708,8 +1211,8 @@ impl Updater {
         let InstallKind::Managed { app_root } = detect_install() else {
             if cfg!(windows) {
                 bail!(
-                    "self-update is not available on Windows yet — rebuild with \
-                     `cargo build --release -p zeron` to update"
+                    "self-update on Windows runs from the sidebar update button \
+                     or `zeron update`"
                 );
             }
             bail!(
@@ -764,6 +1267,7 @@ mod tests {
             detect_install_from(
                 Path::new("/home/u/.zeron/app/0.1.1/zeron"),
                 Some(Path::new("/home/u")),
+                None,
             ),
             InstallKind::Managed {
                 app_root: PathBuf::from("/home/u/.zeron/app")
@@ -773,6 +1277,7 @@ mod tests {
             detect_install_from(
                 Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
                 Some(Path::new("/Users/u")),
+                None,
             ),
             InstallKind::MacApp {
                 bundle: PathBuf::from("/Applications/Zeron.app")
@@ -780,13 +1285,14 @@ mod tests {
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.
         assert_eq!(
-            detect_install_from(Path::new("/tmp/foo.app/zeron"), None),
+            detect_install_from(Path::new("/tmp/foo.app/zeron"), None, None),
             InstallKind::Unmanaged
         );
         assert_eq!(
             detect_install_from(
                 Path::new("/src/target/release/zeron"),
-                Some(Path::new("/home/u"))
+                Some(Path::new("/home/u")),
+                None,
             ),
             InstallKind::Unmanaged
         );
@@ -820,17 +1326,81 @@ mod tests {
         assert_eq!(os == "windows", cfg!(target_os = "windows"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn windows_install_is_never_managed() {
-        // No Windows installer creates `%USERPROFILE%\.zeron\app` yet, so a
-        // Windows build must always detect Unmanaged and `apply()` must bail
-        // with a Windows-specific message rather than attempting a symlink
-        // swap that doesn't exist on this platform.
-        if cfg!(windows) {
-            assert_eq!(detect_install(), InstallKind::Unmanaged);
-            let err = apply_headless(Path::new("C:/nope"), "0.0.0").unwrap_err();
-            assert!(err.to_string().contains("Windows"));
+    fn windows_install_detection() {
+        let local_app_data = Path::new(r"C:\Users\x\AppData\Local");
+        let install_dir = PathBuf::from(r"C:\Users\x\AppData\Local\Programs\Zeron");
+        // install.ps1's per-user install is WinManaged (prefix match is
+        // case-insensitive).
+        for exe in [
+            r"C:\Users\x\AppData\Local\Programs\Zeron\zeron.exe",
+            r"c:\users\x\appdata\local\programs\zeron\zeron.exe",
+        ] {
+            assert_eq!(
+                detect_install_from(
+                    Path::new(exe),
+                    Some(Path::new(r"C:\Users\x")),
+                    Some(local_app_data),
+                ),
+                InstallKind::WinManaged {
+                    install_dir: install_dir.clone()
+                },
+                "{exe}"
+            );
         }
+        // A cargo target dir stays a report-only source build.
+        assert_eq!(
+            detect_install_from(
+                Path::new(r"D:\src\zeron\target\release\zeron.exe"),
+                Some(Path::new(r"C:\Users\x")),
+                Some(local_app_data),
+            ),
+            InstallKind::Unmanaged
+        );
+        // Without LOCALAPPDATA the managed prefix cannot be known.
+        assert_eq!(
+            detect_install_from(
+                Path::new(r"C:\Users\x\AppData\Local\Programs\Zeron\zeron.exe"),
+                Some(Path::new(r"C:\Users\x")),
+                None,
+            ),
+            InstallKind::Unmanaged
+        );
+    }
+
+    #[test]
+    fn windows_release_json_maps_to_manifest() {
+        let name = headless_artifact("0.2.66");
+        let body = format!(
+            r#"{{"tag_name":"v0.2.66","assets":[{{"name":"{name}","url":"https://api.github.com/repos/R-ACU/zeron-windows/releases/assets/123","digest":"sha256:deadbeef"}},{{"name":"unrelated-source.tar.gz","url":"https://api.github.com/repos/R-ACU/zeron-windows/releases/assets/124","digest":null}}]}}"#
+        );
+        let manifest = windows_manifest_from_release(&body).unwrap();
+        assert_eq!(manifest.version, "0.2.66");
+        assert_eq!(manifest.files.len(), 1, "only the platform zip is kept");
+        let meta = &manifest.files[&name];
+        assert_eq!(meta.sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            meta.url.as_deref(),
+            Some("https://api.github.com/repos/R-ACU/zeron-windows/releases/assets/123")
+        );
+    }
+
+    #[test]
+    fn windows_release_json_without_zip_bails() {
+        let body = r#"{"tag_name":"v0.2.66","assets":[{"name":"unrelated.txt","url":"https://api.github.com/assets/1","digest":null}]}"#;
+        let err = windows_manifest_from_release(body).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("no Windows build"), "{message}");
+        assert!(message.contains(&headless_artifact("0.2.66")), "{message}");
+        // No digest on the asset: checksum stays None (download then skips
+        // verification with a warning), the url still maps.
+        let name = headless_artifact("0.2.66");
+        let body = format!(
+            r#"{{"tag_name":"v0.2.66","assets":[{{"name":"{name}","url":"https://api.github.com/assets/2"}}]}}"#
+        );
+        let manifest = windows_manifest_from_release(&body).unwrap();
+        assert_eq!(manifest.files[&name].sha256, None);
     }
 
     #[test]

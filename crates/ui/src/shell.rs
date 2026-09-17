@@ -1100,7 +1100,7 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_button`).
+/// In-app update lifecycle (macOS bundle / managed Windows installs; see `render_update_button`).
 enum UpdateFlow {
     Idle,
     Downloading,
@@ -1617,12 +1617,12 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
-    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
-    /// UpdateStatus stream says WHETHER one exists; this says how far the
+    /// Local lifecycle of an in-app update (macOS bundle swap, Windows staged
+    /// swap) — the engine's UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
     update_flow: UpdateFlow,
     update_task: Option<Task<()>>,
-    /// Instructions for installs without in-app bundle replacement.
+    /// Instructions for installs without in-app self-update.
     update_details: popover::Popup<()>,
     /// How this binary was installed decides the button's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
@@ -6814,17 +6814,21 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Compact update action next to the sidebar identity. macOS bundles can
-    /// download and restart; other installs show update instructions.
+    /// Compact update action next to the sidebar identity. macOS bundles and
+    /// managed Windows installs download and restart; other installs show
+    /// update instructions.
     fn render_update_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
         }
         let latest = status.latest_version.clone()?;
-        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
+        let self_updating = matches!(
+            self.install,
+            zeron_update::InstallKind::MacApp { .. } | zeron_update::InstallKind::WinManaged { .. }
+        );
 
-        let (label, clickable): (SharedString, bool) = if mac_app {
+        let (label, clickable): (SharedString, bool) = if self_updating {
             match &self.update_flow {
                 UpdateFlow::Idle => (format!("Update available: v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
@@ -6877,9 +6881,7 @@ impl Shell {
                 this.update_details.note_trigger_press();
             }));
         if self.update_details.get().is_some() {
-            let instructions = if cfg!(windows) {
-                "This Windows build is maintained separately. Official releases cannot be installed here automatically. Update with a newer Windows build."
-            } else if matches!(self.install, zeron_update::InstallKind::Managed { .. }) {
+            let instructions = if matches!(self.install, zeron_update::InstallKind::Managed { .. }) {
                 "Run `zeron update` in a terminal to install this release."
             } else {
                 "This app was built from source. Update your checkout and rebuild to install the new version."
@@ -6896,7 +6898,12 @@ impl Shell {
                 .child(popover::menu_row(theme, false, "update-release-notes")
                     .id("update-release-notes").cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        cx.open_url("https://github.com/zeronsh/zeron/releases");
+                        // Windows builds release from the private fork.
+                        cx.open_url(if cfg!(windows) {
+                            "https://github.com/R-ACU/zeron-windows/releases"
+                        } else {
+                            "https://github.com/zeronsh/zeron/releases"
+                        });
                         this.close_update_details(cx);
                     }))
                     .child(icon(icons::ARROW_UP_RIGHT).size(px(16.0)).text_color(theme.accent))
@@ -6925,7 +6932,10 @@ impl Shell {
     /// Idle downloads, ready restarts, failures retry. Other installs expose
     /// update instructions without dismissing the available-release indicator.
     fn on_update_button_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
+        if !matches!(
+            self.install,
+            zeron_update::InstallKind::MacApp { .. } | zeron_update::InstallKind::WinManaged { .. }
+        ) {
             if self.update_details.take_press_was_open() {
                 self.close_update_details(cx);
             } else {
@@ -6942,15 +6952,21 @@ impl Shell {
         }
     }
 
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio / reqwest); the button offers "restart to apply" when done.
+    /// Fetch the manifest and stage the new desktop build under the data dir
+    /// (macOS bundle tarball / Windows release zip); the button offers "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
             let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            // Windows stages the fork's release zip (its manifest came from
+            // GitHub); macOS stages the app bundle tarball.
+            if cfg!(windows) {
+                zeron_update::stage_windows(&manifest, &data_dir).await
+            } else {
+                zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            }
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -6973,26 +6989,46 @@ impl Shell {
         cx.notify();
     }
 
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
+    /// Swap the staged build over the installed one and quit: macOS `ditto`s
+    /// the bundle and arms the detached relauncher, Windows spawns the
+    /// apply-update helper — both finish once this process (and its engine
+    /// lock / IPC port) is gone.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
         if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
             return;
         }
-        let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
-            return;
-        };
-        match zeron_update::apply_mac_app(&staged, &bundle) {
-            Ok(()) => {
-                zeron_update::relaunch_app_after_exit(&bundle);
-                crate::app_menus::quit_after_save(cx);
+        match self.install.clone() {
+            zeron_update::InstallKind::MacApp { bundle } => {
+                match zeron_update::apply_mac_app(&staged, &bundle) {
+                    Ok(()) => {
+                        zeron_update::relaunch_app_after_exit(&bundle);
+                        crate::app_menus::quit_after_save(cx);
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "update apply failed");
+                        self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                }
             }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
+            zeron_update::InstallKind::WinManaged { install_dir } => {
+                // The detached helper waits for this process to exit, swaps
+                // the staged files into the install dir, and relaunches.
+                match zeron_update::spawn_windows_apply(
+                    &staged,
+                    &install_dir,
+                    Some(std::process::id()),
+                    true,
+                ) {
+                    Ok(()) => crate::app_menus::quit_after_save(cx),
+                    Err(err) => {
+                        tracing::error!(error = %err, "update apply failed");
+                        self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                }
             }
+            _ => {}
         }
     }
 
