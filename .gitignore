@@ -16,5 +16,6 @@ edge/dist/
 AGENTS.md
 CLAUDE.md
 TODO.md
-vendor/
 .cargo/
+
+vendor/zui/target/
