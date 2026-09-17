@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
+use zeron_ui::autostart::LoginItem;
 
 const LAUNCHD_LABEL: &str = "sh.zeron.app";
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
@@ -78,7 +79,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         let action = format!("conhost.exe --headless \"{}\" headless", exe.display());
         // Reinstall-friendly: end any previous run before rewriting the task.
         let _ = run_quiet("schtasks", &["/End", "/TN", SCHEDULED_TASK_NAME]);
-        run(
+        let created = run(
             "schtasks",
             &[
                 "/Create",
@@ -92,9 +93,33 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
                 "/TR",
                 &action,
             ],
-        )?;
-        run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
-        println!("Installed and started the '{SCHEDULED_TASK_NAME}' scheduled task.");
+        );
+        match created {
+            Ok(()) => {
+                // The task owns the engine start now; a login entry left by
+                // an earlier fallback install would only start a duplicate
+                // that exits on the engine's single-instance lock.
+                let _ = zeron_ui::autostart::set_enabled(LoginItem::Engine, false);
+                run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
+                println!("Installed and started the '{SCHEDULED_TASK_NAME}' scheduled task.");
+            }
+            Err(err) => {
+                // A generic ONLOGON trigger is refused without elevation
+                // (exit code only; the message is localized). The per-user
+                // Run entry Settings > General manages needs no rights.
+                println!("{err:#}");
+                println!(
+                    "Scheduled task not created; registering a per-user login entry instead (HKCU Run \"{}\").",
+                    LoginItem::Engine.registry_value_name()
+                );
+                zeron_ui::autostart::set_enabled(LoginItem::Engine, true)
+                    .map_err(anyhow::Error::msg)?;
+                spawn_hidden_headless(&exe)?;
+                println!(
+                    "Registered the engine to start at sign-in and started it now. If a Zeron window is already running its own engine, the background engine takes over at the next sign-in."
+                );
+            }
+        }
     } else {
         bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
@@ -192,9 +217,22 @@ pub fn uninstall() -> anyhow::Result<()> {
         }
     } else if cfg!(target_os = "windows") {
         let _ = run_quiet("schtasks", &["/End", "/TN", SCHEDULED_TASK_NAME]);
-        match run_quiet("schtasks", &["/Delete", "/F", "/TN", SCHEDULED_TASK_NAME]) {
-            Ok(()) => println!("Removed the '{SCHEDULED_TASK_NAME}' scheduled task."),
-            Err(_) => println!("Not installed."),
+        let task_removed =
+            run_quiet("schtasks", &["/Delete", "/F", "/TN", SCHEDULED_TASK_NAME]).is_ok();
+        if task_removed {
+            println!("Removed the '{SCHEDULED_TASK_NAME}' scheduled task.");
+        }
+        // The fallback login entry `install` registers without elevation.
+        let entry_removed = windows_login_entry_registered()
+            && zeron_ui::autostart::set_enabled(LoginItem::Engine, false).is_ok();
+        if entry_removed {
+            println!(
+                "Removed the '{}' login entry.",
+                LoginItem::Engine.registry_value_name()
+            );
+        }
+        if !task_removed && !entry_removed {
+            println!("Not installed.");
         }
         if let Ok(data_dir) = windows_data_dir() {
             // Best-effort: absent is fine, and a locked/in-use file isn't worth failing over.
@@ -222,10 +260,14 @@ pub fn start() -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "start", SYSTEMD_UNIT])?;
     } else if cfg!(target_os = "windows") {
-        if !windows_task_installed() {
+        if windows_task_installed() {
+            run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
+        } else if windows_login_entry_registered() {
+            let exe = std::env::current_exe().context("resolving the zeron executable path")?;
+            spawn_hidden_headless(&exe)?;
+        } else {
             bail!("not installed, run `zeron daemon install` first");
         }
-        run("schtasks", &["/Run", "/TN", SCHEDULED_TASK_NAME])?;
     } else {
         bail!("zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Scheduled Tasks)");
     }
@@ -321,6 +363,14 @@ pub fn status() -> anyhow::Result<()> {
             .args(["/Query", "/TN", SCHEDULED_TASK_NAME, "/FO", "LIST", "/V"])
             .output()
             .context("running schtasks")?;
+        println!(
+            "Login entry: {}",
+            if windows_login_entry_registered() {
+                "registered (HKCU Run, starts the engine at sign-in)"
+            } else {
+                "not registered"
+            }
+        );
         if !output.status.success() {
             println!("{SCHEDULED_TASK_NAME}: not installed (run `zeron daemon install`)");
         } else {
@@ -395,6 +445,35 @@ fn windows_task_installed() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Whether the per-user "Zeron Engine" Run entry exists (the fallback
+/// `install` registers, also managed by Settings > General).
+fn windows_login_entry_registered() -> bool {
+    zeron_ui::autostart::read_status().is_ok_and(|status| status.engine.registered)
+}
+
+/// Start `zeron headless` now, detached, with a hidden console of its own
+/// (`CREATE_NO_WINDOW`), so it outlives the terminal this CLI runs in.
+#[cfg(windows)]
+fn spawn_hidden_headless(exe: &Path) -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new(exe)
+        .arg("headless")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()
+        .context("starting zeron headless")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_hidden_headless(_exe: &Path) -> anyhow::Result<()> {
+    bail!("starting a hidden engine is only implemented on Windows")
 }
 
 /// `<data_dir>` resolution used by `uninstall` to find the env file to

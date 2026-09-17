@@ -1271,6 +1271,19 @@ thread_local! {
 }
 
 #[cfg(test)]
+/// The registered key whose text is exactly `text` — code-line keys carry a
+/// block and line index the caller should not have to reconstruct.
+pub(crate) fn selection_test_key_for_text(text: &str) -> String {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|entry| entry.text.as_ref() == text)
+            .map(|entry| entry.key.to_string())
+            .unwrap_or_else(|| panic!("no painted text element holds {text:?}"))
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn selection_test_bounds(key: &str) -> gpui::Bounds<gpui::Pixels> {
     REGISTRY.with(|r| {
         r.borrow()
@@ -1989,6 +2002,118 @@ fn code_block_frame(
         .child(body)
 }
 
+/// One rendered code line: monospace syntax runs, addresses underlined and
+/// clickable, and the whole line registered for transcript text selection.
+///
+/// Code lines used to be inert `StyledText` — not registered in the selection
+/// registry, so a drag inside a fence selected nothing and only the copy
+/// button could get the text out. They now register exactly like prose.
+fn code_line_element(
+    line: &SharedString,
+    runs: Vec<TextRun>,
+    li: usize,
+    fit_content: bool,
+    sel_prefix: &str,
+    link_ui: Option<&LinkUi>,
+    theme: &Theme,
+) -> AnyElement {
+    let links: Vec<(Range<usize>, LinkTarget)> = match link_ui {
+        Some(_) => super::url_scan::find_urls(line)
+            .into_iter()
+            .map(|found| {
+                (
+                    found.range.clone(),
+                    LinkTarget::new(&line[found.range], &found.url),
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let runs = underline_link_runs(runs, &links, theme);
+    let styled = StyledText::new(line.clone()).with_runs(runs);
+    let layout = styled.layout().clone();
+    let key: std::sync::Arc<str> = format!("{sel_prefix}:{li}").into();
+    let sel_layout = layout.clone();
+    let sel_text = line.clone();
+    let sel_theme = theme.clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection(window, &key, &sel_text, &sel_layout, &sel_theme);
+        },
+    )
+    .absolute()
+    .size_full();
+    let child = div()
+        .relative()
+        .map(|el| {
+            if fit_content {
+                el.w_full().min_w_0().min_h(px(CODE_LINE_HEIGHT))
+            } else {
+                el.h(px(CODE_LINE_HEIGHT)).flex_none()
+            }
+        })
+        .child(underlay)
+        .child(styled)
+        .into_any_element();
+    if links.is_empty() {
+        return child;
+    }
+    super::link_interaction::LinkRanges {
+        id: format!("{sel_prefix}-link{li}").into(),
+        child,
+        layout,
+        links,
+        ui: link_ui.cloned(),
+    }
+    .into_any_element()
+}
+
+/// Split `runs` at address boundaries and give the address pieces the link
+/// underline. Fonts and total run length are untouched, so a fence keeps its
+/// monospace shaping and only the URL run becomes decorated (and, through
+/// [`code_line_element`], interactive).
+fn underline_link_runs(
+    runs: Vec<TextRun>,
+    links: &[(Range<usize>, LinkTarget)],
+    theme: &Theme,
+) -> Vec<TextRun> {
+    if links.is_empty() {
+        return runs;
+    }
+    let underline = UnderlineStyle {
+        color: Some(theme.text_muted),
+        thickness: px(1.0),
+        wavy: false,
+    };
+    let mut out = Vec::with_capacity(runs.len() + links.len() * 2);
+    let mut pos = 0usize;
+    for run in runs {
+        let (start, end) = (pos, pos + run.len);
+        pos = end;
+        let mut cuts = vec![start, end];
+        for (range, _) in links {
+            for edge in [range.start, range.end] {
+                if edge > start && edge < end {
+                    cuts.push(edge);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for slice in cuts.windows(2) {
+            let (s, e) = (slice[0], slice[1]);
+            let mut piece = run.clone();
+            piece.len = e - s;
+            if links.iter().any(|(r, _)| r.start <= s && e <= r.end) {
+                piece.underline = Some(underline);
+            }
+            out.push(piece);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_code_block_source(
     language: Option<&str>,
@@ -2068,6 +2193,11 @@ fn render_code_block_source_with_actions(
         Some(veil) => veil.borrow_mut().advance(ix, code, opts.now),
         None => Vec::new(),
     };
+    // Selection keys and link plumbing for the individual code lines below.
+    // Links inside a fence route through the same activation path as prose.
+    let sel_prefix = format!("{}:code{ix}", opts.row_key);
+    let link_ui = opts.link.clone().filter(|ui| ui.source_session.is_some());
+    let line_theme = theme.clone();
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
     let code_ui = opts.code.as_ref().and_then(|code| code.get(&ix)).cloned();
     let fit_content = code_ui.as_ref().is_some_and(|ui| ui.fit_content);
@@ -2141,20 +2271,18 @@ fn render_code_block_source_with_actions(
         .children((0..cached.lines.len()).scan(0usize, move |off, li| {
             let (line, runs) = &cached.lines[li];
             let start = *off;
-            *off = start + line.len() + 1; // +1 for the '\n'
+            *off = start + line.len() + 1; // +1 for the line break
             let local = slice_spans(&veil_spans, start, start + line.len());
             let runs = apply_veil(runs.clone(), &local);
-            Some(
-                div()
-                    .map(|el| {
-                        if fit_content {
-                            el.w_full().min_w_0().min_h(px(CODE_LINE_HEIGHT))
-                        } else {
-                            el.h(px(CODE_LINE_HEIGHT)).flex_none()
-                        }
-                    })
-                    .child(StyledText::new(line.clone()).with_runs(runs)),
-            )
+            Some(code_line_element(
+                line,
+                runs,
+                li,
+                fit_content,
+                &sel_prefix,
+                link_ui.as_ref(),
+                &line_theme,
+            ))
         }));
 
     let body: AnyElement = if let Some(ui) = code_ui.as_ref() {
@@ -2333,6 +2461,41 @@ pub fn runs_for_syntax_line_with_plain(
 mod tests {
     use super::*;
     use crate::markdown::parser::{InlineStyle, parse_full};
+
+    /// A fence line keeps its monospace runs; only the address run is
+    /// underlined, and the run lengths still add up to the line.
+    #[test]
+    fn code_lines_underline_only_the_address() {
+        let line = "GitHub: github.com/owner/repo";
+        let mono = gpui::font("monospace");
+        let theme = Theme::dark();
+        let base = vec![TextRun {
+            len: line.len(),
+            font: mono.clone(),
+            color: theme.text,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        let links: Vec<(Range<usize>, LinkTarget)> = crate::markdown::url_scan::find_urls(line)
+            .into_iter()
+            .map(|f| (f.range.clone(), LinkTarget::new(&line[f.range], &f.url)))
+            .collect();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].1.navigation,
+            Ok("https://github.com/owner/repo".into())
+        );
+        let runs = underline_link_runs(base, &links, &theme);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), line.len());
+        assert!(runs.iter().all(|r| r.font == mono));
+        let underlined: usize = runs
+            .iter()
+            .filter(|r| r.underline.is_some())
+            .map(|r| r.len)
+            .sum();
+        assert_eq!(underlined, "github.com/owner/repo".len());
+    }
 
     #[test]
     fn code_block_indices_include_nested_quotes_and_lists() {

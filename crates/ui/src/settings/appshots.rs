@@ -37,8 +37,12 @@ impl ShortcutsPage {
         let theme = Theme::of(cx).clone();
         let accent = theme.accent;
         let capabilities = self.appshot_capabilities;
-        let toggle = |id: &'static str, label: &'static str, enabled: bool| {
-            widgets::toggle_switch(&theme, enabled)
+        // Glide progress per switch, driven before the rows borrow `cx`.
+        let capture_t = widgets::switch_progress("appshots-enabled", self.appshots_enabled, cx);
+        let sound_t =
+            widgets::switch_progress("appshots-sound", self.appshot_sound_enabled, cx);
+        let toggle = |id: &'static str, label: &'static str, enabled: bool, t: f32| {
+            widgets::toggle_switch_t(&theme, t)
                 .id(id)
                 .role(gpui::Role::Switch)
                 .aria_label(label)
@@ -54,6 +58,7 @@ impl ShortcutsPage {
             "appshots-enabled",
             "Capture Appshots",
             self.appshots_enabled,
+            capture_t,
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.appshots_enabled = !this.appshots_enabled;
@@ -64,6 +69,7 @@ impl ShortcutsPage {
             "appshot-sound-enabled",
             "Capture sound",
             self.appshot_sound_enabled,
+            sound_t,
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.appshot_sound_enabled = !this.appshot_sound_enabled;

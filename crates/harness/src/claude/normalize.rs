@@ -230,6 +230,11 @@ impl Normalizer {
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
             Frame::System(f) => {
+                if f.subtype == "local_command_output" {
+                    if let Some(text) = f.content.as_str().filter(|text| !text.trim().is_empty()) {
+                        return vec![AgentEvent::TextDelta { text: text.to_owned() }];
+                    }
+                }
                 // A background subagent's completion arrives as an UNTAGGED
                 // `task_notification` carrying the spawning tool's id — the
                 // wire's only terminal signal for it (live-verified 2.1.228:
@@ -484,6 +489,18 @@ impl Normalizer {
             }
 
             Frame::User(f) => {
+                if f.parent_tool_use_id.is_none() {
+                    let texts: Vec<String> = if let Some(text) = f.message.content.as_str() {
+                        vec![text.to_owned()]
+                    } else { f.message.blocks().filter(|block| block.kind == "text").map(|block| block.text).collect() };
+                    let output: Vec<AgentEvent> = texts.iter().filter_map(|text| {
+                        let (_, rest) = text.split_once("<local-command-stdout>")?;
+                        let (body, _) = rest.split_once("</local-command-stdout>")?;
+                        (!body.trim().is_empty()).then(|| AgentEvent::TextDelta { text: body.trim().to_owned() })
+                    }).collect();
+                    if !output.is_empty() { return output; }
+                }
+
                 if let Some(parent) = &f.parent_tool_use_id {
                     // A subagent's tool results echo on the main channel too;
                     // they belong to its transcript, attributed like its calls.
@@ -656,6 +673,14 @@ impl Normalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_command_output_is_visible_text() {
+        let mut norm = Normalizer::new();
+        let frame = super::super::wire::parse_frame(r#"{"type":"system","subtype":"local_command_output","content":"Context: 12%"}"#).unwrap();
+        assert!(matches!(norm.normalize(frame, false).as_slice(), [AgentEvent::TextDelta { text }] if text == "Context: 12%"));
+    }
+
     use serde_json::json;
 
     #[test]

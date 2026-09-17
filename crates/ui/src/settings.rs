@@ -21,9 +21,13 @@ pub mod archived;
 pub mod composer;
 pub mod devices;
 pub mod files;
+pub mod general;
 pub mod harnesses;
 pub mod notifications;
+pub mod search;
+pub mod search_results;
 pub mod shortcuts;
+pub mod skills;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -206,7 +210,7 @@ impl Default for GitHistoryColumnWidths {
     }
 }
 
-/// A section on the Accounts settings page: the four CLI providers plus the
+/// A section on the Accounts settings page: the five CLI providers plus the
 /// stored API keys, which the page orders and hides like any other section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -215,16 +219,18 @@ pub enum AccountsProvider {
     Codex,
     Cursor,
     Kimi,
+    Cline,
     ApiKeys,
 }
 
 impl AccountsProvider {
     /// Canonical order — also the fallback for anything a stored order omits.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::Cursor,
         Self::Kimi,
+        Self::Cline,
         Self::ApiKeys,
     ];
 
@@ -234,6 +240,7 @@ impl AccountsProvider {
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
             Self::Kimi => "Kimi",
+            Self::Cline => "Cline",
             Self::ApiKeys => "API keys",
         }
     }
@@ -566,6 +573,14 @@ pub enum SidebarSort {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatFolder {
+    pub id: String,
+    pub name: String,
+    pub workspace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
     /// Submit using Enter or the platform modifier plus Enter.
@@ -588,6 +603,14 @@ pub struct UiSettings {
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
+    /// Device-local default cwd, independent of the selected chat.
+    pub workspace_space_id: Option<String>,
+    pub workspace_initialized: bool,
+    pub chat_folders: Vec<ChatFolder>,
+    pub chat_folder_assignments: std::collections::HashMap<String, String>,
+    pub project_colors: std::collections::HashMap<String, u32>,
+    #[serde(skip)]
+    pub active_chat_folder: Option<String>,
     /// Open session tabs in visual order (drag-reorder edits in place).
     /// Device-local: a tab is a local viewport onto the synced session list —
     /// closing one never archives the session. Ids of archived/deleted chats
@@ -621,6 +644,10 @@ pub struct UiSettings {
     /// Suppress the banner while a Zeron window is focused (the chime covers
     /// the foreground case).
     pub notifications_background_only: bool,
+    /// Veto system sleep (including lid-close sleep) while an agent run is in
+    /// progress on this device; released a few minutes after the last run
+    /// ends. Device-local; only the Windows build acts on it (`power.rs`).
+    pub keep_awake_while_running: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
@@ -727,6 +754,12 @@ impl Default for UiSettings {
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
             last_space_id: None,
+            workspace_space_id: None,
+            workspace_initialized: false,
+            chat_folders: Vec::new(),
+            chat_folder_assignments: Default::default(),
+            project_colors: Default::default(),
+            active_chat_folder: None,
             open_tabs: None,
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
@@ -737,6 +770,7 @@ impl Default for UiSettings {
             sound_attention_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
+            keep_awake_while_running: false,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -1647,6 +1681,12 @@ mod tests {
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
             last_space_id: Some("space-1".into()),
+            workspace_space_id: Some("space-1".into()),
+            workspace_initialized: true,
+            chat_folders: vec![ChatFolder { id: "folder:1".into(), name: "Images".into(), workspace: Some("space-1".into()) }],
+            chat_folder_assignments: std::collections::HashMap::from([("chat-1".into(), "folder:1".into())]),
+            project_colors: std::collections::HashMap::from([("folder:1".into(), 0xa78bfa)]),
+            active_chat_folder: None,
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
             tab_order: std::collections::HashMap::from([(
@@ -1660,6 +1700,7 @@ mod tests {
             sound_attention_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
+            keep_awake_while_running: true,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -1719,6 +1760,7 @@ mod tests {
                 AccountsProvider::Codex,
                 AccountsProvider::Cursor,
                 AccountsProvider::ClaudeCode,
+                AccountsProvider::Cline,
             ]),
             accounts_hidden_providers: Some(vec![AccountsProvider::Cursor]),
             legacy_accent_color: None,

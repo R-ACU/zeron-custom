@@ -15,6 +15,8 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
 
+pub mod inbox;
+pub mod automations;
 pub mod agent_accounts;
 pub mod api_keys;
 pub mod auth;
@@ -31,6 +33,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+mod usage_ledger;
 pub mod source_control;
 pub mod spaces;
 pub mod terminals;
@@ -119,6 +122,8 @@ pub struct EngineConfig {
 /// The assembled engine core — also constructible without the IPC server for tests
 /// and the in-process (headed) mode.
 pub struct EngineCore {
+    pub inbox: inbox::Inbox,
+    pub automations: automations::Automations,
     pub sessions: SessionsEngine,
     pub doc_host: DocHost,
     pub workspace: WorkspaceHost,
@@ -218,6 +223,8 @@ impl EngineCore {
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        sessions.load_usage(&profile.store_root().join("usage.sqlite"))
+            .map_err(std::io::Error::other)?;
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -240,7 +247,13 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
-        match sessions.recover_stale() {
+        let inbox = inbox::Inbox::open(&profile.store_root().join("inbox.json"), &device_id)?;
+        sessions.set_inbox(inbox.clone());
+        let automations = automations::Automations::open(
+            &profile.store_root().join("automations.json"), &device_id,
+            sessions.clone(), doc_host.clone(), workspace.clone(), inbox.clone(),
+        )?;
+        match sessions.recover_stale_excluding(&automations.chat_ids()) {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
@@ -287,6 +300,7 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        sessions.set_accounts(agent_accounts.clone());
         // Exports the stored provider keys into this process's environment right
         // here, so every agent CLI spawned later inherits them.
         let api_keys = api_keys::ApiKeys::shared(data_dir);
@@ -302,7 +316,10 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        automations.start();
         Ok(Self {
+            inbox,
+            automations,
             sessions,
             doc_host,
             workspace,
@@ -450,6 +467,8 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_api_keys(self.api_keys.clone())
+        .with_automations(self.automations.clone())
+        .with_inbox(self.inbox.clone())
         .with_auth(self.auth())
         .with_previews(self.previews.clone());
         if let Some(links) = self.links() {
@@ -480,6 +499,7 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.automations.shutdown().await;
         self.previews.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts

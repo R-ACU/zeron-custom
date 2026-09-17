@@ -1,8 +1,8 @@
-//! Money formatting and the session cost estimate.
+//! Money formatting and provider-reported session costs.
 //!
 //! Two surfaces share this module: the COST row under the model picker's
 //! effort slider (per-million list prices) and the composer footer's session
-//! chip (what this chat's reported tokens would cost). Everything here is pure
+//! chip (the cumulative USD amount reported by the harness). Everything here is pure
 //! so both can be unit-tested without a window.
 
 use zeron_proto::{HarnessId, ModelPricing, PriceSource, UsageTotals};
@@ -28,24 +28,12 @@ pub const OUTPUT_LABEL: &str = "Output";
 pub const FREE_LABEL: &str = "Free";
 
 /// Tooltip on the footer's session cost chip.
-pub const SESSION_ESTIMATE_TOOLTIP: &str =
-    "Session estimate from reported tokens at list price; cached input is counted as normal input.";
+pub const SESSION_COST_TOOLTIP: &str = "Cumulative session cost in USD reported by the provider/harness, including cache and model changes as supplied. This is not a final invoice. If no cost is reported, the amount is unavailable.";
 
-/// Whether a chat on this harness is billed per token, and therefore whether
-/// the composer shows a running cost estimate for it.
-///
-/// Only opencode today: it drives the user's own API keys (or OpenCode Zen)
-/// and its catalog carries real prices. Claude Code, Codex and Kimi are
-/// normally driven from a SUBSCRIPTION, where a dollar figure would be pure
-/// fiction, so they stay off even though their models carry list prices. The
-/// remaining ACP agents have no prices at all.
-///
-/// Widening this is a one-line change: add the harness here once its runs are
-/// actually billed per token (and its models carry pricing).
+/// Pi and OpenCode expose provider-reported costs. Subscription harnesses do
+/// not show a dollar amount derived from unrelated list prices.
 pub fn shows_session_cost(harness: HarnessId) -> bool {
     match harness {
-        // Both run on the user's own provider keys (OpenRouter and friends),
-        // so every reported token costs real money.
         HarnessId::Opencode | HarnessId::Pi => true,
         HarnessId::ClaudeCode
         | HarnessId::Codex
@@ -54,6 +42,7 @@ pub fn shows_session_cost(harness: HarnessId) -> bool {
         | HarnessId::Devin
         | HarnessId::Grok
         | HarnessId::Hermes
+        | HarnessId::Cline
         | HarnessId::Mock => false,
     }
 }
@@ -85,6 +74,7 @@ pub fn shows_model_cost(harness: HarnessId) -> bool {
         | HarnessId::Devin
         | HarnessId::Grok
         | HarnessId::Hermes
+        | HarnessId::Cline
         | HarnessId::Mock => false,
     }
 }
@@ -137,6 +127,19 @@ pub fn format_estimate(usd: f64) -> String {
     format!("${usd:.2}")
 }
 
+/// A missing report is distinct from an explicitly reported free session.
+/// No selected-model pricing is used: a model switch cannot reprice history.
+pub fn session_cost_label(totals: Option<UsageTotals>) -> String {
+    totals
+        .and_then(|totals| valid_cost(totals.cost_usd))
+        .map(format_estimate)
+        .unwrap_or_else(|| "Cost unavailable".into())
+}
+
+fn valid_cost(cost: Option<f64>) -> Option<f64> {
+    cost.filter(|usd| usd.is_finite() && *usd >= 0.0)
+}
+
 /// Fold one CUMULATIVE usage report from the engine into what the UI holds.
 ///
 /// The engine sends running totals, not deltas, so the only thing that can go
@@ -148,6 +151,10 @@ pub fn merge_totals(previous: Option<UsageTotals>, incoming: UsageTotals) -> Usa
     UsageTotals {
         input_tokens: previous.input_tokens.max(incoming.input_tokens),
         output_tokens: previous.output_tokens.max(incoming.output_tokens),
+        cost_usd: match (valid_cost(previous.cost_usd), valid_cost(incoming.cost_usd)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        },
     }
 }
 
@@ -157,6 +164,61 @@ mod tests {
 
     fn catalog(input: f64, cached: Option<f64>, output: f64) -> ModelPricing {
         ModelPricing::usd(input, cached, output, PriceSource::Catalog)
+    }
+
+    #[test]
+    fn reported_cost_distinguishes_missing_free_and_invalid() {
+        assert_eq!(session_cost_label(None), "Cost unavailable");
+        for cost in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
+            assert_eq!(
+                session_cost_label(Some(UsageTotals {
+                    input_tokens: 10_000,
+                    cost_usd: cost,
+                    ..Default::default()
+                })),
+                "Cost unavailable"
+            );
+        }
+        assert_eq!(
+            session_cost_label(Some(UsageTotals {
+                cost_usd: Some(0.0),
+                ..Default::default()
+            })),
+            "$0.00"
+        );
+    }
+
+    #[test]
+    fn cost_replays_and_token_only_reports_preserve_the_reported_total() {
+        let mut held = None;
+        for cost in [
+            Some(0.0),
+            Some(0.12),
+            Some(0.03),
+            None,
+            Some(f64::NAN),
+            Some(-1.0),
+        ] {
+            held = Some(merge_totals(
+                held,
+                UsageTotals {
+                    cost_usd: cost,
+                    ..Default::default()
+                },
+            ));
+        }
+        assert_eq!(session_cost_label(held), "$0.12");
+        // A subsequent report after a model change uses the cumulative amount,
+        // regardless of token count or the newly selected model's list price.
+        held = Some(merge_totals(
+            held,
+            UsageTotals {
+                input_tokens: 1_000_000,
+                cost_usd: Some(0.15),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(session_cost_label(held), "$0.15");
     }
 
     #[test]
@@ -185,6 +247,7 @@ mod tests {
         let totals = UsageTotals {
             input_tokens: 1_000_000,
             output_tokens: 100_000,
+            ..Default::default()
         };
         // 1M input at $3 + 100k output at $15/1M = 3.0 + 1.5
         let usd = estimate_usd(totals, &pricing).unwrap();
@@ -231,6 +294,7 @@ mod tests {
                 UsageTotals {
                     input_tokens: input,
                     output_tokens: output,
+                    ..Default::default()
                 },
             );
             assert_eq!(merged.input_tokens, expect_in);
@@ -247,8 +311,9 @@ mod tests {
     }
 
     #[test]
-    fn only_opencode_is_billed_per_token_today() {
+    fn pi_and_opencode_show_reported_costs() {
         assert!(shows_session_cost(HarnessId::Opencode));
+        assert!(shows_session_cost(HarnessId::Pi));
         for subscription in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Kimi] {
             assert!(!shows_session_cost(subscription));
         }

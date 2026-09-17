@@ -70,6 +70,11 @@ impl Render for FilesSettingsPage {
         let selected_font_size = self.editor_font_size;
         let word_wrap = self.word_wrap;
         let show_all_files = self.show_all_files;
+        // Switch glides first: the option closures below hold `cx` immutably
+        // for the rest of the render (`widgets::switch_progress`).
+        let autosave_t = widgets::switch_progress("files-autosave", autosave_enabled, cx);
+        let word_wrap_t = widgets::switch_progress("files-word-wrap", word_wrap, cx);
+        let show_all_t = widgets::switch_progress("files-show-all", show_all_files, cx);
         let options = DELAY_OPTIONS.into_iter().map(|delay| {
             let active = delay == selected;
             div()
@@ -164,7 +169,7 @@ impl Render for FilesSettingsPage {
                             )),
                     )
                     .child(
-                        widgets::toggle_switch(&theme, autosave_enabled)
+                        widgets::toggle_switch_t(&theme, autosave_t)
                             .id("files-autosave-toggle")
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -254,7 +259,7 @@ impl Render for FilesSettingsPage {
                             )),
                     )
                     .child(
-                        widgets::toggle_switch(&theme, word_wrap)
+                        widgets::toggle_switch_t(&theme, word_wrap_t)
                             .id("files-word-wrap-toggle")
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -286,7 +291,7 @@ impl Render for FilesSettingsPage {
                             )),
                     )
                     .child(
-                        widgets::toggle_switch(&theme, show_all_files)
+                        widgets::toggle_switch_t(&theme, show_all_t)
                             .id("files-show-all-toggle")
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {

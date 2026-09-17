@@ -126,7 +126,20 @@ impl Render for NotificationsPage {
         let attention_sound = self.attention_sound;
         let desktop = self.desktop;
         let background_only = self.background_only;
-        let toggle = |id: &'static str, label: &'static str, enabled: bool, interactive: bool| {
+        // The switch glides are driven before the row builders borrow `cx`;
+        // keys are per setting, so a flip keeps animating across re-renders
+        // (`widgets::switch_progress`).
+        let sound_t = widgets::switch_progress("notifications-sound", sound, cx);
+        let completion_t = widgets::switch_progress("notifications-completion", completion_sound, cx);
+        let input_t = widgets::switch_progress("notifications-input", input_sound, cx);
+        let attention_t = widgets::switch_progress("notifications-attention", attention_sound, cx);
+        let desktop_t = widgets::switch_progress("notifications-desktop", desktop, cx);
+        let background_t = widgets::switch_progress("notifications-background", background_only, cx);
+        let toggle = |id: &'static str,
+                      label: &'static str,
+                      enabled: bool,
+                      t: f32,
+                      interactive: bool| {
             // Keep the familiar 32×18 visual inside a 40×40 activation target.
             // Disabled subordinate controls remain named switches in the
             // accessibility tree, but have no focus or input handlers.
@@ -147,7 +160,7 @@ impl Render for NotificationsPage {
                 .when(!interactive, |el| {
                     el.aria_description("Unavailable while its parent setting is off")
                 })
-                .child(widgets::toggle_switch(&theme, enabled))
+                .child(widgets::toggle_switch_t(&theme, t))
         };
         let card = widgets::section_card(&theme)
             .child(
@@ -173,7 +186,13 @@ impl Render for NotificationsPage {
                     )
                     .child(
                         interactive_switch(
-                            toggle("notifications-sound-toggle", "Session sounds", sound, true),
+                            toggle(
+                                "notifications-sound-toggle",
+                                "Session sounds",
+                                sound,
+                                sound_t,
+                                true,
+                            ),
                             accent,
                             NotificationPreference::Sound,
                             cx,
@@ -205,6 +224,7 @@ impl Render for NotificationsPage {
                             "notifications-completion-sound-toggle",
                             "Task completed sound",
                             completion_sound,
+                            completion_t,
                             sound,
                         )
                         .when(sound, |el| {
@@ -242,6 +262,7 @@ impl Render for NotificationsPage {
                             "notifications-input-sound-toggle",
                             "Input required sound",
                             input_sound,
+                            input_t,
                             sound,
                         )
                         .when(sound, |el| {
@@ -279,6 +300,7 @@ impl Render for NotificationsPage {
                             "notifications-attention-sound-toggle",
                             "Errors and disconnections sound",
                             attention_sound,
+                            attention_t,
                             sound,
                         )
                         .when(sound, |el| {
@@ -319,6 +341,7 @@ impl Render for NotificationsPage {
                                 "notifications-desktop-toggle",
                                 "Desktop notifications",
                                 desktop,
+                                desktop_t,
                                 true,
                             ),
                             accent,
@@ -356,6 +379,7 @@ impl Render for NotificationsPage {
                             "notifications-background-toggle",
                             "Only notify when Zeron is in the background",
                             background_only,
+                            background_t,
                             desktop,
                         )
                         .when(desktop, |el| {

@@ -18,13 +18,18 @@
 //! - Linux: `notify-send` (libnotify's CLI, present on every mainstream
 //!   desktop).
 //! - Windows: WinRT toasts via `tauri-winrt-notification`, posted from a
-//!   background thread (the crate's `Toast::show` blocks briefly). Every
-//!   AppUserModelID Windows can resolve without an installer is
-//!   [`Toast::POWERSHELL_APP_ID`] — a real installer's Start Menu shortcut can
-//!   instead carry [`WINDOWS_AUMID`] and set `ZERON_TOAST_APP_ID` to it, which
-//!   [`windows_app_id`] then picks up; until that shortcut exists, toasts show
-//!   the PowerShell name/icon (cosmetic only, matching the osascript/
-//!   notify-send fallback cosmetics on the other platforms).
+//!   background thread (the crate's `Toast::show` blocks briefly), under
+//!   Zeron's own AppUserModelID [`WINDOWS_AUMID`] so the banner carries the
+//!   Zeron name and icon instead of PowerShell's. The AUMID needs no installer
+//!   and no admin: [`init_platform_identity`] claims it for the process
+//!   (`SetCurrentProcessExplicitAppUserModelID`) and writes
+//!   `HKCU\Software\Classes\AppUserModelId\Zeron.Desktop` with `DisplayName`
+//!   and `IconUri`, which is what lets the notification platform resolve a
+//!   name and icon for an id no Start Menu shortcut introduced (the shortcut
+//!   `scripts\install.ps1` stamps with `System.AppUserModel.ID` is the second,
+//!   optional route). `ZERON_TOAST_APP_ID` stays as an override:
+//!   `powershell` falls back to [`Toast::POWERSHELL_APP_ID`], any other value
+//!   is used verbatim.
 //! - `ZERON_DISABLE_NOTIFICATIONS` env kill-switch + the
 //!   `notificationsEnabled` ui-setting (checked by the caller);
 //! - failures are logged and swallowed — a missing notifier must never
@@ -348,16 +353,15 @@ fn post_impl(title: &str, body: &str, _chat_id: Option<&str>) {
     });
 }
 
-/// The AppUserModelID an installed Zeron carries once the installer's Start
-/// Menu shortcut is stamped with it (`Toast::new` needs an id Windows already
-/// recognizes; a bare unregistered id would make the toast silently vanish).
-/// Not wired into the installer yet — see the module doc.
+/// Zeron's AppUserModelID: the identity toasts are attributed to, claimed by
+/// [`init_platform_identity`] at startup and stamped onto the installer's
+/// Start Menu shortcut. Keep both in sync with `scripts\install.ps1`.
 #[cfg(target_os = "windows")]
-const WINDOWS_AUMID: &str = "Zeron.Desktop";
+pub const WINDOWS_AUMID: &str = "Zeron.Desktop";
 
-/// Env var that opts a build into [`WINDOWS_AUMID`] once it is actually
-/// registered; anything else (including unset) keeps the PowerShell id, which
-/// every Windows install already has.
+/// Env override for the toast identity: `powershell` (the kill-switch) falls
+/// back to the id every Windows install already has, any other value is used
+/// verbatim, unset means [`WINDOWS_AUMID`].
 #[cfg(target_os = "windows")]
 const WINDOWS_APP_ID_ENV: &str = "ZERON_TOAST_APP_ID";
 
@@ -371,10 +375,203 @@ fn windows_app_id() -> String {
 
 #[cfg(target_os = "windows")]
 fn windows_app_id_for(env_value: Option<&str>) -> String {
-    if env_value == Some(WINDOWS_AUMID) {
-        WINDOWS_AUMID.to_string()
-    } else {
-        tauri_winrt_notification::Toast::POWERSHELL_APP_ID.to_string()
+    match env_value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => WINDOWS_AUMID.to_string(),
+        Some(value) if value.eq_ignore_ascii_case("powershell") => {
+            tauri_winrt_notification::Toast::POWERSHELL_APP_ID.to_string()
+        }
+        Some(value) => value.to_string(),
+    }
+}
+
+/// Claim [`WINDOWS_AUMID`] for this process and make Windows able to resolve
+/// it to a name and an icon. Call once, as early as possible at startup (the
+/// explicit AUMID must be set before the shell reads the process identity for
+/// taskbar grouping, jump lists or notifications). No-op off Windows.
+pub fn init_platform_identity() {
+    #[cfg(target_os = "windows")]
+    windows_identity::init();
+}
+
+/// Registering the AUMID: two independent halves, both per-user, neither
+/// needing an installer or admin.
+///
+/// 1. `SetCurrentProcessExplicitAppUserModelID` makes this process *be*
+///    `Zeron.Desktop` (taskbar grouping and the toast's activation identity).
+/// 2. `HKCU\Software\Classes\AppUserModelId\<aumid>` with `DisplayName` and
+///    `IconUri` is what the notification platform reads to render a name and
+///    icon for an id that no Start Menu shortcut introduced — without it a
+///    `CreateToastNotifier(aumid)` toast shows the raw id (or nothing).
+///
+/// Values are compared before writing, so a warm start touches no registry.
+#[cfg(target_os = "windows")]
+mod windows_identity {
+    use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegGetValueW, RegSetKeyValueW,
+    };
+
+    /// Toast icons render on a dark chrome; transparent keeps the ico's own
+    /// shape. (`IconBackgroundColor` is AARRGGBB hex.)
+    const ICON_BACKGROUND: &str = "00000000";
+
+    pub(super) fn init() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            set_process_aumid();
+            if let Err(err) = register_aumid_key() {
+                tracing::debug!(error = %err, "could not register the Zeron AppUserModelID");
+            }
+        });
+    }
+
+    fn set_process_aumid() {
+        use windows::core::HSTRING;
+        let aumid = HSTRING::from(super::WINDOWS_AUMID);
+        // SAFETY: `aumid` outlives the call; the function only reads it.
+        let result =
+            unsafe { windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(&aumid) };
+        if let Err(err) = result {
+            tracing::debug!(error = %err, "SetCurrentProcessExplicitAppUserModelID failed");
+        }
+    }
+
+    fn register_aumid_key() -> Result<(), String> {
+        let subkey = format!(r"Software\Classes\AppUserModelId\{}", super::WINDOWS_AUMID);
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        let icon = icon_uri(&exe, icon_beside());
+        for (name, value) in [
+            ("DisplayName", "Zeron"),
+            ("IconUri", icon.as_str()),
+            ("IconBackgroundColor", ICON_BACKGROUND),
+        ] {
+            write_string_if_changed(&subkey, name, value)?;
+        }
+        Ok(())
+    }
+
+    /// The packaged icon next to the exe (`install.ps1` copies both). PNG
+    /// first: the toast image spec takes png/jpg/gif, an ico only sometimes.
+    pub(super) fn icon_beside() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        ["zeron.png", "zeron.ico"]
+            .into_iter()
+            .map(|name| exe.with_file_name(name))
+            .find(|path| path.is_file())
+    }
+
+    /// Prefer the shipped ico; a dev build without one points at the exe,
+    /// whose embedded icon the shell can still extract. Pure over the probe so
+    /// the choice is testable.
+    fn icon_uri(exe: &Path, ico: Option<PathBuf>) -> String {
+        ico.unwrap_or_else(|| exe.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn read_string(subkey: &str, name: &str) -> Option<String> {
+        let (subkey_w, name_w) = (wide(subkey), wide(name));
+        let mut buffer: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            let mut size = buffer.len() as u32;
+            let data: *mut core::ffi::c_void = if buffer.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                buffer.as_mut_ptr().cast()
+            };
+            // SAFETY: NUL-terminated strings; `data` is either null (the
+            // documented size probe) or `buffer` with `size` its byte length.
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER,
+                    subkey_w.as_ptr(),
+                    name_w.as_ptr(),
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    data,
+                    &mut size,
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+                return None;
+            }
+            if status == ERROR_SUCCESS && !buffer.is_empty() {
+                buffer.truncate(size as usize);
+                let units: Vec<u16> = buffer
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                let len = units.iter().position(|u| *u == 0).unwrap_or(units.len());
+                return Some(String::from_utf16_lossy(&units[..len]));
+            }
+            if status == ERROR_SUCCESS || status == ERROR_MORE_DATA {
+                buffer = vec![0; size as usize + 64];
+                continue;
+            }
+            return None;
+        }
+        None
+    }
+
+    /// Idempotent: writes only when the stored value differs.
+    fn write_string_if_changed(subkey: &str, name: &str, value: &str) -> Result<(), String> {
+        if read_string(subkey, name).as_deref() == Some(value) {
+            return Ok(());
+        }
+        let (subkey_w, name_w, data) = (wide(subkey), wide(name), wide(value));
+        let bytes = (data.len() * std::mem::size_of::<u16>()) as u32;
+        // SAFETY: NUL-terminated strings; `data` includes its terminating NUL
+        // and `bytes` is its size in bytes, as REG_SZ requires. The call
+        // creates the subkey when it is missing.
+        let status = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                subkey_w.as_ptr(),
+                name_w.as_ptr(),
+                REG_SZ,
+                data.as_ptr().cast(),
+                bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!("{subkey}\\{name}: Windows error {status}"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_shipped_icon_wins_over_the_executable() {
+            let exe = Path::new(r"C:\Programs\Zeron\zeron.exe");
+            let ico = PathBuf::from(r"C:\Programs\Zeron\zeron.ico");
+            assert_eq!(icon_uri(exe, Some(ico.clone())), ico.to_string_lossy());
+            assert_eq!(icon_uri(exe, None), exe.to_string_lossy());
+        }
+
+        /// Reading a key nobody wrote must be `None`, not a Windows error
+        /// bubbling up as a bogus "changed" verdict (which would rewrite the
+        /// registry on every start).
+        #[test]
+        fn an_absent_value_reads_as_none() {
+            assert_eq!(
+                read_string(
+                    r"Software\Classes\AppUserModelId\Zeron.Desktop.Absent",
+                    "DisplayName"
+                ),
+                None
+            );
+        }
     }
 }
 
@@ -386,6 +583,16 @@ fn post_impl(title: &str, body: &str, chat_id: Option<&str>) {
     std::thread::spawn(move || {
         use tauri_winrt_notification::Toast;
         let mut toast = Toast::new(&windows_app_id()).title(&title).text1(&body);
+        // The AUMID's registered IconUri already names the app icon; an
+        // explicit appLogoOverride also covers ids whose registration the
+        // platform has not picked up yet. Absolute path, no UNC prefix.
+        if let Some(icon) = windows_identity::icon_beside() {
+            toast = toast.icon(
+                &icon,
+                tauri_winrt_notification::IconCrop::Square,
+                "Zeron",
+            );
+        }
         if let Some(chat_id) = chat_id {
             toast = toast.on_activated(move |_arguments| {
                 windows_click::dispatch(chat_id.clone());
@@ -441,21 +648,31 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_app_id_only_switches_on_exact_match() {
-        assert_eq!(
-            windows_app_id_for(Some(WINDOWS_AUMID)),
-            WINDOWS_AUMID,
-            "the installer's exact AUMID opts in"
-        );
+    fn windows_toasts_default_to_zerons_own_identity() {
         assert_eq!(
             windows_app_id_for(None),
-            tauri_winrt_notification::Toast::POWERSHELL_APP_ID,
-            "unset stays on the id every Windows install already has"
+            WINDOWS_AUMID,
+            "unset means Zeron's own AUMID, registered at startup"
         );
         assert_eq!(
-            windows_app_id_for(Some("Zeron.Desktop.Typo")),
+            windows_app_id_for(Some("")),
+            WINDOWS_AUMID,
+            "an empty override is no override"
+        );
+        assert_eq!(
+            windows_app_id_for(Some(" powershell ")),
             tauri_winrt_notification::Toast::POWERSHELL_APP_ID,
-            "a near-miss must not be treated as a registered AUMID"
+            "the kill-switch falls back to the id every Windows install has"
+        );
+        assert_eq!(
+            windows_app_id_for(Some("PowerShell")),
+            tauri_winrt_notification::Toast::POWERSHELL_APP_ID,
+            "the kill-switch is spelling-insensitive"
+        );
+        assert_eq!(
+            windows_app_id_for(Some("Other.App")),
+            "Other.App",
+            "any other value is used verbatim"
         );
     }
 

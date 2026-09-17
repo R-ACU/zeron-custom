@@ -3,8 +3,8 @@
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
 //! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
-//! ([`AcpHarness::hermes`], `hermes acp`) and Kimi ([`AcpHarness::kimi`],
-//! `kimi acp`) — plus pi
+//! ([`AcpHarness::hermes`], `hermes acp`), Kimi ([`AcpHarness::kimi`],
+//! `kimi acp`) and Cline ([`AcpHarness::cline`], `cline --acp`) — plus pi
 //! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
 //! driver exists. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -30,6 +30,7 @@
 
 mod devin_models;
 mod normalize;
+mod pi_usage;
 mod subagent;
 mod subagent_devin;
 
@@ -163,7 +164,7 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
     }
 }
 
-fn npm_global_bins() -> Vec<PathBuf> {
+pub(crate) fn npm_global_bins() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = crate::home_dir() {
         dirs.push(home.join(".local").join("bin"));
@@ -424,16 +425,14 @@ fn pi_spec() -> AcpAgentSpec {
         },
         // The adapter has no `_session/steering` extension: turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
-        // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
-        // equivalent and is left to the agent default).
-        reasoning_levels: &[
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
+        // No harness-wide ladder on purpose: every discovered pi row carries
+        // its OWN ladder (the adapter's `thought_level` values, narrowed per
+        // model by pi's catalog in `crate::pi_thinking`), and the UI falls
+        // back to the harness ladder whenever a model's is empty — which
+        // would hand a model that cannot think a full Min…X-High slider.
+        // Empty here means "no effort control" for those models, as pi
+        // itself treats them (`getSupportedThinkingLevels` → `["off"]`).
+        reasoning_levels: &[],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
@@ -547,6 +546,74 @@ fn kimi_spec() -> AcpAgentSpec {
     }
 }
 
+fn cline_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".cline").join("bin"));
+        dirs.push(home.join(".npm-global").join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs
+}
+
+fn cline_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Cline,
+        display_name: "Cline",
+        executable: "cline",
+        env_override: "CLINE_ACP_EXECUTABLE",
+        // `--acp` is a TOP-LEVEL flag, not a subcommand (verified against
+        // cline 3.0.62: `cline --acp` prints "[acp] starting ACP mode over
+        // stdio…" on stderr and answers `initialize` as agent "cline").
+        args: &["--acp"],
+        // Native ACP server — no adapter package in between.
+        npm_package: None,
+        extra_paths: cline_install_paths,
+        cli_executable: "cline",
+        cli_extra_paths: cline_install_paths,
+        install_hint: "cline (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.cline/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `npm install -g cline`, then `cline auth`; set CLINE_ACP_EXECUTABLE \
+             to override)",
+        // Verified live (3.0.62): `session/new` advertises BOTH a first-class
+        // `models` state and a `model` config option (category "model") with
+        // ~300 routed entries — the wire is authoritative and the config
+        // option wins. This static list only names the pick when a probe
+        // fails; Cline routes to whatever its account is entitled to, so a
+        // hand-maintained flagship table here would go stale within weeks.
+        models: || {
+            vec![Model {
+                id: "anthropic/claude-sonnet-5".into(),
+                label: "Claude Sonnet 5".into(),
+                description: Some("Cline's default routed coding model".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+                pricing: None,
+            }]
+        },
+        // No `_session/steering` extension advertised in `initialize` —
+        // steers deliver at turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Deliberately empty: Cline's `session/new` advertises exactly two
+        // config options, `provider` and `model` — no `thought_level`
+        // category, so there is no rung the wire would accept mid-session.
+        // The CLI's own `--thinking none|low|medium|high|xhigh` is a
+        // launch-time flag, which cannot follow a per-model pick. A fallback
+        // ladder here would show a slider that silently does nothing.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged — check `cline doctor` \
+             and that the account still has an active provider.",
+    }
+}
+
 /// Background-install managed npm adapters for agents whose CLI is present
 /// on this device, so a first chat never pays (or trips over) an npm run.
 /// Skips agents whose adapter is already resolvable; failures are logged and
@@ -619,7 +686,7 @@ pub struct AcpHarness {
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
-    models_cache: tokio::sync::OnceCell<Vec<Model>>,
+    models_cache: tokio::sync::RwLock<Option<(u64, Vec<Model>)>>,
     /// Coalesce concurrent picker/title probes. Starting several OpenCode
     /// processes at once makes cold plugin loading slower and wastes memory.
     models_probe: tokio::sync::Mutex<()>,
@@ -640,7 +707,7 @@ impl AcpHarness {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
             commands: tokio::sync::OnceCell::new(),
-            models_cache: tokio::sync::OnceCell::new(),
+            models_cache: tokio::sync::RwLock::new(None),
             models_probe: tokio::sync::Mutex::new(()),
             devin_models: devin_models::Catalog::default(),
         }
@@ -670,6 +737,11 @@ impl AcpHarness {
     /// Kimi Code CLI (`kimi acp`) — Moonshot AI's native ACP server.
     pub fn kimi() -> Self {
         Self::with_spec(kimi_spec())
+    }
+
+    /// Cline (`cline --acp`) — Cline Bot's native ACP server.
+    pub fn cline() -> Self {
+        Self::with_spec(cline_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -868,7 +940,9 @@ impl AcpHarness {
                 .await?;
             let mut commands = scan_available_commands(&init);
             if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let cwd = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| "/".into());
                 let session = client
                     .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                     .await;
@@ -926,17 +1000,23 @@ impl AcpHarness {
                 .refresh(&exe, self.model_discovery_timeout)
                 .await;
         }
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
+        let revision = crate::credential_revision();
+        if let Some((cached_revision, models)) = &*self.models_cache.read().await {
+            if *cached_revision == revision {
+                return Ok(models.clone());
+            }
         }
         let _probe = self.models_probe.lock().await;
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
+        let revision = crate::credential_revision();
+        if let Some((cached_revision, models)) = &*self.models_cache.read().await {
+            if *cached_revision == revision {
+                return Ok(models.clone());
+            }
         }
         match self.discover_models().await {
             Ok(models) if !models.is_empty() => {
-                let _ = self.models_cache.set(models.clone());
-                Ok(self.models_cache.get().cloned().unwrap_or(models))
+                *self.models_cache.write().await = Some((revision, models.clone()));
+                Ok(models)
             }
             Ok(_) => Ok((self.spec.models)()),
             Err(_) => Ok((self.spec.models)()),
@@ -961,11 +1041,44 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let cwd = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| "/".into());
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
-            let mut models = models_from_session(&session, &(self.spec.models)());
+            let mut models = if self.spec.id == HarnessId::Cline {
+                let mut routed = Vec::new();
+                let session_id = session["sessionId"].as_str().ok_or_else(||
+                    HarnessError::Protocol("Cline returned no session id".into()))?;
+                let provider_option = session["configOptions"].as_array()
+                    .and_then(|options| options.iter().find(|option| option["id"] == "provider"));
+                let current = provider_option.and_then(|option| option["currentValue"].as_str())
+                    .unwrap_or("cline");
+                append_cline_models(&mut routed, current, &session);
+                if let Some(options) = provider_option.and_then(|option| option["options"].as_array()) {
+                    for option in options {
+                        let Some(provider) = option["value"].as_str().filter(|p| *p != current) else { continue };
+                        // Only advertise providers Cline itself recognizes as available.
+                        if let Ok(response) = client.request("session/set_config_option", json!({
+                            "sessionId": session_id, "configId": "provider", "value": provider
+                        })).await {
+                            append_cline_models(&mut routed, provider, &response);
+                        }
+                    }
+                }
+                routed
+            } else {
+                models_from_session(&session, &(self.spec.models)())
+            };
+            // pi-acp advertises ONE ladder for every model; pi's own catalog
+            // knows which models can think at all and which rungs each one
+            // takes (user report: X-High offered on a model with no
+            // reasoning). Narrow every known row to what pi would accept.
+            if self.spec.id == HarnessId::Pi {
+                let wire = wire_ladder(&session);
+                crate::pi_thinking::apply(&mut models, &crate::pi_thinking::catalog(), &wire);
+            }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
             for model in &mut models {
@@ -1015,6 +1128,26 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
     }
 }
 
+/// The effort ladder a `session/new` response advertises: the `thought_level`
+/// config option's values, mapped onto zeron's rungs (values with no rung,
+/// like pi's `off`, drop out). Empty when the agent advertises none.
+fn wire_ladder(session_response: &Value) -> Vec<ReasoningLevel> {
+    session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| o.get("value").and_then(Value::as_str))
+                .filter_map(reasoning_from_value)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Derive the model list a `session/new` response advertises. The `model`
 /// config option's choices come FIRST, the legacy first-class `models` state
 /// is only a fallback: the org adapters enumerate one `availableModels` entry
@@ -1033,17 +1166,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .map(|a| a.as_slice())
         .unwrap_or_default();
 
-    let ladder: Vec<ReasoningLevel> = config_options
-        .iter()
-        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
-        .and_then(|o| o.get("options").and_then(Value::as_array))
-        .map(|opts| {
-            opts.iter()
-                .filter_map(|o| o.get("value").and_then(Value::as_str))
-                .filter_map(reasoning_from_value)
-                .collect()
-        })
-        .unwrap_or_default();
+    let ladder = wire_ladder(session_response);
     let wire_options: Vec<ModelOption> = config_options
         .iter()
         .filter_map(trait_from_config_option)
@@ -1094,9 +1217,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         }
     };
 
-    let model_select: Vec<&Value> = config_options
-        .iter()
-        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+    let model_select: Vec<&Value> = model_config_option(config_options)
         .and_then(|o| o.get("options").and_then(Value::as_array))
         .map(|opts| opts.iter().collect())
         .unwrap_or_default();
@@ -1184,6 +1305,26 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
 /// session opens in. Booleans render as an off/on select, mirroring the
 /// catalogs (zeron never declares the boolean config capability, so adapters
 /// send selects, but handle the shape defensively).
+/// The session config option that really picks the MODEL.
+///
+/// `category: "model"` is not unique: Cline tags its `provider` select with it
+/// too (provider first, model second — verified against cline 3.0.62), and
+/// taking the first match would fill the picker with three billing providers
+/// instead of the routed model catalog. An option whose `id` normalizes to
+/// `model` wins; only when none does is the first `category: "model"` option
+/// used, which is what every single-option agent (claude-agent-acp, Kimi,
+/// codex-acp) already relies on.
+fn model_config_option<'a>(config_options: &'a [Value]) -> Option<&'a Value> {
+    let category_model =
+        |o: &&Value| o.get("category").and_then(Value::as_str) == Some("model");
+    config_options
+        .iter()
+        .find(|o| {
+            category_model(o) && norm_id(o.get("id").and_then(Value::as_str).unwrap_or("")) == "model"
+        })
+        .or_else(|| config_options.iter().find(category_model))
+}
+
 fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
     if matches!(
         option.get("category").and_then(Value::as_str),
@@ -1375,6 +1516,16 @@ struct Session {
     kill_grace: Duration,
     handshake_timeout: Duration,
     stderr_tail: crate::StderrTail,
+}
+
+/// Keep the billing provider in the selection, even when two providers sell
+/// the same model. Strip it only at the Cline process boundary.
+fn append_cline_models(models: &mut Vec<Model>, provider: &str, response: &Value) {
+    for mut model in models_from_session(response, &[]) {
+        model.id = format!("{provider}::{}", model.id);
+        model.label = format!("{provider}/{}", model.label);
+        models.push(model);
+    }
 }
 
 fn initialize_params(harness: HarnessId) -> Value {
@@ -1669,6 +1820,10 @@ fn config_option_sets(
         .get("contextWindow")
         .and_then(Value::as_str)
         .is_some_and(|w| w.eq_ignore_ascii_case("1m"));
+    // Which of possibly several `category: "model"` options is the model one.
+    let model_option_id = model_config_option(options)
+        .and_then(|o| o.get("id"))
+        .and_then(Value::as_str);
     let mut sets = Vec::new();
     for option in options {
         let Some(config_id) = option.get("id").and_then(Value::as_str) else {
@@ -1687,9 +1842,13 @@ fn config_option_sets(
             .collect();
 
         let wanted: Option<Value> = match (kind, category) {
-            ("select", Some("model")) => model
+            // Only the option `model_config_option` picked: Cline tags its
+            // `provider` select `category: "model"` too, and a model id must
+            // never be written into the provider pick.
+            ("select", Some("model")) if Some(config_id) == model_option_id => model
                 .and_then(|m| pick_model_value(m, &available, context_1m))
                 .map(Value::String),
+            ("select", Some("model")) => None,
             // The run's permission mode picks the agent's own mode option.
             // `auto` wants the no-prompts one — claude-agent-acp calls it
             // `bypassPermissions`, codex-acp `agent-full-access`
@@ -2143,6 +2302,15 @@ async fn run_session(session: Session) {
         handshake_timeout,
         stderr_tail,
     } = session;
+    let mut request = request;
+    let selected_model = request.model.clone();
+    let cline_provider = if harness == HarnessId::Cline {
+        request.model.as_deref().and_then(|id| id.split_once("::"))
+            .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
+    } else { None };
+    if let Some((_, model)) = &cline_provider {
+        request.model = Some(model.clone());
+    }
     let RunControls {
         request_input,
         mut steering,
@@ -2208,6 +2376,14 @@ async fn run_session(session: Session) {
             return Err(HarnessError::Protocol(
                 "session/new returned no sessionId".into(),
             ));
+        }
+        if let Some((provider, _)) = &cline_provider {
+            let response = request_draining(&client, &mut incoming, "session/set_config_option", json!({
+                "sessionId": session_id, "configId": "provider", "value": provider
+            })).await?;
+            if let Some(options) = response.get("configOptions") {
+                session_response["configOptions"] = options.clone();
+            }
         }
         if harness == HarnessId::Devin
             && let Some(model) = request.model.as_deref()
@@ -2374,7 +2550,7 @@ async fn run_session(session: Session) {
         &event_tx,
         AgentEvent::SessionStarted {
             harness,
-            model: request.model.clone().unwrap_or_default(),
+            model: selected_model.unwrap_or_default(),
             tools: Vec::new(),
             cwd: request.cwd.clone(),
             session_id: session_id.clone(),
@@ -2386,6 +2562,7 @@ async fn run_session(session: Session) {
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
+    pi_usage::emit(harness, &session_id, &event_tx).await;
     if !init_commands.is_empty()
         && !send(
             &event_tx,
@@ -2652,6 +2829,7 @@ async fn run_session(session: Session) {
                 {
                     break 'main;
                 }
+                pi_usage::emit(harness, &session_id, &event_tx).await;
                 let (status, error) = stop_outcome(&res, interrupted);
                 done_current = true;
                 if interrupted {
@@ -2821,6 +2999,7 @@ async fn run_session(session: Session) {
                         if let Some(usage) = usage_from_response(&res) {
                             let _ = send(&event_tx, usage).await;
                         }
+                        pi_usage::emit(harness, &session_id, &event_tx).await;
                         let (status, error) = stop_outcome(&res, interrupted);
                         done_current = true;
                         if interrupted {
@@ -3274,6 +3453,8 @@ async fn run_session(session: Session) {
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
+        // Also recover costs already flushed before a crash/cancellation.
+        pi_usage::emit(harness, &session_id, &event_tx).await;
         if interrupted && !done_after_interrupt {
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
@@ -3309,6 +3490,19 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cline_catalog_keeps_billing_routes_distinct() {
+        let response = json!({"configOptions": [{"id":"model", "type":"select",
+            "category":"model", "options":[{"value":"anthropic/shared-model", "name":"Shared Model"}]}]});
+        let mut models = Vec::new();
+        append_cline_models(&mut models, "cline", &response);
+        append_cline_models(&mut models, "openrouter", &response);
+        assert_eq!(models[0].id, "cline::anthropic/shared-model");
+        assert_eq!(models[1].id, "openrouter::anthropic/shared-model");
+        assert_eq!(models[1].label, "openrouter/Shared Model");
+    }
+
 
     #[test]
     fn devin_initialize_enables_only_the_supported_subagent_stream() {
@@ -3873,6 +4067,66 @@ mod tests {
         );
     }
 
+    /// Cline's real `session/new` shape: TWO `category: "model"` selects,
+    /// `provider` first. The picker must show the models, not the providers,
+    /// and the send path must not write a model id into `provider`.
+    #[test]
+    fn a_second_category_model_option_never_shadows_the_model_select() {
+        let cline = json!({
+            "sessionId": "s",
+            "configOptions": [
+                { "id": "provider", "type": "select", "category": "model",
+                  "currentValue": "cline",
+                  "options": [{"value": "cline", "name": "Cline Usage-Billing"},
+                              {"value": "cline-pass", "name": "ClinePass"}] },
+                { "id": "model", "type": "select", "category": "model",
+                  "currentValue": "anthropic/claude-sonnet-5",
+                  "options": [{"value": "anthropic/claude-sonnet-5", "name": "Claude Sonnet 5"},
+                              {"value": "openai/gpt-6-astra", "name": "GPT-6 Astra"}] },
+            ]
+        });
+        let models = models_from_session(&cline, &[]);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["anthropic/claude-sonnet-5", "openai/gpt-6-astra"]
+        );
+        // No `thought_level` option: no rung may be attached.
+        assert!(models.iter().all(|m| m.reasoning_levels.is_empty()));
+        // The switch lands on `model`, and `provider` is left alone.
+        assert_eq!(
+            config_option_sets(
+                &cline,
+                Some("openai/gpt-6-astra"),
+                &[],
+                &serde_json::Map::new(),
+                PermissionMode::Ask
+            ),
+            vec![(
+                "model".to_string(),
+                json!({ "value": "openai/gpt-6-astra" })
+            )]
+        );
+        // A single category=model option keeps working whatever its id is.
+        let legacy = json!({
+            "sessionId": "s",
+            "configOptions": [{
+                "id": "base_model", "type": "select", "category": "model",
+                "currentValue": "a", "options": [{"value": "a"}, {"value": "b"}]
+            }]
+        });
+        assert_eq!(models_from_session(&legacy, &[]).len(), 2);
+        assert_eq!(
+            config_option_sets(
+                &legacy,
+                Some("b"),
+                &[],
+                &serde_json::Map::new(),
+                PermissionMode::Ask
+            ),
+            vec![("base_model".to_string(), json!({ "value": "b" }))]
+        );
+    }
+
     #[test]
     fn an_explicit_mode_option_pick_beats_the_permission_mode() {
         let cursor = json!({
@@ -3888,6 +4142,39 @@ mod tests {
         assert_eq!(
             config_option_sets(&cursor, None, &[], &opts, PermissionMode::Bypass),
             vec![("mode".to_string(), json!({ "value": "plan" }))]
+        );
+    }
+}
+
+/// Live checks against a real, signed-in agent install. `#[ignore]`d: they
+/// spawn the vendor CLI and need a working account (same contract as
+/// `pi_thinking::live`).
+#[cfg(test)]
+mod cline_live {
+    use super::*;
+    use crate::Harness;
+
+    /// `cargo test -p zeron-harness --lib cline_live -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a signed-in cline install on PATH"]
+    async fn discovery_reads_clines_own_catalog() {
+        let cline = AcpHarness::cline();
+        assert!(cline.installed(), "cline CLI not found on this device");
+        let models = cline.models().await.expect("model discovery");
+        println!("cline advertised {} models", models.len());
+        for model in models.iter().take(5) {
+            println!("  {} — {} {:?}", model.id, model.label, model.reasoning_levels);
+        }
+        // The wire is authoritative: a real install advertises far more than
+        // the one-entry static fallback in `cline_spec`.
+        assert!(
+            models.len() > 1,
+            "discovery fell back to the static catalog — the probe failed"
+        );
+        // No `thought_level` config option means no rung may be offered.
+        assert!(
+            models.iter().all(|m| m.reasoning_levels.is_empty()),
+            "cline advertised an effort ladder — re-check cline_spec"
         );
     }
 }

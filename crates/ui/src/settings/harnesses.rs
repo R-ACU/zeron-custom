@@ -48,6 +48,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Kimi => "Moonshot AI's Kimi Code CLI (kimi CLI).",
+        HarnessId::Cline => "Cline Bot's Cline agent (cline CLI).",
         HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
         HarnessId::Mock => "Scripted test harness.",
     }
@@ -64,6 +65,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Kimi => "kimi",
+        HarnessId::Cline => "cline",
         HarnessId::Opencode => "opencode",
         HarnessId::Mock => "mock",
     }
@@ -592,6 +594,16 @@ impl HarnessesPage {
         };
         let descriptors = visible_harnesses(list);
         let enabled_count = descriptors.iter().filter(|d| descriptor_enabled(d)).count();
+        // Glide progress per harness, keyed by the harness (never by the row
+        // index — the visible list changes) and driven before the row closure
+        // borrows `cx`.
+        let switch_t: Vec<f32> = descriptors
+            .iter()
+            .map(|descriptor| {
+                let key = format!("harness-switch-{:?}", descriptor.id);
+                widgets::switch_progress(&key, descriptor_enabled(descriptor), cx)
+            })
+            .collect();
         descriptors
             .into_iter()
             .enumerate()
@@ -661,7 +673,7 @@ impl HarnessesPage {
                             .child(widgets::meta_line(&theme, meta)),
                     )
                     .child(
-                        widgets::toggle_switch(&theme, enabled)
+                        widgets::toggle_switch_t(&theme, switch_t[ix])
                             .id(("harness-toggle", ix))
                             .when(interactive, |el| {
                                 el.cursor_pointer()

@@ -130,6 +130,16 @@ pub fn pulse_lease(view: EntityId, cx: &mut App) {
     pulse_lease_every(view, 1, cx);
 }
 
+/// Continuous time for cosmetic motion, sharing the bounded pulse clock.
+/// Returning None also disables the avatar's blink and float in reduced motion.
+pub fn animation_seconds(view: EntityId, cx: &mut App) -> Option<f32> {
+    if reduced_motion(cx) {
+        return None;
+    }
+    pulse_lease(view, cx);
+    Some(cx.default_global::<PulseClock>().epoch.elapsed().as_secs_f32())
+}
+
 fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
     if cx.reduce_motion() {
         return;
@@ -379,10 +389,28 @@ pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
 /// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
 /// blend every interactive hover wash rides in the original.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
+/// Settings search results entrance: the results column rises into place from
+/// [`SETTINGS_RESULTS_RISE_DISTANCE`] below while fading in. Quint-out — the
+/// repo's curve for a surface that travels rather than just tints.
+pub const SETTINGS_RESULTS_RISE: MotionSpec = MotionSpec::new(260, EASE_OUT_QUINT);
+/// Settings page switch: the same move, shorter and smaller — swapping
+/// sections must not read as a page load.
+pub const SETTINGS_PAGE_RISE: MotionSpec = MotionSpec::new(180, EASE_OUT_QUINT);
+/// Rise distance (px) of the settings results entrance.
+pub const SETTINGS_RESULTS_RISE_DISTANCE: f32 = 18.0;
+/// Rise distance (px) of a settings page switch.
+pub const SETTINGS_PAGE_RISE_DISTANCE: f32 = 8.0;
+/// Settings toggle-switch flip: 160ms ease-out for the knob travel and the
+/// track/knob color blend — long enough to read as a movement, short enough
+/// that the setting still feels instant.
+pub const SWITCH_GLIDE: MotionSpec = MotionSpec::new(160, EASE_OUT);
 /// Effort-slider fill/thumb glide: 180ms ease-out (§ composer picker).
 pub const EFFORT_SLIDE: MotionSpec = MotionSpec::new(180, EASE_OUT);
 /// Effort-slider sparkle field: one 6s drift cycle across the filled track.
 pub const EFFORT_SPARKLE: MotionSpec = MotionSpec::new(6000, EASE);
+/// Soft breathing of a live status dot (the Automations "Active" chip) and of
+/// the wizard's stage glow: one slow cycle, never a blink.
+pub const STATUS_DOT_PULSE: MotionSpec = MotionSpec::new(2600, EASE);
 /// Zeron loader pulse period: 2.4s.
 pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
@@ -1080,6 +1108,10 @@ mod tests {
         assert_eq!(NEW_THREAD_TRANSITION.duration_ms, 420);
         assert_eq!(NEW_THREAD_TRANSITION.curve, EASE_RESORT);
         assert_eq!(CHEVRON.duration_ms, 200);
+        assert_eq!(SETTINGS_RESULTS_RISE.duration_ms, 260);
+        assert_eq!(SETTINGS_RESULTS_RISE.curve, EASE_OUT_QUINT);
+        assert_eq!(SETTINGS_PAGE_RISE.duration_ms, 180);
+        assert_eq!(SETTINGS_PAGE_RISE.curve, EASE_OUT_QUINT);
         assert_eq!(ZERON_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
         assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));

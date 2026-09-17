@@ -839,6 +839,9 @@ async fn run_session(session: Session) {
                 }),
             );
         }
+        if !title_only && request.model_options.get("isolateWorkspace").and_then(Value::as_bool) == Some(true) {
+            p.insert("config".into(), json!({"project_root_markers": []}));
+        }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
@@ -996,7 +999,11 @@ async fn run_session(session: Session) {
     }
 
     let mut router = TurnRouter::default();
-    match start_turn(&client, turn_params(&request.prompt)).await {
+    // Keep the user's native/global developer instructions intact. Only reference
+    // files outside native project discovery; never embed their contents.
+    let instruction_refs = if title_only { None } else { crate::instructions::references(&request, false) };
+    let initial_prompt = instruction_refs.map(|refs| format!("{refs}\n\n{}", request.prompt));
+    match start_turn(&client, turn_params(initial_prompt.as_deref().unwrap_or(&request.prompt))).await {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
             let _ = event_tx

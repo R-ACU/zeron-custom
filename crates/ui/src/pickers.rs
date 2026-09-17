@@ -566,7 +566,7 @@ fn flagship_models(harness: HarnessId) -> &'static [&'static str] {
 }
 
 /// Whether `id` is one of the harness's flagship models.
-fn is_flagship_model(harness: HarnessId, id: &str) -> bool {
+pub(crate) fn is_flagship_model(harness: HarnessId, id: &str) -> bool {
     flagship_models(harness)
         .iter()
         .any(|prefix| id.starts_with(prefix))
@@ -574,10 +574,13 @@ fn is_flagship_model(harness: HarnessId, id: &str) -> bool {
 
 /// Leading catalog rows a harness takes on TOP of [`flagship_models`]
 /// (catalogs are served newest-first). Zero where the ids above are curated
-/// and complete.
-fn flagship_lead_rows(harness: HarnessId) -> usize {
+/// and complete — and zero for pi, whose catalog is the user's own provider
+/// config in ITS order, not newest-first: two arbitrary rows above an OTHER
+/// divider read as a nonsensical ranking (user report), so pi's list is
+/// one undivided run.
+pub(crate) fn flagship_lead_rows(harness: HarnessId) -> usize {
     match harness {
-        HarnessId::ClaudeCode | HarnessId::Mock | HarnessId::Codex => 0,
+        HarnessId::ClaudeCode | HarnessId::Mock | HarnessId::Codex | HarnessId::Pi => 0,
         _ => FALLBACK_FLAGSHIP_ROWS,
     }
 }
@@ -2749,7 +2752,7 @@ impl Pickers {
             }
             _ => None,
         };
-        let (device_label, project_label, offline) = {
+        let (device_label, project_label, offline, show_device) = {
             let state = self.state.read(cx);
             let device_id = state.effective_device_id();
             let device_label: SharedString = device_id
@@ -2761,12 +2764,14 @@ impl Pickers {
             let offline = device_id
                 .as_deref()
                 .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
-            let project_label: SharedString = state
+            let mut project_label: SharedString = state
                 .selected_space_row()
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
                 .into();
-            (device_label, project_label, offline)
+            if state.selected_space.as_ref() == crate::settings::current(cx).workspace_space_id.as_ref() && state.selected_space.is_some() { project_label = "Change folder".into(); }
+            let show_device = offline || device_id != state.local_device_id;
+            (device_label, project_label, offline, show_device)
         };
         let device_chip = self
             .footer_chip(
@@ -2792,13 +2797,13 @@ impl Pickers {
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .child(attach_overlay(
+            .when(show_device, |el| el.child(attach_overlay(
                 device_chip,
                 &mut overlay,
                 PickerKind::Device,
                 "device-popover",
                 closing,
-            ))
+            )))
             .child(attach_overlay_end(
                 project_chip,
                 &mut overlay,
@@ -3835,11 +3840,7 @@ impl Pickers {
         // before: on a harness tab every row already shares the tab's agent.
         let route_icon: Option<(&'static str, Option<gpui::Hsla>)> =
             display.route.as_ref().map(|route| {
-                if route.is_openrouter() {
-                    (crate::icons::BRAND_OPENROUTER, None)
-                } else {
-                    (icon_path, tint)
-                }
+                route.icon().map(|icon| (icon, None)).unwrap_or((icon_path, tint))
             });
         let harness_name = row.harness_name.clone();
         let harness = row.harness;
@@ -3856,7 +3857,7 @@ impl Pickers {
         // redundant "via" clause; the two-line favorites row marks the
         // HARNESS instead and spells the route out.
         let attribution: Option<SharedString> = display
-            .tagline(compact && route_icon.is_some())
+            .tagline(compact && display.route.as_ref().and_then(|route| route.icon()).is_some())
             .or_else(|| {
                 row.model
                     .description
@@ -4671,6 +4672,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
         HarnessId::Kimi => (crate::icons::KIMI_MARK, None),
+        // Cline Bot's mark (Simple Icons, CC0), monochrome.
+        HarnessId::Cline => (crate::icons::CLINE_MARK, None),
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
     }
@@ -4896,6 +4899,11 @@ impl Render for Pickers {
                 Some(crate::icons::claude_brand()),
             ),
         };
+        let harness_icon = self.effective_harness(cx).zip(self.selected_model(cx))
+            .and_then(|(harness, model)| {
+                crate::model_display::display_model(harness, &model.id, &model.label)
+                    .route.and_then(|route| route.icon()).map(|icon| (icon, None))
+            }).unwrap_or(harness_icon);
         let explicit_options = self.explicit_options(cx);
         let traits_set = pill_traits_summary(
             self.selected_model(cx),
@@ -5634,6 +5642,36 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|r| r.model.id.as_str()).collect();
         assert_eq!(ids, vec!["glm-5.2", "qwen-4", "default", "kimi-3"]);
         assert_eq!(rows.divider, Some(3));
+    }
+
+    /// pi's catalog is the user's provider config in its own order: no
+    /// flagship guess, no OTHER divider, the list stays as served.
+    #[test]
+    fn pi_keeps_its_catalog_order_without_a_divider() {
+        let descriptors = vec![descriptor(HarnessId::Pi, "Pi")];
+        let models: Vec<Model> = [
+            "openrouter/anthropic/claude-3-haiku",
+            "openrouter/anthropic/claude-fable-5",
+            "openrouter/anthropic/claude-fable-5.1",
+            "openrouter/deepseek/deepseek-v4-pro",
+        ]
+        .into_iter()
+        .map(|id| bare_model(id, id))
+        .collect();
+        let models_for = |harness: HarnessId| -> Option<&[Model]> {
+            (harness == HarnessId::Pi).then_some(models.as_slice())
+        };
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::Pi),
+            &descriptors,
+            models_for,
+            |_, _| false,
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r.model.id.as_str()).collect();
+        assert_eq!(ids, models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>());
+        assert_eq!(rows.divider, None);
     }
 
     #[test]

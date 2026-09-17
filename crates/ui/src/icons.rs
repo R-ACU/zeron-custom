@@ -12,7 +12,7 @@
 //!   ports of zeron's `icons.tsx`. gpui tints SVGs with the text color, so the
 //!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
 //! - The `brand-*` marks identify the API-key providers. DeepSeek, Gemini,
-//!   Mistral, OpenRouter and Ollama come from Simple Icons (CC0); Groq,
+//!   Mistral, OpenRouter, Ollama and Cloudflare come from Simple Icons (CC0); Groq,
 //!   Fireworks and Together are the vendors' own site marks, refitted to the
 //!   24px box as single-colour paths. All of them paint in `currentColor`.
 //!
@@ -154,6 +154,9 @@ icon_assets![
     (GLOBAL, "global"),
     (CHECKLIST, "checklist"),
     (WIDGET, "widget"),
+    // Lightning bolt in the Solar Linear style (Skills) — drawn here, the
+    // embedded Solar subset has no bolt glyph.
+    (BOLT, "bolt"),
     (WIFI_OFF, "wifi-off"),
     (CLOSE_CIRCLE, "close-circle"),
     // Hand-drawn info glyph in the Solar Linear style (like the terminal/
@@ -203,8 +206,10 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (KIMI_MARK, "kimi-mark"),
+    (CLINE_MARK, "cline-mark"),
+    (BRAND_CLOUDFLARE, "brand-cloudflare"),
     (OPENCODE_MARK, "opencode-mark"),
-    // API-key provider marks. The five Simple Icons marks (CC0) carry the
+    // API-key provider marks. The Simple Icons marks (CC0) carry the
     // vendors' own artwork; Groq, Fireworks and Together are their official
     // site marks, redrawn as single-colour 24px glyphs (see the module docs).
     (BRAND_DEEPSEEK, "brand-deepseek"),

@@ -97,6 +97,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Media_Audio",
+    # keep-awake veto (SetThreadExecutionState) in `power.rs`
+    "Win32_System_Power",
+    # autostart.rs: HKCU Run login entries
+    "Win32_System_Registry",
 ] }
 # appshots
 windows = { version = "0.61", features = [

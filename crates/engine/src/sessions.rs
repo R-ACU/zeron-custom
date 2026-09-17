@@ -176,6 +176,7 @@ struct RoutedSteer {
 }
 
 struct Inner {
+    inbox: OnceLock<crate::inbox::Inbox>,
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
@@ -203,12 +204,10 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
-    /// chat_id → cumulative reported token usage, folded from the harnesses'
-    /// `Usage` passthrough. PROCESS-LOCAL and never persisted: the composer's
-    /// session cost chip is an estimate for THIS run of the app and starts at
-    /// zero again after a restart (the events themselves are explicitly
-    /// non-persisted, so there is nothing durable to rebuild it from).
-    usage: Mutex<HashMap<String, UsageTotals>>,
+    /// Profile-local billing totals and durable message receipts.
+    usage: Mutex<crate::usage_ledger::UsageLedger>,
+    usage_changed: watch::Sender<u64>,
+    accounts: OnceLock<crate::AgentAccounts>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -232,6 +231,7 @@ impl SessionsEngine {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(Inner {
+                inbox: OnceLock::new(),
                 device_id,
                 journal,
                 registry,
@@ -244,13 +244,21 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
-                usage: Mutex::new(HashMap::new()),
+                usage: Mutex::new(crate::usage_ledger::UsageLedger::default()),
+                usage_changed: watch::channel(0).0,
+                accounts: OnceLock::new(),
             }),
         }
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
+    pub fn set_accounts(&self, accounts: crate::AgentAccounts) {
+        let _ = self.inner.accounts.set(accounts);
+    }
+
+    pub fn set_inbox(&self, inbox: crate::inbox::Inbox) { let _ = self.inner.inbox.set(inbox); }
+
     pub fn set_doc_host(&self, host: DocHost) {
         // First set wins (the OnceLock contract this slot replaced).
         let mut slot = lock(&self.inner.doc_host);
@@ -300,11 +308,18 @@ impl SessionsEngine {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }
 
-    /// Cumulative reported token usage for this chat since the engine started.
-    /// `None` until the harness has reported any — the composer then shows no
-    /// cost chip rather than a misleading "$0.00".
+    pub fn load_usage(&self, path: &std::path::Path) -> rusqlite::Result<()> {
+        *lock(&self.inner.usage) = crate::usage_ledger::UsageLedger::open(path)?;
+        Ok(())
+    }
+
+    /// Persisted reported billing totals for this chat.
     pub fn usage_totals(&self, chat_id: &str) -> Option<UsageTotals> {
-        lock(&self.inner.usage).get(chat_id).copied()
+        lock(&self.inner.usage).get(chat_id)
+    }
+
+    pub(crate) fn watch_usage(&self) -> watch::Receiver<u64> {
+        self.inner.usage_changed.subscribe()
     }
 
     /// Whether this harness takes a prompt *during* a turn, rather than only at
@@ -422,7 +437,7 @@ impl SessionsEngine {
         });
         if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
             let user_id = message_id.clone().unwrap_or_else(new_id);
-            let accepted = if steerable && same_runtime {
+            let accepted = if steerable && same_runtime && !local_usage_command(harness_id, &request.prompt) {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
                 let mut pending = lock(&ledger);
@@ -769,6 +784,13 @@ impl SessionsEngine {
     /// the remembered harness session (zeron: "not just eulogized";
     /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
+        self.recover_stale_excluding(&std::collections::HashSet::new())
+    }
+
+    /// Scheduled runs are interrupted on restart, never replayed automatically.
+    pub(crate) fn recover_stale_excluding(
+        &self, no_resume: &std::collections::HashSet<String>,
+    ) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
 
@@ -815,7 +837,7 @@ impl SessionsEngine {
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+            let will_resume = !no_resume.contains(&chat_id) && fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
 
             let note = if will_resume {
                 "Run interrupted by engine restart — resuming"
@@ -927,6 +949,11 @@ impl Inner {
                 0
             }
         };
+        if matches!(event, AgentEvent::InputRequested { .. } | AgentEvent::InputResolved { .. } | AgentEvent::Done { .. }) {
+            if let Some(inbox) = self.inbox.get() {
+                if let Err(error) = inbox.event(chat_id, event, seq) { tracing::error!(%error, "session inbox update failed"); }
+            }
+        }
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
             let _ = hub.send(JournaledEvent {
                 seq,
@@ -1438,6 +1465,29 @@ struct RunResumeState {
     startup_retry: bool,
 }
 
+fn local_usage_command(harness: HarnessId, prompt: &str) -> bool {
+    harness == HarnessId::ClaudeCode && matches!(prompt.trim(), "/usage" | "/cost" | "/stats")
+}
+
+fn usage_command_text(snapshot: Option<&zeron_proto::AgentAccountsSnapshot>, totals: Option<&UsageTotals>) -> String {
+    let mut lines = vec!["**Claude Code usage**".to_owned()];
+    let account = snapshot.and_then(|snapshot| snapshot.accounts.iter()
+        .find(|account| account.harness == HarnessId::ClaudeCode && account.active));
+    if let Some(account) = account.filter(|account| !account.usage_windows.is_empty()) {
+        for window in &account.usage_windows {
+            let reset = window.resets_at.map(|time| format!(", resets {}",
+                time.with_timezone(&chrono::Local).format("%d %b %H:%M"))).unwrap_or_default();
+            lines.push(format!("- {}: {:.0}% used{}", window.label, window.used_fraction * 100.0, reset));
+        }
+    } else {
+        lines.push("Plan usage is currently unavailable. Check Settings > Accounts for the Claude Code connection.".into());
+    }
+    if let Some(totals) = totals {
+        lines.push(format!("\nReported tokens in this chat since Zeron started: {} input, {} output.", totals.input_tokens, totals.output_tokens));
+    }
+    lines.join("\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -1466,7 +1516,27 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
+    let launch = if local_usage_command(harness_id, &request.prompt) {
+        // Claude's local TUI command produces no stream-json answer. Render
+        // the same account usage source as Settings without invoking a model.
+        let totals = lock(&inner.usage).get(&chat_id);
+        let accounts = inner.accounts.get().cloned();
+        let resume = request.resume.clone();
+        let stream = futures::stream::once(async move {
+            let snapshot = match accounts {
+                Some(accounts) => accounts.list(true).await.ok(),
+                None => None,
+            };
+            let text = usage_command_text(snapshot.as_ref(), totals.as_ref());
+            vec![Ok(AgentEvent::TextDelta { text }), Ok(AgentEvent::Done {
+                status: DoneStatus::Completed, result: None, error: None, session_id: resume,
+            })]
+        }).flat_map(futures::stream::iter).boxed();
+        Ok(stream)
+    } else {
+        harness.run(request, controls).await
+    };
+    let mut stream = match launch {
         Ok(stream) => stream,
         Err(err) => {
             let message = err.to_string();
@@ -1766,6 +1836,13 @@ async fn drive_run(
             event: sub_event,
         } = &event
         {
+            if let AgentEvent::Cost { id, usd } = sub_event.as_ref() {
+                if let Err(err) = lock(&inner.usage).add_cost(&chat_id, id, *usd) {
+                    tracing::warn!(%chat_id, error = %err, "subagent cost write failed");
+                }
+                inner.usage_changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+                continue;
+            }
             inner.publish(&chat_id, &event);
             let is_steer = matches!(
                 sub_event.as_ref(),
@@ -1938,19 +2015,23 @@ async fn drive_run(
                 continue;
             }
         }
-        // Billing usage is a pure passthrough: it never lands in the doc (it
-        // would replicate to every device and outlive the process) and it must
-        // not reopen a parked turn, so it is folded into the process-local
-        // running total here and dropped, exactly like ContextUsage below.
+        // Billing stays local and cannot reopen a parked turn.
+        if let AgentEvent::Cost { id, usd } = &event {
+            if let Err(err) = lock(&inner.usage).add_cost(&chat_id, id, *usd) {
+                tracing::warn!(%chat_id, error = %err, "session cost write failed");
+            }
+            inner.usage_changed.send_modify(|revision| *revision = revision.wrapping_add(1));
+            continue;
+        }
         if let AgentEvent::Usage {
             input_tokens,
             output_tokens,
         } = &event
         {
-            lock(&inner.usage)
-                .entry(chat_id.clone())
-                .or_default()
-                .add(*input_tokens, *output_tokens);
+            if let Err(err) = lock(&inner.usage).add_tokens(&chat_id, *input_tokens, *output_tokens) {
+                tracing::warn!(%chat_id, error = %err, "session token usage write failed");
+            }
+            inner.usage_changed.send_modify(|revision| *revision = revision.wrapping_add(1));
             continue;
         }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
@@ -2394,6 +2475,17 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn local_usage_is_exact_and_missing_data_stays_visible() {
+        assert!(super::local_usage_command(zeron_proto::HarnessId::ClaudeCode, " /usage "));
+        assert!(!super::local_usage_command(zeron_proto::HarnessId::ClaudeCode, "/usage explain this"));
+        assert!(!super::local_usage_command(zeron_proto::HarnessId::Pi, "/usage"));
+        let text = super::usage_command_text(None, Some(&zeron_proto::UsageTotals { input_tokens: 42, output_tokens: 7, ..Default::default() }));
+        assert!(text.contains("unavailable"));
+        assert!(text.contains("42 input, 7 output"));
+        assert!(!text.contains("0%"));
+    }
     use super::{PendingInputs, RuntimeConfig, auto_answers, subagent_doc_id};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};

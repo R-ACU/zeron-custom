@@ -4098,6 +4098,7 @@ impl DocHost {
                 // minting another checkout.
                 let fresh_worktree = match request.worktree.take() {
                     Some(spec) => {
+                        request.set_original_project_path(spec.repo_path.clone());
                         let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
                         request.cwd = cwd;
                         fresh

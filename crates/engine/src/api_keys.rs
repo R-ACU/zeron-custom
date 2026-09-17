@@ -57,6 +57,8 @@ pub fn env_var(provider: ApiKeyProvider) -> &'static str {
         ApiKeyProvider::Mistral => "MISTRAL_API_KEY",
         ApiKeyProvider::Fireworks => "FIREWORKS_API_KEY",
         ApiKeyProvider::Together => "TOGETHER_API_KEY",
+        ApiKeyProvider::Cline => "CLINE_API_KEY",
+        ApiKeyProvider::Cloudflare => "CLOUDFLARE_API_TOKEN",
         ApiKeyProvider::OllamaCompatible => "OLLAMA_HOST",
     }
 }
@@ -116,9 +118,11 @@ pub fn shape_hint(provider: ApiKeyProvider, key: &str) -> Option<&'static str> {
         ),
         // Mistral, Fireworks and Together issue opaque keys with no stable
         // prefix — there is nothing honest to check.
-        ApiKeyProvider::Mistral | ApiKeyProvider::Fireworks | ApiKeyProvider::Together => {
-            (&[], "")
-        }
+        ApiKeyProvider::Mistral
+        | ApiKeyProvider::Fireworks
+        | ApiKeyProvider::Together
+        | ApiKeyProvider::Cline
+        | ApiKeyProvider::Cloudflare => (&[], ""),
     };
     if prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p)) {
         None
@@ -132,6 +136,8 @@ pub fn shape_hint(provider: ApiKeyProvider, key: &str) -> Option<&'static str> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
+    #[serde(default)]
+    cloudflare: Option<zeron_proto::CloudflareGateway>,
     key: String,
     updated_at: i64,
 }
@@ -161,6 +167,14 @@ struct Inner {
     foreign: HashSet<&'static str>,
     /// Variables this process set itself — the only ones it may change.
     owned: Mutex<HashSet<&'static str>>,
+}
+
+fn provider_env_vars(provider: ApiKeyProvider) -> Vec<&'static str> {
+    let mut names = vec![env_var(provider)];
+    if provider == ApiKeyProvider::Cloudflare {
+        names.extend(["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"]);
+    }
+    names
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -197,9 +211,8 @@ impl ApiKeys {
         let foreign: HashSet<&'static str> = ApiKeyProvider::ALL
             .into_iter()
             .map(env_var)
-            .filter(|name| {
-                std::env::var_os(name).is_some_and(|value| !value.is_empty())
-            })
+            .chain(["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"])
+            .filter(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
             .collect();
         let keys = ApiKeys {
             inner: Arc::new(Inner {
@@ -222,6 +235,7 @@ impl ApiKeys {
                 .filter_map(|provider| {
                     let entry = entries.get(&provider)?;
                     Some(StoredApiKey {
+                        cloudflare: entry.cloudflare.clone(),
                         provider,
                         masked: if provider.is_secret() {
                             mask(&entry.key)
@@ -229,7 +243,9 @@ impl ApiKeys {
                             entry.key.clone()
                         },
                         env_var: env_var(provider).to_string(),
-                        applied: !self.inner.foreign.contains(env_var(provider)),
+                        applied: !provider_env_vars(provider)
+                            .iter()
+                            .any(|name| self.inner.foreign.contains(name)),
                         updated_at: entry.updated_at,
                     })
                 })
@@ -239,6 +255,37 @@ impl ApiKeys {
 
     /// Save (or replace) one provider's key, then re-export.
     pub fn set(&self, provider: ApiKeyProvider, key: &str) -> Result<ApiKeysSnapshot, EngineError> {
+        self.set_with_cloudflare(provider, key, None)
+    }
+
+    pub fn set_with_cloudflare(
+        &self,
+        provider: ApiKeyProvider,
+        key: &str,
+        cloudflare: Option<zeron_proto::CloudflareGateway>,
+    ) -> Result<ApiKeysSnapshot, EngineError> {
+        let cloudflare = if provider == ApiKeyProvider::Cloudflare {
+            let config = cloudflare.ok_or_else(|| {
+                EngineError::Other("Enter the Cloudflare account ID and gateway ID.".into())
+            })?;
+            let account_id = config.account_id.trim().to_string();
+            let gateway_id = config.gateway_id.trim().to_string();
+            if account_id.len() != 32
+                || !account_id.bytes().all(|c| c.is_ascii_hexdigit())
+                || gateway_id.is_empty()
+                || !gateway_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return Err(EngineError::Other("Enter a 32-character Cloudflare account ID and a valid gateway ID (letters, numbers, hyphens or underscores).".into()));
+            }
+            Some(zeron_proto::CloudflareGateway {
+                account_id,
+                gateway_id,
+            })
+        } else {
+            None
+        };
         let key = key.trim();
         if key.is_empty() {
             return Err(EngineError::Other("The key is empty.".into()));
@@ -246,12 +293,14 @@ impl ApiKeys {
         lock(&self.inner.entries).insert(
             provider,
             Entry {
+                cloudflare,
                 key: key.to_string(),
                 updated_at: now_ms(),
             },
         );
         self.persist()?;
         self.apply(provider);
+        zeron_harness::credentials_changed();
         Ok(self.list())
     }
 
@@ -260,12 +309,14 @@ impl ApiKeys {
     pub fn remove(&self, provider: ApiKeyProvider) -> Result<ApiKeysSnapshot, EngineError> {
         lock(&self.inner.entries).remove(&provider);
         self.persist()?;
-        let name = env_var(provider);
-        if lock(&self.inner.owned).remove(name) {
-            // SAFETY / deliberate: see `apply`. Only a variable this process
-            // set itself is cleared here; the user's own export is left alone.
-            unsafe { std::env::remove_var(name) };
+        for name in provider_env_vars(provider) {
+            if lock(&self.inner.owned).remove(name) {
+                // SAFETY / deliberate: see `apply`. Only a variable this process
+                // set itself is cleared here; the user's own export is left alone.
+                unsafe { std::env::remove_var(name) };
+            }
         }
+        zeron_harness::credentials_changed();
         Ok(self.list())
     }
 
@@ -296,24 +347,24 @@ impl ApiKeys {
     /// per-harness launch spec) having to know that zeron stores keys at all.
     /// A variable the user already had set is never touched.
     fn apply(&self, provider: ApiKeyProvider) {
-        let name = env_var(provider);
-        if self.inner.foreign.contains(name) {
-            return;
-        }
-        let Some(key) = lock(&self.inner.entries)
-            .get(&provider)
-            .map(|entry| entry.key.clone())
-        else {
+        let Some(entry) = lock(&self.inner.entries).get(&provider).cloned() else {
             return;
         };
-        lock(&self.inner.owned).insert(name);
-        // SAFETY: `set_var` is unsafe in edition 2024 because another thread
-        // reading the environment concurrently is a data race. Every caller
-        // here is the engine's own control path (startup assembly, or an RPC
-        // handler on the engine runtime), and the only readers are the
-        // `Command` spawns that snapshot the environment for a child process.
-        // The store is the single writer, serialised by `entries`.
-        unsafe { std::env::set_var(name, key) };
+        let mut values = vec![(env_var(provider), entry.key)];
+        if provider == ApiKeyProvider::Cloudflare
+            && let Some(config) = entry.cloudflare
+        {
+            values.push(("CLOUDFLARE_ACCOUNT_ID", config.account_id));
+            values.push(("CLOUDFLARE_GATEWAY_ID", config.gateway_id));
+        }
+        for (name, value) in values {
+            if self.inner.foreign.contains(name) {
+                continue;
+            }
+            lock(&self.inner.owned).insert(name);
+            // Inherit into subsequent CLI launches, preserving user-owned exports.
+            unsafe { std::env::set_var(name, value) };
+        }
     }
 }
 
@@ -322,7 +373,8 @@ mod tests {
     use super::*;
 
     fn tmp_file(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zeron-api-keys-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("zeron-api-keys-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("api-keys.json")
     }
@@ -336,7 +388,10 @@ mod tests {
         // No separator in the first eight characters: fall back to four.
         assert_eq!(mask("AIzaSyAAAABBBBCCCC"), "AIza\u{2026}CCCC");
         // Nothing usable may leak out of a short key.
-        assert_eq!(mask("sk-12345"), "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
+        assert_eq!(
+            mask("sk-12345"),
+            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
         assert_eq!(mask(""), "\u{2022}\u{2022}\u{2022}");
         // The masked form never contains the middle of the secret.
         let secret = "sk-or-v1-SECRETMIDDLEPART-4f2a";
@@ -416,7 +471,8 @@ mod tests {
         let file = tmp_file("foreign");
         let _ = std::fs::remove_file(&file);
         let keys = ApiKeys::open(file.clone());
-        keys.set(ApiKeyProvider::Mistral, "zeron-stored-key").unwrap();
+        keys.set(ApiKeyProvider::Mistral, "zeron-stored-key")
+            .unwrap();
         assert_eq!(
             std::env::var(NAME).ok().as_deref(),
             Some("from-the-users-shell"),
@@ -434,5 +490,108 @@ mod tests {
         );
         unsafe { std::env::remove_var(NAME) };
         let _ = std::fs::remove_file(&file);
+    }
+    #[test]
+    fn cline_and_cloudflare_export_persist_and_remove_all_connection_fields() {
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let names = [
+            "CLINE_API_KEY",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_ACCOUNT_ID",
+            "CLOUDFLARE_GATEWAY_ID",
+        ];
+        let _restore = Restore(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        for name in names {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("keys.json");
+        let keys = ApiKeys::open(file.clone());
+        let config = zeron_proto::CloudflareGateway {
+            account_id: "0123456789abcdef0123456789abcdef".into(),
+            gateway_id: "zeron-test".into(),
+        };
+        assert!(keys.set(ApiKeyProvider::Cloudflare, "test-token").is_err());
+        assert!(keys.list().keys.is_empty());
+        keys.set(ApiKeyProvider::Cline, "test-cline-key").unwrap();
+        keys.set_with_cloudflare(
+            ApiKeyProvider::Cloudflare,
+            "test-cloudflare-token",
+            Some(config.clone()),
+        )
+        .unwrap();
+        assert_eq!(std::env::var("CLINE_API_KEY").unwrap(), "test-cline-key");
+        assert_eq!(
+            std::env::var("CLOUDFLARE_API_TOKEN").unwrap(),
+            "test-cloudflare-token"
+        );
+        assert_eq!(
+            std::env::var("CLOUDFLARE_ACCOUNT_ID").unwrap(),
+            config.account_id
+        );
+        assert_eq!(
+            std::env::var("CLOUDFLARE_GATEWAY_ID").unwrap(),
+            config.gateway_id
+        );
+        let stored: StoreFile = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(
+            stored.keys[&ApiKeyProvider::Cloudflare].cloudflare,
+            Some(config.clone())
+        );
+        assert_eq!(
+            keys.list()
+                .keys
+                .iter()
+                .find(|k| k.provider == ApiKeyProvider::Cloudflare)
+                .unwrap()
+                .cloudflare,
+            Some(config)
+        );
+        keys.remove(ApiKeyProvider::Cline).unwrap();
+        keys.remove(ApiKeyProvider::Cloudflare).unwrap();
+        for name in names {
+            assert!(std::env::var_os(name).is_none());
+        }
+        // Foreign routing values stay untouched, and the UI reports the override.
+        unsafe {
+            std::env::set_var("CLOUDFLARE_GATEWAY_ID", "user-gateway");
+        }
+        let foreign = ApiKeys::open(temp.path().join("foreign.json"));
+        let config = zeron_proto::CloudflareGateway {
+            account_id: "0123456789abcdef0123456789abcdef".into(),
+            gateway_id: "stored-gateway".into(),
+        };
+        let snapshot = foreign
+            .set_with_cloudflare(
+                ApiKeyProvider::Cloudflare,
+                "another-test-token",
+                Some(config),
+            )
+            .unwrap();
+        assert!(!snapshot.keys[0].applied);
+        foreign.remove(ApiKeyProvider::Cloudflare).unwrap();
+        assert_eq!(
+            std::env::var("CLOUDFLARE_GATEWAY_ID").unwrap(),
+            "user-gateway"
+        );
     }
 }

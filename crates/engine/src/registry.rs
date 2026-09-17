@@ -531,21 +531,15 @@ pub fn default_registry() -> HarnessRegistry {
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
     // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
-    // pi's thinking ladder minus its "off" tier.
+    // no harness-wide ladder (each discovered model carries its own, narrowed
+    // per model from pi's catalog; an empty one means no effort control).
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
+            reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
         },
@@ -573,6 +567,24 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| zeron_harness::AcpHarness::kimi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::kimi()) as Arc<dyn Harness>)),
+    );
+    // Cline over ACP (`cline --acp`), same lazy pattern: the static descriptor
+    // mirrors AcpHarness::cline() exactly. No `_session/steering` extension
+    // (turn-boundary steers) and no effort ladder — Cline's `session/new`
+    // advertises only `provider` and `model` config options, so there is no
+    // `thought_level` rung the wire would take.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Cline,
+            name: "Cline".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::cline().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::cline()) as Arc<dyn Harness>)),
     );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
@@ -678,6 +690,7 @@ mod tests {
                 HarnessId::Hermes,
                 HarnessId::Pi,
                 HarnessId::Kimi,
+                HarnessId::Cline,
                 HarnessId::Opencode
             ]
         );
@@ -735,17 +748,8 @@ mod tests {
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
         assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
-        assert_eq!(
-            pi.reasoning_levels(),
-            &[
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max
-            ]
-        );
+        // Per-model ladders only (pi's catalog decides), no harness fallback.
+        assert!(pi.reasoning_levels().is_empty());
         let kimi = registry.resolve(HarnessId::Kimi).unwrap();
         assert_eq!(kimi.id(), HarnessId::Kimi);
         assert_eq!(kimi.display_name(), "Kimi");
@@ -758,6 +762,12 @@ mod tests {
                 ReasoningLevel::Max
             ]
         );
+        let cline = registry.resolve(HarnessId::Cline).unwrap();
+        assert_eq!(cline.id(), HarnessId::Cline);
+        assert_eq!(cline.display_name(), "Cline");
+        assert_eq!(cline.steering_mode(), SteeringMode::TurnBoundary);
+        // Cline advertises no `thought_level` config option: no effort control.
+        assert!(cline.reasoning_levels().is_empty());
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`

@@ -39,11 +39,13 @@ pub fn used_by(provider: ApiKeyProvider) -> &'static [&'static str] {
         ApiKeyProvider::Deepseek => &["OpenCode", "Pi"],
         ApiKeyProvider::Groq => &["OpenCode", "Pi"],
         ApiKeyProvider::Xai => &["OpenCode", "Pi", "Grok CLI"],
-        ApiKeyProvider::Moonshot => &["Kimi", "OpenCode"],
+        ApiKeyProvider::Moonshot => &["Kimi", "OpenCode", "Pi"],
         ApiKeyProvider::Google => &["OpenCode", "Pi"],
         ApiKeyProvider::Mistral => &["OpenCode", "Pi"],
         ApiKeyProvider::Fireworks => &["OpenCode", "Pi"],
         ApiKeyProvider::Together => &["OpenCode", "Pi"],
+        ApiKeyProvider::Cline => &["Cline"],
+        ApiKeyProvider::Cloudflare => &["OpenCode"],
         ApiKeyProvider::OllamaCompatible => &["OpenCode"],
     }
 }
@@ -67,6 +69,8 @@ pub fn key_page_url(provider: ApiKeyProvider) -> &'static str {
         ApiKeyProvider::Mistral => "https://console.mistral.ai/api-keys",
         ApiKeyProvider::Fireworks => "https://app.fireworks.ai/settings/users/api-keys",
         ApiKeyProvider::Together => "https://api.together.ai/settings/api-keys",
+        ApiKeyProvider::Cline => "https://app.cline.bot",
+        ApiKeyProvider::Cloudflare => "https://dash.cloudflare.com/profile/api-tokens",
         ApiKeyProvider::OllamaCompatible => "https://ollama.com/download",
     }
 }
@@ -89,6 +93,8 @@ pub fn provider_icon(provider: ApiKeyProvider) -> &'static str {
         ApiKeyProvider::Mistral => crate::icons::BRAND_MISTRAL,
         ApiKeyProvider::Fireworks => crate::icons::BRAND_FIREWORKS,
         ApiKeyProvider::Together => crate::icons::BRAND_TOGETHER,
+        ApiKeyProvider::Cline => crate::icons::CLINE_MARK,
+        ApiKeyProvider::Cloudflare => crate::icons::BRAND_CLOUDFLARE,
         ApiKeyProvider::OllamaCompatible => crate::icons::BRAND_OLLAMA,
     }
 }
@@ -144,6 +150,8 @@ pub struct ApiKeysSection {
     provider_menu: popover::Popup<ProviderMenu>,
     draft_provider: ApiKeyProvider,
     key_input: Entity<ComposerInput>,
+    account_input: Entity<ComposerInput>,
+    gateway_input: Entity<ComposerInput>,
     /// The field is masked until the user asks to edit it (click, or the eye).
     /// gpui's text input paints its own glyphs, so masking is a swap of the
     /// rendered element rather than a property of the input: the input keeps
@@ -180,6 +188,12 @@ impl ApiKeysSection {
             provider_menu: popover::Popup::default(),
             draft_provider: ApiKeyProvider::Anthropic,
             key_input,
+            account_input: cx.new(|cx| {
+                ComposerInput::with_context("Account ID", "Composer", cx).with_single_line()
+            }),
+            gateway_input: cx.new(|cx| {
+                ComposerInput::with_context("Gateway ID", "Composer", cx).with_single_line()
+            }),
             revealed: false,
             saving: false,
             removing: None,
@@ -249,7 +263,13 @@ impl ApiKeysSection {
         let provider = self.draft_provider;
         self.saving = true;
         self.error = None;
-        let params = serde_json::json!({ "provider": provider, "key": key });
+        let cloudflare =
+            (provider == ApiKeyProvider::Cloudflare).then(|| zeron_proto::CloudflareGateway {
+                account_id: self.account_input.read(cx).text().trim().to_string(),
+                gateway_id: self.gateway_input.read(cx).text().trim().to_string(),
+            });
+        let params =
+            serde_json::json!({ "provider": provider, "key": key, "cloudflare": cloudflare });
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::SET_API_KEY, params).await;
             this.update(cx, |section, cx| {
@@ -334,6 +354,19 @@ impl ApiKeysSection {
         self.close_provider_menu(cx);
         self.draft_provider = provider;
         self.error = None;
+        if provider == ApiKeyProvider::Cloudflare {
+            let config = self
+                .snapshot
+                .ready()
+                .and_then(|s| s.keys.iter().find(|key| key.provider == provider))
+                .and_then(|key| key.cloudflare.clone());
+            if let Some(config) = config {
+                self.account_input
+                    .update(cx, |input, cx| input.set_text(&config.account_id, cx));
+                self.gateway_input
+                    .update(cx, |input, cx| input.set_text(&config.gateway_id, cx));
+            }
+        }
         let placeholder = key_placeholder(provider);
         self.key_input
             .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
@@ -692,6 +725,63 @@ impl Render for ApiKeysSection {
             .flex_col()
             .gap(px(8.0))
             .child(widgets::field_label(&theme, "Add API key"))
+            .when(provider == ApiKeyProvider::Cloudflare, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(widgets::field_label(&theme, "Account ID"))
+                                .child(
+                                    div()
+                                        .h(px(34.0))
+                                        .px(px(10.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(self.account_input.clone()),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(widgets::field_label(&theme, "Gateway ID"))
+                                .child(
+                                    div()
+                                        .h(px(34.0))
+                                        .px(px(10.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(self.gateway_input.clone()),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -778,7 +868,8 @@ impl Render for ApiKeysSection {
                     .child(SharedString::from(
                         "Stored on this device and exported into the environment of every \
                          agent zeron starts, so the CLIs find their provider keys without \
-                         a shell profile.",
+                         a shell profile. Model lists refresh when you reopen the picker. \
+                         Cline can only use providers exposed by its CLI.",
                     )),
             )
             .child(
@@ -812,6 +903,7 @@ mod tests {
 
     fn stored(provider: ApiKeyProvider) -> StoredApiKey {
         StoredApiKey {
+            cloudflare: None,
             provider,
             masked: "sk-or-\u{2026}4f2a".into(),
             env_var: "OPENROUTER_API_KEY".into(),

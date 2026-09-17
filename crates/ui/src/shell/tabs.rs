@@ -105,12 +105,14 @@ impl Shell {
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.settings.active_chat_folder = None;
+        self.schedule_save(cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         let target = {
             let state = self.state.read(cx);
             self.settings
-                .space_filter
+                .workspace_space_id
                 .clone()
                 .filter(|id| state.space_row(id).is_some())
         };
@@ -118,7 +120,8 @@ impl Shell {
         self.state.update(cx, |s, cx| {
             if target.is_some() {
                 s.select_space(target, cx);
-            } else if defaults.no_project {
+            } else {
+                // No default workspace means an explicit projectless new chat.
                 // Opening an existing project session (including boot's last
                 // session) must not erase the saved new-session opt-out.
                 s.select_space(None, cx);
@@ -296,6 +299,7 @@ impl Shell {
             )
         };
 
+        let automation = self.state.read(cx).selected_chat_row().and_then(|chat| chat.automation.clone());
         let inner = div()
             .size_full()
             .flex()
@@ -315,8 +319,9 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
+                        .when_some(automation.as_ref(), |el, identity| el.child(crate::agent_avatar::automation_face(identity, 18.0)))
                         .when_some(
-                            harness.map(crate::pickers::harness_brand_icon),
+                            harness.filter(|_| automation.is_none()).map(crate::pickers::harness_brand_icon),
                             |el, (path, tint)| {
                                 el.child(
                                     icon(path)

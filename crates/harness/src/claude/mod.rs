@@ -193,6 +193,10 @@ impl ClaudeHarness {
             cmd.arg(format!("--resume={resume}"));
         }
         let mut settings = serde_json::Map::new();
+        let excludes = crate::instructions::claude_parent_excludes(request);
+        if !excludes.is_empty() {
+            settings.insert("claudeMdExcludes".into(), serde_json::json!(excludes));
+        }
         if option_is_on(&request.model_options, "fastMode") {
             settings.insert("fastMode".into(), Value::Bool(true));
         }
@@ -414,6 +418,11 @@ impl ClaudeHarness {
         // and ignores later changes (it has no tools anyway).
         let controls_permission = controls.permission.clone();
         let mut cmd = self.build_command(&exe, &request);
+        if !title_only {
+            if let Some(instructions) = crate::instructions::references(&request, true) {
+                cmd.arg("--append-system-prompt").arg(instructions);
+            }
+        }
         if title_only {
             cmd.args([
                 "--system-prompt",

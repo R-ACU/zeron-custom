@@ -42,6 +42,16 @@ struct Interaction {
     dismissed: Rc<Cell<bool>>,
     tooltip_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focused: Option<usize>,
+    /// The rect of the link the pointer last pressed. A click focuses the hit
+    /// target and may hand the window's input to the browser pane, so neither
+    /// a hover tooltip nor the focus card may survive it: the tooltip stays
+    /// suppressed until the pointer leaves that rect again (a mouse-leave
+    /// event can be lost entirely while the pane takes over).
+    clicked: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Set by a press on a hit target, consumed by the next prepaint: focus
+    /// that the pointer caused must not raise the keyboard destination card.
+    pointer_focus: Rc<Cell<bool>>,
+    window_active: bool,
 }
 impl IntoElement for LinkRanges {
     type Element = Self;
@@ -56,6 +66,7 @@ impl Element for LinkRanges {
         Rc<RefCell<Option<(usize, Point<Pixels>)>>>,
         Rc<Cell<u64>>,
         Rc<Cell<bool>>,
+        Rc<Cell<Option<Bounds<Pixels>>>>,
         Rc<Cell<Option<Bounds<Pixels>>>>,
     );
     fn id(&self) -> Option<ElementId> {
@@ -101,7 +112,19 @@ impl Element for LinkRanges {
                     dismissed: Rc::default(),
                     tooltip_bounds: Rc::default(),
                     focused: None,
+                    clicked: Rc::default(),
+                    pointer_focus: Rc::default(),
+                    window_active: true,
                 });
+            // Losing the window (the browser pane, another app) must take the
+            // disclosure with it; the pointer may never come back over the
+            // link to end the hover.
+            let window_active = window.is_window_active();
+            if !window_active {
+                state.clicked.set(None);
+                state.dismissed.set(true);
+            }
+            state.window_active = window_active;
             if state.bounds != bounds {
                 state.menu.borrow_mut().take();
                 state.epoch.set(state.epoch.get().wrapping_add(1));
@@ -112,7 +135,10 @@ impl Element for LinkRanges {
                 .iter()
                 .position(|focus| focus.is_focused(window));
             if focused != state.focused {
-                state.dismissed.set(false);
+                // Only keyboard focus discloses the destination: a click
+                // focuses the hit target too, and its card would then cover
+                // the text with nothing left to dismiss it.
+                state.dismissed.set(state.pointer_focus.replace(false));
             }
             state.focused = focused;
             state.bounds = bounds;
@@ -122,6 +148,11 @@ impl Element for LinkRanges {
                 *bounds.borrow_mut() = Some(state.tooltip_bounds.clone());
             });
             let theme = Theme::of(cx).clone();
+            let tooltip_allowed = hover_tooltip_allowed(
+                state.menu.borrow().is_some(),
+                state.clicked.get(),
+                window_active,
+            );
             let mut overlays = Vec::new();
             for (index, (range, target)) in self.links.iter().enumerate() {
                 for (part, rect) in range_rects(&self.layout, range, 0., 0.)
@@ -149,8 +180,11 @@ impl Element for LinkRanges {
                     let hit = div()
                         .id(format!("link-{index}-{part}-{}", state.epoch.get()))
                         // Removing the builder cancels both visible tooltips
-                        // and GPUI's delayed show task while the menu owns input.
-                        .when(state.menu.borrow().is_none(), |hit| {
+                        // and GPUI's delayed show task — while the menu owns
+                        // input, after a click, and while the window is away.
+                        // Unlike the epoch, the gate leaves the element id
+                        // alone, so a pending click still lands.
+                        .when(tooltip_allowed, |hit| {
                             hit.hoverable_tooltip(move |_, cx| {
                                 let url = destination.clone();
                                 let bounds = tooltip_bounds.clone();
@@ -179,6 +213,15 @@ impl Element for LinkRanges {
                                     window,
                                     cx,
                                 );
+                            }
+                        })
+                        .on_mouse_down(MouseButton::Left, {
+                            let clicked = state.clicked.clone();
+                            let pointer_focus = state.pointer_focus.clone();
+                            move |_, window, _| {
+                                clicked.set(Some(rect));
+                                pointer_focus.set(true);
+                                window.refresh();
                             }
                         })
                         .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -222,7 +265,12 @@ impl Element for LinkRanges {
                     overlays.push(hit);
                 }
             }
-            if state.menu.borrow().is_none() && !state.dismissed.get() {
+            if focus_card_visible(
+                focused,
+                state.menu.borrow().is_some(),
+                state.dismissed.get(),
+                window_active,
+            ) {
                 if let Some(index) = focused {
                     if let Some(rect) =
                         range_rects(&self.layout, &self.links[index].0, 0., 0.).first()
@@ -404,6 +452,7 @@ impl Element for LinkRanges {
                     state.epoch.clone(),
                     state.dismissed.clone(),
                     state.tooltip_bounds.clone(),
+                    state.clicked.clone(),
                 ),
                 state,
             )
@@ -423,6 +472,20 @@ impl Element for LinkRanges {
         let epoch = paint.2.clone();
         let dismissed = paint.3.clone();
         let tooltip_bounds = paint.4.clone();
+        let clicked = paint.5.clone();
+        let scroll_clicked = clicked.clone();
+        // The click suppression ends where the hover itself would: the moment
+        // the pointer leaves the link it pressed.
+        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, _| {
+            if phase == DispatchPhase::Capture
+                && clicked
+                    .get()
+                    .is_some_and(|rect| !rect.contains(&event.position))
+            {
+                clicked.set(None);
+                window.refresh();
+            }
+        });
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, _| {
             if phase == DispatchPhase::Capture
                 && !tooltip_bounds
@@ -432,6 +495,7 @@ impl Element for LinkRanges {
                 menu.borrow_mut().take();
                 epoch.set(epoch.get().wrapping_add(1));
                 dismissed.set(true);
+                scroll_clicked.set(None);
                 window.refresh();
             }
         });
@@ -441,6 +505,30 @@ impl Element for LinkRanges {
         }
     }
 }
+/// Whether a hover tooltip builder may be attached this frame: never while the
+/// context menu owns input, never over a link the pointer just pressed (the
+/// click may open the browser pane and swallow the mouse-leave), never while
+/// the window is not the active one.
+fn hover_tooltip_allowed(
+    menu_open: bool,
+    clicked: Option<Bounds<Pixels>>,
+    window_active: bool,
+) -> bool {
+    !menu_open && clicked.is_none() && window_active
+}
+
+/// Whether the keyboard destination card shows: only for a focused link, and
+/// only while nothing dismissed it (a click, a scroll, a relayout, the window
+/// going away).
+fn focus_card_visible(
+    focused: Option<usize>,
+    menu_open: bool,
+    dismissed: bool,
+    window_active: bool,
+) -> bool {
+    focused.is_some() && !menu_open && !dismissed && window_active
+}
+
 fn click_is_activation(event: &ClickEvent) -> bool {
     match event {
         ClickEvent::Mouse(event) => {
@@ -455,7 +543,37 @@ fn click_is_activation(event: &ClickEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{MouseClickEvent, MouseDownEvent, MouseUpEvent, TestAppContext, point};
+    use gpui::{MouseClickEvent, MouseDownEvent, MouseUpEvent, TestAppContext, point, size};
+
+    #[test]
+    fn a_clicked_link_keeps_its_disclosure_away() {
+        let rect = Bounds {
+            origin: point(px(10.), px(10.)),
+            size: size(px(40.), px(16.)),
+        };
+        assert!(hover_tooltip_allowed(false, None, true));
+        assert!(
+            !hover_tooltip_allowed(false, Some(rect), true),
+            "a click must hide the tooltip, not leave it over the text"
+        );
+        assert!(!hover_tooltip_allowed(true, None, true), "menu owns input");
+        assert!(
+            !hover_tooltip_allowed(false, None, false),
+            "a window that lost focus never delivers the mouse-leave"
+        );
+
+        assert!(focus_card_visible(Some(0), false, false, true));
+        assert!(
+            !focus_card_visible(None, false, false, true),
+            "no focused link, no card"
+        );
+        assert!(
+            !focus_card_visible(Some(0), false, true, true),
+            "a click, a scroll or a relayout dismisses the card"
+        );
+        assert!(!focus_card_visible(Some(0), true, false, true));
+        assert!(!focus_card_visible(Some(0), false, false, false));
+    }
     #[test]
     fn selection_drags_and_secondary_clicks_do_not_navigate() {
         let mut event = MouseClickEvent {

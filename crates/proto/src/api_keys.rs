@@ -29,6 +29,8 @@ pub enum ApiKeyProvider {
     Mistral,
     Fireworks,
     Together,
+    Cline,
+    Cloudflare,
     /// An OpenAI-compatible server reached over a custom base URL (Ollama,
     /// LM Studio, vLLM …). The stored value is that URL, not a secret.
     OllamaCompatible,
@@ -36,7 +38,7 @@ pub enum ApiKeyProvider {
 
 impl ApiKeyProvider {
     /// Display order of the "Add API key" list and of the stored-key rows.
-    pub const ALL: [ApiKeyProvider; 12] = [
+    pub const ALL: [ApiKeyProvider; 14] = [
         ApiKeyProvider::Anthropic,
         ApiKeyProvider::Openai,
         ApiKeyProvider::Openrouter,
@@ -48,6 +50,8 @@ impl ApiKeyProvider {
         ApiKeyProvider::Mistral,
         ApiKeyProvider::Fireworks,
         ApiKeyProvider::Together,
+        ApiKeyProvider::Cline,
+        ApiKeyProvider::Cloudflare,
         ApiKeyProvider::OllamaCompatible,
     ];
 
@@ -65,6 +69,8 @@ impl ApiKeyProvider {
             ApiKeyProvider::Mistral => "Mistral",
             ApiKeyProvider::Fireworks => "Fireworks",
             ApiKeyProvider::Together => "Together",
+            ApiKeyProvider::Cline => "Cline",
+            ApiKeyProvider::Cloudflare => "Cloudflare AI Gateway",
             ApiKeyProvider::OllamaCompatible => "Ollama-compatible base URL",
         }
     }
@@ -80,6 +86,8 @@ impl ApiKeyProvider {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredApiKey {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare: Option<CloudflareGateway>,
     pub provider: ApiKeyProvider,
     /// `sk-or-…4f2a`: enough to recognise which key this is, not enough to use it.
     pub masked: String,
@@ -91,6 +99,13 @@ pub struct StoredApiKey {
     pub applied: bool,
     /// Epoch millis of the last save.
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudflareGateway {
+    pub account_id: String,
+    pub gateway_id: String,
 }
 
 /// `ListApiKeys` / `SetApiKey` / `RemoveApiKey` reply.
@@ -125,6 +140,7 @@ mod tests {
         let snapshot = ApiKeysSnapshot {
             keys: vec![StoredApiKey {
                 provider: ApiKeyProvider::Openrouter,
+                cloudflare: None,
                 masked: "sk-or-\u{2026}4f2a".into(),
                 env_var: "OPENROUTER_API_KEY".into(),
                 applied: true,

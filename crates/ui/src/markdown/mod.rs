@@ -22,6 +22,7 @@ pub mod mend;
 pub mod parser;
 pub mod render;
 pub mod selection;
+pub mod url_scan;
 pub mod veil;
 
 pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};

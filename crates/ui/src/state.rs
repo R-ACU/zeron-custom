@@ -645,12 +645,8 @@ pub struct AppState {
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<zeron_doc::QueuedMessage>,
     pub context_usage: Option<zeron_proto::ContextUsage>,
-    /// chat_id -> cumulative reported token usage, as the engine folds it from
-    /// the harnesses' `Usage` passthrough. SESSION-LOCAL: the event is never
-    /// persisted to a doc, so this starts empty on every app start and the
-    /// composer's cost chip only ever estimates the CURRENT run of the app.
-    /// Kept per chat (not cleared on selection change) so switching away and
-    /// back does not appear to reset a chat's spend.
+    /// Cumulative reported tokens and USD per chat, restored by engine reports.
+    /// Kept per chat so selection changes never reset the displayed spend.
     pub session_usage: HashMap<String, zeron_proto::UsageTotals>,
     /// The selected chat's opening `WatchDocMessages` reset has landed. An
     /// empty transcript is otherwise indistinguishable from the pre-replay
@@ -680,7 +676,7 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
+    /// Latest `UpdateStatus` frame drives the sidebar update button.
     pub update: Option<zeron_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
@@ -1559,6 +1555,7 @@ impl AppState {
     ) -> Vec<(ChatIndicator, &Chat)> {
         self.overview_chats(now)
             .into_iter()
+            .filter(|(_, chat)| chat.automation.is_none())
             .filter(|(_, chat)| match space_filter {
                 Some(space_id) => chat.space_id.as_deref() == Some(space_id),
                 None => true,
@@ -2276,9 +2273,8 @@ impl AppState {
         true
     }
 
-    /// Cumulative reported tokens for the SELECTED chat, if any have been
-    /// reported since the app started. `None` keeps the composer's cost chip
-    /// hidden rather than showing a confident "$0.00".
+    /// Cumulative reported usage for the selected chat. Missing cost remains
+    /// unavailable, while an explicit zero USD report is a valid free amount.
     pub fn selected_session_usage(&self) -> Option<zeron_proto::UsageTotals> {
         let chat_id = self.selected_chat.as_deref()?;
         self.session_usage
@@ -3048,6 +3044,7 @@ mod tests {
             branch: None,
             checkout_id: None,
             source_context: None,
+            automation: None,
             config: None,
             last_message_preview: None,
             last_message_at: last_msg_min.map(|m| base + TimeDelta::minutes(m)),
@@ -3110,6 +3107,7 @@ mod tests {
         let totals = |i: u64, o: u64| UsageTotals {
             input_tokens: i,
             output_tokens: o,
+            ..Default::default()
         };
         let mut state = AppState::new();
         state.selected_chat = Some("a".into());
@@ -3138,17 +3136,36 @@ mod tests {
         state.selected_chat = Some("a".into());
         assert_eq!(state.selected_session_usage(), Some(totals(4_000, 900)));
 
-        // What the footer chip renders for those tokens.
-        let pricing =
-            zeron_proto::ModelPricing::usd(3.0, Some(0.3), 15.0, zeron_proto::PriceSource::Catalog);
-        let usd = crate::pricing::estimate_usd(state.selected_session_usage().unwrap(), &pricing)
-            .unwrap();
-        assert_eq!(crate::pricing::format_estimate(usd), "$0.03");
+        // Token reports alone never invent a bill from current model prices.
+        assert_eq!(
+            crate::pricing::session_cost_label(state.selected_session_usage()),
+            "Cost unavailable"
+        );
+        let paid = UsageTotals {
+            cost_usd: Some(0.03),
+            ..totals(4_000, 900)
+        };
+        assert!(state.apply_session_usage("a", paid));
+        assert_eq!(
+            crate::pricing::session_cost_label(state.selected_session_usage()),
+            "$0.03"
+        );
+        assert!(!state.apply_session_usage("a", totals(4_000, 900)));
 
-        // The totals are session-local: nothing persists them, and a runtime
-        // replacement (prepare_runtime_replacement) clears the map outright.
+        // The engine restores cumulative totals after a runtime replacement.
         state.session_usage.clear();
         assert_eq!(state.selected_session_usage(), None);
+        state.apply_session_usage("a", paid);
+        assert_eq!(state.selected_session_usage(), Some(paid));
+        state.selected_chat = Some("free".into());
+        state.apply_session_usage("free", UsageTotals {
+            cost_usd: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            crate::pricing::session_cost_label(state.selected_session_usage()),
+            "$0.00"
+        );
     }
 
     #[test]

@@ -26,13 +26,12 @@ pub fn page_column() -> gpui::Div {
         .flex_col()
 }
 
-/// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (zeron settings.devices.tsx).
+/// Page headline and its smaller count share an optical vertical center.
 pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
         .flex_row()
-        .items_baseline()
+        .items_center()
         .gap(px(10.0))
         .child(
             div()
@@ -263,23 +262,53 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
 /// Display-only toggle switch (zeron branch-picker.tsx `Toggle`): an 18×32
 /// pill whose knob slides right and track flips white when on. State is owned
 /// by the parent row — the caller adds `.id(..)` and `.on_click(..)`.
+///
+/// Snaps between the two end states; a row that can flip while it stays
+/// mounted pairs [`switch_progress`] with [`toggle_switch_t`] instead.
 pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
+    toggle_switch_t(theme, if on { 1.0 } else { 0.0 })
+}
+
+/// The same switch painted at an arbitrary progress `t` (0 = off, 1 = on):
+/// the knob rides the track and both colors blend, so a flip reads as one
+/// glide instead of a jump. Feed it from [`switch_progress`].
+pub fn toggle_switch_t(theme: &Theme, t: f32) -> gpui::Div {
+    let t = t.clamp(0.0, 1.0);
     div()
         .flex_none()
         .w(px(32.0))
         .h(px(18.0))
         .rounded_full()
-        .bg(if on { theme.text } else { ink(0.15) })
+        .bg(crate::motion::mix(ink(0.15), theme.text, t))
         .relative()
         .child(
             div()
                 .absolute()
                 .top(px(2.0))
-                .left(px(if on { 16.0 } else { 2.0 }))
+                .left(px(crate::motion::lerp(2.0, 16.0, t)))
                 .size(px(14.0))
                 .rounded_full()
-                .bg(if on { theme.on_solid } else { ink(0.7) }),
+                .bg(crate::motion::mix(ink(0.7), theme.on_solid, t)),
         )
+}
+
+/// The painted progress of the switch behind `key`, gliding toward `on` over
+/// [`crate::motion::SWITCH_GLIDE`].
+///
+/// The manual-drive value tween (never `with_animation`, whose element-id
+/// clock replays from 0 whenever the tree is rebuilt — the settings outlet is
+/// rebuilt on every keystroke and the shell recreates page entities after a
+/// flip). `key` must therefore be stable per setting, not per row index, and
+/// the view keeps frames coming through the shared pulse lease while the
+/// glide is in flight.
+pub fn switch_progress<V: 'static>(key: &str, on: bool, cx: &mut gpui::Context<V>) -> f32 {
+    let reduced = crate::motion::reduced_motion(cx);
+    let target = if on { 1.0 } else { 0.0 };
+    let t = crate::motion::value_tween(key, target, &crate::motion::SWITCH_GLIDE, reduced);
+    if crate::motion::value_tween_active(key) {
+        crate::motion::pulse_lease(cx.entity_id(), cx);
+    }
+    t
 }
 
 /// A small quiet ghost action (`rounded-lg px-2.5 py-1.5 text-[12px]

@@ -873,6 +873,7 @@ impl WorkspaceHost {
                 branch: None,
                 checkout_id: None,
                 source_context: None,
+            automation: None,
                 config,
                 last_message_preview: None,
                 last_message_at: None,
@@ -1057,6 +1058,10 @@ impl WorkspaceHost {
     /// HEAD-watcher reconciliation: the branch checked out at the chat's cwd.
     pub fn set_chat_branch(&self, chat_id: &str, branch: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_branch(chat_id, branch))?)
+    }
+
+    pub fn set_chat_automation(&self, chat_id: &str, automation: &zeron_proto::ChatAutomation) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_automation(chat_id, automation))?)
     }
 
     pub fn set_chat_source_context(

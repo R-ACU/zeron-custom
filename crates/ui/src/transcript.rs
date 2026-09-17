@@ -4621,8 +4621,8 @@ impl Transcript {
         if !crate::image_hover::is_previewable_image(&path) {
             return None;
         }
-        let probe = (self.image_hover.target_key() == Some(&id))
-            .then(|| self.image_hover.anchor_cell());
+        let probe =
+            (self.image_hover.target_key() == Some(&id)).then(|| self.image_hover.anchor_cell());
         let key = id.clone();
         let on_hover = cx.listener(move |this: &mut Self, hovered: &bool, _, cx| {
             if *hovered {
@@ -4695,8 +4695,7 @@ impl Transcript {
                     None => {
                         let measured = crate::image_hover::measure(&image.image);
                         if let Some(measured) = measured {
-                            self.image_preview_meta
-                                .put(target.path.clone(), measured);
+                            self.image_preview_meta.put(target.path.clone(), measured);
                         }
                         measured
                     }
@@ -6340,8 +6339,11 @@ impl Transcript {
                 }
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
-                let image_hover =
-                    self.chip_image_hover(SharedString::from(format!("{row_id}#img{ix}")), tool, cx);
+                let image_hover = self.chip_image_hover(
+                    SharedString::from(format!("{row_id}#img{ix}")),
+                    tool,
+                    cx,
+                );
                 if detail.is_none() && invocation.is_none() {
                     return reveal_tool_row(
                         tool_chip(
@@ -6381,12 +6383,6 @@ impl Transcript {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .when(!collapses, |card| {
-                        card.rounded(px(9.0))
-                            .border_1()
-                            .border_color(crate::theme::hairline(0.07))
-                            .bg(crate::theme::ink(0.03))
-                    })
                     .child(
                         div()
                             .id(key.clone())
@@ -6428,6 +6424,7 @@ impl Transcript {
                 // came back), separated by a small gap.
                 if open || animating {
                     let mut panel = div()
+                        .when(is_agent_tool(tool), |el| el.pl(px(32.)))
                         .flex_none()
                         .min_w_0()
                         .flex()
@@ -6435,22 +6432,12 @@ impl Transcript {
                         .overflow_hidden();
                     if let Some(invocation) = invocation.as_deref() {
                         panel = panel
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
-                            )
+                            .child(div().h(px(DETAIL_SEPARATOR)).flex_none())
                             .child(detail_body(invocation, None, theme));
                     }
                     if let Some(detail) = detail.as_deref() {
                         panel = panel
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
-                            )
+                            .child(div().h(px(DETAIL_SEPARATOR)).flex_none())
                             .child(detail_body(detail, detail_highlights[ix].clone(), theme));
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
@@ -7044,6 +7031,48 @@ fn chip_header_row(
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
+    if is_agent_tool(tool) {
+        let seed = crate::agent_avatar::spawn_seed(&tool.call);
+        let shapes = crate::agent_avatar::SHAPES;
+        let colors = crate::agent_avatar::PALETTE;
+        let time = crate::motion::animation_seconds(view, cx);
+        return div()
+            .h(px(CHIP_HEADER_HEIGHT))
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                crate::agent_avatar::Avatar::new(
+                    shapes[seed % shapes.len()].key,
+                    colors[(seed / shapes.len()) % colors.len()].hsla(),
+                    24.,
+                )
+                .motion(crate::agent_avatar::IdleMotion::Float)
+                .time(time)
+                .phase((seed % 17) as f32 * 0.37)
+                .render(),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(TOOL_LABEL_SIZE))
+                    .text_color(theme.text_muted)
+                    .child(subagent_tab_title(&tool.call)),
+            )
+            .when_some(trail, |row, trail| {
+                row.child(
+                    crate::icons::icon(match trail {
+                        ChipTrail::Chevron { open: true } => crate::icons::ALT_ARROW_DOWN,
+                        ChipTrail::Chevron { open: false } => crate::icons::ALT_ARROW_RIGHT,
+                        ChipTrail::OpenArrow => crate::icons::ARROW_UP_RIGHT,
+                    })
+                    .size(px(12.))
+                    .text_color(theme.text_faint),
+                )
+            });
+    }
     let (label, detail) = if tool.is_thought {
         ("Thought process", String::new())
     } else {
@@ -7211,9 +7240,7 @@ fn chip_header_row(
                             badge
                                 .id(hover.id.clone())
                                 .relative()
-                                .on_hover(move |hovered, window, cx| {
-                                    on_hover(hovered, window, cx)
-                                })
+                                .on_hover(move |hovered, window, cx| on_hover(hovered, window, cx))
                                 .when(hover_text, |badge| {
                                     badge.group_hover("tool-header", |style| {
                                         style.text_color(theme.text)
@@ -7568,12 +7595,6 @@ fn tool_chip(
                 .flex()
                 .items_center()
                 .overflow_hidden()
-                .when(!rail, |card| {
-                    card.rounded(px(9.0))
-                        .border_1()
-                        .border_color(crate::theme::hairline(0.07))
-                        .bg(crate::theme::ink(0.03))
-                })
                 .when(rail && content_reveal < 1.0, |card| {
                     card.relative()
                         .top(px(4.0 * (1.0 - content_reveal)))
@@ -7625,12 +7646,7 @@ fn subagent_chip(
                 .flex()
                 .items_center()
                 .overflow_hidden()
-                .rounded(px(9.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::ink(0.05)))
                 .on_click(on_open)
                 .child(chip_header_row(
                     tool,
@@ -9596,6 +9612,66 @@ mod tests {
                 );
                 crate::markdown::selection::end_active_drag();
                 crate::markdown::selection::clear_if_owner("reply#text.39:39");
+            });
+        }
+
+        /// Regression: a fenced code block used to render as inert
+        /// `StyledText`, so a drag inside it selected nothing and only the
+        /// copy button could get the text out. Code lines now register in the
+        /// selection registry exactly like prose, and an address inside the
+        /// fence is a real link target.
+        #[test]
+        fn code_block_text_is_selectable_and_links_are_detected() {
+            with_window(|transcript, window, cx| {
+                let md = "Intro line.\n\n```sh\ncurl github.com/owner/repo\nsecond code line here\n```\n";
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![assistant(
+                            "reply",
+                            MessageStatus::Complete,
+                            vec![text_part("text", md)],
+                        )],
+                        cx,
+                    );
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                let key = render::selection_test_key_for_text("second code line here");
+                let bounds = render::selection_test_bounds(&key);
+                let start = bounds.origin + gpui::point(px(1.0), px(4.0));
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: start,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                            position: start + gpui::point(px(70.0), px(0.0)),
+                            pressed_button: Some(MouseButton::Left),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                let selected = crate::markdown::selection::selected_text()
+                    .expect("a drag inside a code block must select its text");
+                assert!(
+                    !selected.is_empty() && "second code line here".starts_with(&selected),
+                    "unexpected code selection: {selected:?}"
+                );
+                crate::markdown::selection::end_active_drag();
+                crate::markdown::selection::clear_if_owner(&key);
+                // The bare host on the first fence line is a navigable link.
+                let found = crate::markdown::url_scan::find_urls("curl github.com/owner/repo");
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[0].url, "https://github.com/owner/repo");
             });
         }
 

@@ -18,6 +18,8 @@ pub enum HarnessId {
     Pi,
     /// Moonshot AI's Kimi Code CLI, driven over ACP (`kimi acp`).
     Kimi,
+    /// Cline Bot's Cline agent, driven over ACP (`cline --acp`).
+    Cline,
     /// SST's opencode agent, driven natively over its own HTTP/SSE server
     /// protocol (`opencode serve` — the same wire the opencode desktop app
     /// speaks).
@@ -191,15 +193,17 @@ impl ModelPricing {
 }
 
 /// Cumulative reported token usage for one chat, accumulated from
-/// [`AgentEvent::Usage`]. Session-local: the engine holds it in memory for the
-/// life of the process and never writes it to a doc.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// [`AgentEvent::Usage`] and provider-reported costs, persisted locally by the engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Sum of reported message costs in USD, independent of the selected model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 impl UsageTotals {
@@ -211,7 +215,7 @@ impl UsageTotals {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cost_usd.is_none()
     }
 }
 
@@ -277,6 +281,24 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
+    /// Configured workspace folder on the execution device, never a global default.
+    pub fn instruction_root(&self) -> Option<&str> {
+        self.model_options.get("instructionRoot").and_then(serde_json::Value::as_str)
+    }
+
+    pub fn set_instruction_root(&mut self, path: String) {
+        self.model_options.insert("instructionRoot".into(), path.into());
+    }
+
+    /// Original checkout whose local instruction files a generated worktree may lack.
+    pub fn original_project_path(&self) -> Option<&str> {
+        self.model_options.get("originalProjectPath").and_then(serde_json::Value::as_str)
+    }
+
+    pub fn set_original_project_path(&mut self, path: String) {
+        self.model_options.insert("originalProjectPath".into(), path.into());
+    }
+
     /// The permission mode this run actually carries: the explicit pick when
     /// there is one, else the legacy `auto_approve` flag read as
     /// [`PermissionMode::Bypass`] (that flag always meant
@@ -564,6 +586,12 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// Provider-reported cost for one completed message. Stable IDs let the
+    /// engine deduplicate replayed messages across reconnects and restarts.
+    Cost {
+        id: String,
+        usd: f64,
     },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per

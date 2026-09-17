@@ -23,6 +23,12 @@ struct Cli {
     /// scheme handler invokes the exe with this flag.
     #[arg(long = "open-url", value_name = "URL")]
     open_url_flag: Option<String>,
+    /// Set by the start-at-login registration (Settings > General,
+    /// `zeron_ui::autostart::AUTOSTART_FLAG`): give a background engine
+    /// starting at the same sign-in time to come up before the window
+    /// decides between attaching and embedding.
+    #[arg(long = "autostart", hide = true)]
+    autostart: bool,
 }
 
 #[derive(Subcommand)]
@@ -233,11 +239,24 @@ fn main() -> anyhow::Result<()> {
             // the already-running instance's window and exits instead of
             // opening a second UI. `zeron headless`/`status`/`daemon`/etc.
             // never reach this branch, so they are unaffected.
+            // `ZERON_ALLOW_SECOND_INSTANCE=1` skips the guard: a development
+            // build (own `ZERON_DATA_DIR` / `ZERON_IPC_PORT`) can then run
+            // beside the installed app instead of handing its launch over to
+            // it. Never set in normal use — two UIs on one data dir fight.
             #[cfg(windows)]
-            if single_instance::guard(open_url.as_deref())
-                == single_instance::SingleInstance::ForwardedToRunningInstance
+            if std::env::var("ZERON_ALLOW_SECOND_INSTANCE").as_deref() != Ok("1")
+                && single_instance::guard(open_url.as_deref())
+                    == single_instance::SingleInstance::ForwardedToRunningInstance
             {
                 return Ok(());
+            }
+
+            let ipc_port = std::env::var("ZERON_IPC_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(27654);
+            if cli.autostart {
+                wait_for_login_engine(ipc_port);
             }
 
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
@@ -247,10 +266,7 @@ fn main() -> anyhow::Result<()> {
                 data_dir: std::env::var_os("ZERON_DATA_DIR")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(dirs_data_dir),
-                ipc_port: std::env::var("ZERON_IPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
+                ipc_port,
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
@@ -261,6 +277,39 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Upper bound for [`wait_for_login_engine`]: sign-in is when disks are busiest,
+/// but a window that never appears is worse than an embedded engine.
+const LOGIN_ENGINE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A login launch of the window races the background engine registered for
+/// the same sign-in (Settings > General, or `zeron daemon install`). If the
+/// window wins it embeds the engine and takes the data-dir lock, the
+/// background engine exits on the lock, and automations stop as soon as the
+/// window is closed. So when a background engine is registered, wait (bounded)
+/// for its IPC listener first; the UI bootstrap then attaches to it.
+fn wait_for_login_engine(ipc_port: u16) {
+    let engine_registered =
+        zeron_ui::autostart::read_status().is_ok_and(|status| status.engine_starts_at_login());
+    if !engine_registered {
+        return;
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ipc_port));
+    let deadline = std::time::Instant::now() + LOGIN_ENGINE_WAIT;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+            .is_ok()
+        {
+            tracing::info!(port = ipc_port, "background engine is up; attaching");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    tracing::warn!(
+        port = ipc_port,
+        "background engine did not start listening in time; the window embeds its own engine"
+    );
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,
@@ -592,6 +641,23 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
     {
         let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
         std::fs::File::create(&path).ok()
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn login_registration_flag_parses() {
+        let cli = Cli::try_parse_from(["zeron", zeron_ui::autostart::AUTOSTART_FLAG]).unwrap();
+        assert!(cli.autostart);
+        assert!(cli.command.is_none());
+        assert!(cli.open_url.is_none());
+        let cli = Cli::try_parse_from(["zeron"]).unwrap();
+        assert!(!cli.autostart);
     }
 }
 

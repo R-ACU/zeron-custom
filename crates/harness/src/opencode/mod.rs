@@ -35,7 +35,7 @@
 //! [`default_stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) errors
 //! out instead of spinning "Working" forever.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -201,7 +201,7 @@ pub struct OpencodeHarness {
     interrupt_grace: Duration,
     kill_grace: Duration,
     startup_timeout: Duration,
-    models_cache: tokio::sync::OnceCell<Vec<Model>>,
+    models_cache: tokio::sync::RwLock<Option<(u64, Vec<Model>)>>,
     commands_cache: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Coalesce concurrent picker/title probes: several cold opencode boots
     /// at once are slower than one.
@@ -216,7 +216,7 @@ impl Default for OpencodeHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             startup_timeout: startup_timeout(),
-            models_cache: tokio::sync::OnceCell::new(),
+            models_cache: tokio::sync::RwLock::new(None),
             commands_cache: tokio::sync::OnceCell::new(),
             probe_lock: tokio::sync::Mutex::new(()),
         }
@@ -268,8 +268,11 @@ impl OpencodeHarness {
     /// and the composer's commands fetch share one boot.
     async fn probe_models(&self) -> Result<Vec<Model>, HarnessError> {
         let _guard = self.probe_lock.lock().await;
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
+        let revision = crate::credential_revision();
+        if let Some((cached_revision, models)) = &*self.models_cache.read().await {
+            if *cached_revision == revision {
+                return Ok(models.clone());
+            }
         }
         let mut server = self.server(None).await?;
         let result = async {
@@ -288,6 +291,9 @@ impl OpencodeHarness {
         }
         .await;
         server.shutdown(self.kill_grace).await;
+        if let Ok(models) = &result {
+            *self.models_cache.write().await = Some((revision, models.clone()));
+        }
         result
     }
 
@@ -348,11 +354,7 @@ impl Harness for OpencodeHarness {
         if self.base_url.is_none() {
             self.resolve_executable()?;
         }
-        let mut models = self
-            .models_cache
-            .get_or_try_init(|| self.probe_models())
-            .await
-            .cloned()?;
+        let mut models = self.probe_models().await?;
         if models
             .iter()
             .any(|m| m.pricing.is_none() && crate::openrouter_pricing::strip_route(&m.id).is_some())
@@ -859,6 +861,8 @@ struct PartState {
 struct SessionFeed {
     /// messageID → is-assistant (user prompt echoes must not render).
     assistant_messages: HashMap<String, bool>,
+    /// Completed assistant costs already forwarded from repeated SSE snapshots.
+    reported_costs: HashSet<String>,
     /// Parts whose message ROLE isn't known yet, replayed when it lands.
     pending_parts: Vec<Value>,
     parts: HashMap<String, PartState>,
@@ -969,9 +973,26 @@ async fn run_session(session: Session) {
             .get::<ProviderCatalog>("/provider", dir)
             .await
             .unwrap_or_default();
-        Ok::<(String, ProviderCatalog), HarnessError>((session_id, providers))
+        // Native messages retain provider-reported costs across server restarts.
+        // A failed resume creates a fresh session and must not import old costs.
+        let history = if request.resume.as_deref() == Some(session_id.as_str()) {
+            match server
+                .get_json(&format!("/session/{session_id}/message"), dir)
+                .await
+            {
+                Ok(history) => history,
+                Err(error) => {
+                    tracing::debug!(target: "zeron_harness::opencode",
+                        "could not restore session costs: {error}");
+                    Value::Null
+                }
+            }
+        } else {
+            Value::Null
+        };
+        Ok::<_, HarnessError>((session_id, providers, history))
     };
-    let (session_id, providers) = tokio::select! {
+    let (session_id, providers, history) = tokio::select! {
         res = setup => match res {
             Ok(v) => v,
             Err(e) => {
@@ -1040,6 +1061,14 @@ async fn run_session(session: Session) {
     {
         server.shutdown(kill_grace).await;
         return;
+    }
+
+    let mut main_feed = SessionFeed::default();
+    for cost in historical_cost_events(&mut main_feed, &session_id, &history) {
+        if !send(&event_tx, cost).await {
+            server.shutdown(kill_grace).await;
+            return;
+        }
     }
 
     // Advertise slash commands (composer popup); a warm cache skips the call.
@@ -1130,7 +1159,6 @@ async fn run_session(session: Session) {
     let mut turn = TurnState::begin(stall);
 
     // ---- main loop --------------------------------------------------------
-    let mut main_feed = SessionFeed::default();
     let mut children: HashMap<String, ChildRun> = HashMap::new();
     let mut pending_spawns: VecDeque<PendingSpawn> = VecDeque::new();
     // Child sessions created before their spawn chip was seen (id → title).
@@ -1450,6 +1478,45 @@ fn context_usage_event(info: &Value, context_windows: &HashMap<String, u64>) -> 
         .zip(info.get("modelID").and_then(Value::as_str))
         .and_then(|(provider, model)| context_windows.get(&format!("{provider}/{model}")).copied());
     (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
+}
+
+/// OpenCode's assistant cost is the message total in USD, including cached
+/// input and reasoning. Use that amount directly rather than repricing tokens
+/// (or summing step-finish parts, which would count the same spend twice).
+fn completed_cost_event(feed: &mut SessionFeed, info: &Value) -> Option<AgentEvent> {
+    if info.get("role").and_then(Value::as_str) != Some("assistant")
+        || info
+            .pointer("/time/completed")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return None;
+    }
+    let session = info.get("sessionID").and_then(Value::as_str)?;
+    let message = info.get("id").and_then(Value::as_str)?;
+    let usd = info.get("cost").and_then(Value::as_f64)?;
+    if session.is_empty() || message.is_empty() || !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    let id = format!("opencode/{session}/{message}");
+    feed.reported_costs
+        .insert(id.clone())
+        .then_some(AgentEvent::Cost { id, usd })
+}
+
+fn historical_cost_events(
+    feed: &mut SessionFeed,
+    session: &str,
+    history: &Value,
+) -> Vec<AgentEvent> {
+    history
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("info"))
+        .filter(|info| info.get("sessionID").and_then(Value::as_str) == Some(session))
+        .filter_map(|info| completed_cost_event(feed, info))
+        .collect()
 }
 
 /// The requested effort as a variant id the model actually advertises.
@@ -1828,6 +1895,11 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     .assistant_messages
                     .entry(message.to_owned())
                     .or_insert(role == "assistant");
+                if let Some(cost) = completed_cost_event(main_feed, info)
+                    && !send(event_tx, cost).await
+                {
+                    return BusOutcome::ConsumerGone;
+                }
                 // Token usage rides the assistant message; the last one
                 // before idle wins, emitted right before Done.
                 if role == "assistant"
@@ -1861,7 +1933,10 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 if role == "user" && child.done {
                     child.done = false;
                 }
-                let events = replay_pending(&mut child.feed, message, false, turn);
+                let mut events = replay_pending(&mut child.feed, message, false, turn);
+                if let Some(cost) = completed_cost_event(&mut child.feed, info) {
+                    events.push(cost);
+                }
                 let parent = child.parent_tool_use_id.clone();
                 let tagged = events.into_iter().map(|ev| tag(&parent, ev)).collect();
                 return forward(event_tx, tagged).await;
@@ -2673,6 +2748,92 @@ mod tests;
 #[cfg(test)]
 mod context_tests {
     use super::*;
+
+    #[test]
+    fn historical_costs_restore_only_completed_assistants_and_deduplicate_live_replay() {
+        let mut feed = SessionFeed::default();
+        let info = json!({"role":"assistant", "sessionID":"s", "id":"m",
+            "time":{"completed":1}, "cost":0.2});
+        let history = json!([
+            {"info": info, "parts":[]},
+            {"info":{"role":"user", "sessionID":"s", "id":"u", "cost":3}},
+            {"info":{"role":"assistant", "sessionID":"s", "id":"pending", "cost":4}},
+            {"info":{"role":"assistant", "sessionID":"other", "id":"m",
+                "time":{"completed":1}, "cost":5}}
+        ]);
+        assert_eq!(
+            historical_cost_events(&mut feed, "s", &history),
+            vec![AgentEvent::Cost {
+                id: "opencode/s/m".into(),
+                usd: 0.2
+            }]
+        );
+        assert_eq!(completed_cost_event(&mut feed, &info), None);
+        assert!(historical_cost_events(&mut feed, "s", &history).is_empty());
+        assert!(historical_cost_events(&mut feed, "s", &Value::Null).is_empty());
+    }
+
+    #[test]
+    fn completed_cost_uses_native_total_once_per_message() {
+        let mut feed = SessionFeed::default();
+        let mut info = json!({
+            "role": "assistant", "sessionID": "session", "id": "message-1",
+            "cost": 0.0123, "time": {"created": 1},
+            "tokens": {"input": 100, "output": 200, "reasoning": 150,
+                "cache": {"read": 4000, "write": 500}}
+        });
+        // An in-flight snapshot is not the final amount.
+        assert_eq!(completed_cost_event(&mut feed, &info), None);
+        info["time"]["completed"] = json!(2);
+        assert_eq!(
+            completed_cost_event(&mut feed, &info),
+            Some(AgentEvent::Cost {
+                id: "opencode/session/message-1".into(),
+                usd: 0.0123,
+            })
+        );
+        assert_eq!(completed_cost_event(&mut feed, &info), None);
+        // Each tool-loop iteration is a distinct assistant message.
+        info["id"] = json!("message-2");
+        info["cost"] = json!(0.0456);
+        assert_eq!(
+            completed_cost_event(&mut feed, &info),
+            Some(AgentEvent::Cost {
+                id: "opencode/session/message-2".into(),
+                usd: 0.0456,
+            })
+        );
+    }
+
+    #[test]
+    fn completed_cost_preserves_zero_and_ignores_missing_or_invalid_amounts() {
+        let mut feed = SessionFeed::default();
+        let mut info = json!({"role":"assistant", "sessionID":"s", "id":"m",
+            "time":{"completed":1}});
+        assert_eq!(completed_cost_event(&mut feed, &info), None);
+        info["cost"] = json!(-1);
+        assert_eq!(completed_cost_event(&mut feed, &info), None);
+        info["cost"] = json!(0);
+        info["role"] = json!("user");
+        assert_eq!(completed_cost_event(&mut feed, &info), None);
+        info["role"] = json!("assistant");
+        assert_eq!(
+            completed_cost_event(&mut feed, &info),
+            Some(AgentEvent::Cost {
+                id: "opencode/s/m".into(),
+                usd: 0.0,
+            })
+        );
+        // Restarted feeds retain the same ID for engine-side persistence/dedup.
+        assert_eq!(
+            completed_cost_event(&mut SessionFeed::default(), &info),
+            Some(AgentEvent::Cost {
+                id: "opencode/s/m".into(),
+                usd: 0.0
+            })
+        );
+    }
+
     #[test]
     fn context_includes_cache_and_uses_reported_model_limit() {
         let windows = HashMap::from([("provider/model".into(), 200000)]);

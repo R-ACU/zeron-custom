@@ -546,8 +546,7 @@ impl Render for AppshotActionTooltip {
     }
 }
 
-/// The session cost chip's note. Its own type because it WRAPS: the estimate
-/// caveat is a sentence, not a label.
+/// The session cost chip's wrapping provider-report caveat.
 struct SessionCostTooltip;
 
 impl Render for SessionCostTooltip {
@@ -564,7 +563,7 @@ impl Render for SessionCostTooltip {
             .shadow_md()
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(SharedString::from(crate::pricing::SESSION_ESTIMATE_TOOLTIP))
+            .child(SharedString::from(crate::pricing::SESSION_COST_TOOLTIP))
     }
 }
 
@@ -3999,6 +3998,18 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 }
 
 /// A failed command discovery, translated for the popup.
+// Agent catalogs do not consistently include an origin field. Keep native
+// controls ahead of prompt/skill entries; preserve fuzzy ranking within groups.
+fn native_slash_command(name: &str) -> bool {
+    matches!(name, "help" | "usage" | "cost" | "stats" | "status" | "context"
+        | "compact" | "clear" | "new" | "reset" | "model" | "models" | "effort"
+        | "fast" | "config" | "settings" | "permissions" | "mode" | "plan"
+        | "mcp" | "agents" | "login" | "logout" | "auth" | "account" | "doctor"
+        | "resume" | "rename" | "fork" | "export" | "undo" | "redo" | "diff"
+        | "autocompact" | "output-style" | "color" | "init" | "heapdump"
+        | "import" | "reload-plugins" | "reload-skills" | "usage-credits" | "extra-usage")
+}
+
 fn slash_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
@@ -4131,6 +4142,10 @@ pub struct Composer {
     /// provisional input measurements, this changes only when the actual
     /// conversation column changes and can safely drive a follow-up render.
     last_available_width: Option<f32>,
+    /// Visible height of the shell's notice strip sitting on this card's top
+    /// edge (0 when none). The floating destination chips clear it instead of
+    /// being buried under it.
+    notice_height: f32,
     /// Set while an interactive resize is in flight; collapse is deferred
     /// until widths have settled for [`RESIZE_SETTLE_MS`].
     width_changed_at: Option<Instant>,
@@ -4163,23 +4178,15 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
-    /// The session cost estimate beside the context percentage: a small muted
-    /// "$0.12" for what the tokens reported so far would cost at the selected
-    /// model's prices.
-    ///
-    /// Shown only where a run is actually billed per token
-    /// ([`crate::pricing::shows_session_cost`]) — a subscription-driven
-    /// harness would otherwise show a dollar figure nobody is charged. Hidden
-    /// until the harness has reported usage, and hidden again if the model
-    /// carries no prices.
+    /// Reported cumulative USD beside the context percentage. Missing reports
+    /// remain visible as unavailable; selected-model prices never reprice a chat.
     fn render_session_cost_chip(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let harness = self.pickers.read(cx).resolved(cx).harness?;
         if !crate::pricing::shows_session_cost(harness) {
             return None;
         }
-        let totals = self.state.read(cx).selected_session_usage()?;
-        let pricing = self.pickers.read(cx).resolved_pricing(cx)?;
-        let estimate = crate::pricing::estimate_usd(totals, &pricing)?;
+        let totals = self.state.read(cx).selected_session_usage();
+        let label = crate::pricing::session_cost_label(totals);
         let theme = Theme::of(cx).clone();
         Some(
             div()
@@ -4193,9 +4200,7 @@ impl Composer {
                 .text_size(px(11.0))
                 .text_color(theme.text_muted)
                 .hover(|s| s.bg(crate::theme::ink(0.05)))
-                .child(SharedString::from(crate::pricing::format_estimate(
-                    estimate,
-                )))
+                .child(SharedString::from(label))
                 .tooltip(|_, cx| cx.new(|_| SessionCostTooltip).into())
                 .into_any_element(),
         )
@@ -4235,6 +4240,14 @@ impl Composer {
 
     /// Feed the stable conversation-column width into responsive composer
     /// controls.
+    /// Shell → composer: how much room the notice strip takes above the card.
+    pub fn set_notice_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        if (self.notice_height - height).abs() > 0.5 {
+            self.notice_height = height;
+            cx.notify();
+        }
+    }
+
     pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let composer_width = width.clamp(0.0, COMPOSER_MAX_WIDTH);
         if composer_width_changed(self.last_available_width, composer_width) {
@@ -4380,6 +4393,7 @@ impl Composer {
             expanded_anchor: 0.0,
             last_seen_width: 0.0,
             last_available_width: None,
+            notice_height: 0.0,
             width_changed_at: None,
             settle_task: None,
             flip_morph: None,
@@ -5333,6 +5347,8 @@ impl Composer {
                                 .w_full()
                                 .flex()
                                 .flex_row()
+                                .w_full()
+                                .min_w_0()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
@@ -5514,6 +5530,7 @@ impl Composer {
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
+        self.slash.filtered.sort_by_key(|&ix| !native_slash_command(&commands[ix].name));
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
         reset_scroll_offset(&self.slash_scroll);
@@ -5649,7 +5666,7 @@ impl Composer {
                 };
                 let selected = self.slash.active == Some(row_ix);
                 let name: SharedString = format!("/{}", command.name).into();
-                let mut description = command.description.clone();
+                let mut description = command.description.lines().next().unwrap_or_default().trim().to_owned();
                 if let Some(hint) = &command.input_hint {
                     if description.is_empty() {
                         description = format!("<{hint}>");
@@ -5669,6 +5686,8 @@ impl Composer {
                             div()
                                 .flex()
                                 .flex_row()
+                                .w_full()
+                                .min_w_0()
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
@@ -6161,8 +6180,16 @@ impl Composer {
                 .selected_chat_row()
                 .map(|c| c.device_id.clone())
         };
+        let folder_settings = crate::settings::current(cx);
+        let new_chat_folder = folder_settings.active_chat_folder.clone().filter(|id| {
+            folder_settings.chat_folders.iter().any(|f| &f.id == id && f.workspace.as_deref() == space.as_ref().map(|s| s.id.as_str()))
+        });
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        let instruction_root = space_path.clone();
+        let parent_workspace_root = folder_settings.workspace_space_id.as_deref()
+            .and_then(|id| self.state.read(cx).space_row(id)).filter(|s| s.device_id == device_id).map(|s| s.path.clone());
+        let isolate_workspace = space_id.as_ref().is_some_and(|id| Some(id) != folder_settings.workspace_space_id.as_ref());
         if queue && !is_new {
             let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
@@ -6668,7 +6695,20 @@ impl Composer {
                         harness: resolved.harness,
                         model: resolved.model.clone(),
                         reasoning: resolved.reasoning,
-                        model_options: resolved.model_options.clone(),
+                        model_options: {
+                            let mut options = resolved.model_options.clone();
+                            options.remove("instructionRoot");
+                            options.remove("originalProjectPath");
+                            options.remove("isolateWorkspace");
+                            options.remove("parentWorkspaceRoot");
+                            if isolate_workspace { if let Some(root) = &parent_workspace_root {
+                                options.insert("parentWorkspaceRoot".into(), serde_json::json!(root));
+                            }}
+                            if isolate_workspace { options.insert("isolateWorkspace".into(), serde_json::json!(true)); }
+                            if let Some(root) = &instruction_root { options.insert("instructionRoot".into(),serde_json::json!(root)); }
+                            if let Some(path) = &space_path { options.insert("originalProjectPath".into(),serde_json::json!(path)); }
+                            options
+                        },
                         cwd,
                         sandbox: permission.sandbox,
                         auto_approve: permission.mode.auto_approves(),
@@ -6717,6 +6757,13 @@ impl Composer {
                 .await;
             }
             this.update(cx, |composer, cx| {
+                if result.is_ok() && is_new {
+                    if let Some(folder) = new_chat_folder {
+                        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                            settings.chat_folder_assignments.insert(err_chat_id.clone(), folder);
+                        });
+                    }
+                }
                 composer.sending = false;
                 composer
                     .state
@@ -8010,7 +8057,8 @@ impl Render for Composer {
                 div()
                     .id("dock-target-selectors")
                     .absolute()
-                    .top(px(-28.0))
+                    // Above the notice strip, never under it.
+                    .top(px(-28.0 - self.notice_height))
                     .left(px(Theme::SPACE_LG + 10.0))
                     .right(px(Theme::SPACE_LG + 10.0))
                     .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT))
@@ -8064,9 +8112,8 @@ impl Render for Composer {
             let session_permission_chip =
                 (session_chrome_opacity > 0.0).then(|| permission_chip(self, cx));
             let usage = self.state.read(cx).context_usage;
-            // Session cost estimate, shown only for API-billed harnesses
-            // (crate::pricing::shows_session_cost) once the harness has
-            // actually reported tokens.
+            // Provider-reported session cost, available for Pi and OpenCode.
+            // Missing reports keep an explicit unavailable label.
             let session_cost = (session_chrome_opacity > 0.0)
                 .then(|| self.render_session_cost_chip(cx))
                 .flatten();
@@ -8143,6 +8190,13 @@ impl Render for Composer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn slash_controls_precede_skill_entries() {
+        let mut names = ["agent-reach", "usage", "frontend-design:frontend-design", "compact"];
+        names.sort_by_key(|name| !super::native_slash_command(name));
+        assert_eq!(names, ["usage", "compact", "agent-reach", "frontend-design:frontend-design"]);
+    }
     use super::*;
 
     fn composer_focus_window(

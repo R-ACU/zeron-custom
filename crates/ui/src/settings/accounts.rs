@@ -128,18 +128,23 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 5] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
     (HarnessId::Kimi, "Kimi", "kimi"),
+    (HarnessId::Cline, "Cline", "cline"),
 ];
 
-/// The quiet line under an account with no usage meters. Kimi's CLI reports no
-/// rate-limit view at all, so "unavailable" would read as a failure. Pure.
+/// The quiet line under an account with no usage meters. Kimi's numbers are
+/// readable only while the CLI's short-lived access token is fresh, so an empty
+/// meter list is normal there and "unavailable" would read as a failure. Pure.
 pub fn no_usage_label(harness: HarnessId, switchable: bool) -> &'static str {
     match (harness, switchable) {
-        (HarnessId::Kimi, _) => "Signed in \u{2014} the Kimi CLI reports no usage",
+        (HarnessId::Kimi, _) => "Signed in \u{2014} usage shows after a recent Kimi CLI session",
+        // Cline bills per token against the signed-in account, but the CLI
+        // exposes no rate-limit or balance view zeron could read.
+        (HarnessId::Cline, _) => "Signed in \u{2014} the Cline CLI reports no usage",
         (_, true) => "Usage unavailable",
         (_, false) => "Credentials unavailable",
     }
@@ -172,6 +177,7 @@ pub fn provider_harness(provider: AccountsProvider) -> Option<HarnessId> {
         AccountsProvider::Codex => Some(HarnessId::Codex),
         AccountsProvider::Cursor => Some(HarnessId::Cursor),
         AccountsProvider::Kimi => Some(HarnessId::Kimi),
+        AccountsProvider::Cline => Some(HarnessId::Cline),
         AccountsProvider::ApiKeys => None,
     }
 }
@@ -197,6 +203,9 @@ pub fn add_menu_label(provider: AccountsProvider) -> &'static str {
         // Kimi's token set is bound to the CLI's configuration hash, so the
         // only thing zeron can offer is the CLI's own sign-in.
         AccountsProvider::Kimi => "Sign in with Kimi",
+        // Same story as Kimi: `cline auth` keeps one live provider set in its
+        // own configuration, so zeron can only offer the CLI's own sign-in.
+        AccountsProvider::Cline => "Sign in with Cline",
         AccountsProvider::ApiKeys => "Add API key",
     }
 }
@@ -363,6 +372,7 @@ impl LoginFlow {
             HarnessId::Codex => "Add Codex account",
             HarnessId::Cursor => "Connect Cursor",
             HarnessId::Kimi => "Sign in with kimi",
+            HarnessId::Cline => "Sign in with cline",
             _ => "Add Claude account",
         }
     }
@@ -1372,6 +1382,11 @@ impl AccountsPage {
             } => {
                 let has_error = error.is_some();
                 let body = match harness {
+                    HarnessId::Cline => {
+                        "A terminal opened running `cline auth`. Pick a provider there \
+                         and finish the sign-in in the browser it opens. Zeron picks the \
+                         new login up as soon as the CLI stores it."
+                    }
                     HarnessId::Kimi => {
                         "A terminal opened running `kimi login`. Follow the device-code \
                          prompt there — open the page it prints and enter the code it \
@@ -1548,6 +1563,7 @@ pub fn section_mark(provider: AccountsProvider) -> (&'static str, Option<Hsla>) 
         AccountsProvider::Codex => (crate::icons::OPENAI_MARK, None),
         AccountsProvider::Cursor => (crate::icons::CURSOR_MARK, None),
         AccountsProvider::Kimi => (crate::icons::KIMI_MARK, None),
+        AccountsProvider::Cline => (crate::icons::CLINE_MARK, None),
         AccountsProvider::ApiKeys => (crate::icons::KEY_MINIMALISTIC, None),
         AccountsProvider::ClaudeCode => (
             crate::icons::CLAUDE_MARK,
@@ -1952,6 +1968,7 @@ impl AccountsPage {
             AccountsProvider::Codex => "accounts-skeleton-codex",
             AccountsProvider::Cursor => "accounts-skeleton-cursor",
             AccountsProvider::Kimi => "accounts-skeleton-kimi",
+            AccountsProvider::Cline => "accounts-skeleton-cline",
             _ => "accounts-skeleton-claude",
         };
         section_shell()
@@ -2084,7 +2101,7 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code, Codex, Cursor, and Kimi logins on this device, plus \
+                        "The Claude Code, Codex, Cursor, Kimi, and Cline logins on this device, plus \
                          the provider API keys zeron passes to every agent it starts. Zeron \
                          detects the live session, keeps each account backed up, and can \
                          swap between them.",
@@ -2145,10 +2162,10 @@ mod tests {
     #[test]
     fn kimi_is_a_read_only_provider_section() {
         // "Credentials unavailable" would read as a failure for a login that
-        // is perfectly fine and simply reports no quota.
+        // is perfectly fine and simply has no fresh token to read usage with.
         assert_eq!(
             no_usage_label(HarnessId::Kimi, false),
-            "Signed in \u{2014} the Kimi CLI reports no usage"
+            "Signed in \u{2014} usage shows after a recent Kimi CLI session"
         );
         assert_eq!(no_usage_label(HarnessId::Codex, true), "Usage unavailable");
         assert_eq!(
@@ -2158,6 +2175,14 @@ mod tests {
         // Kimi has a card of its own, after the three swappable providers.
         assert_eq!(PROVIDERS[3].0, HarnessId::Kimi);
         assert_eq!(PROVIDERS[3].2, "kimi");
+        // Cline is read-only for the same reason (one live provider set the
+        // CLI owns), and sits after Kimi.
+        assert_eq!(
+            no_usage_label(HarnessId::Cline, false),
+            "Signed in \u{2014} the Cline CLI reports no usage"
+        );
+        assert_eq!(PROVIDERS[4].0, HarnessId::Cline);
+        assert_eq!(PROVIDERS[4].2, "cline");
     }
 
     #[test]
@@ -2254,6 +2279,7 @@ mod tests {
             descriptor(HarnessId::Codex, true),
             descriptor(HarnessId::Cursor, false),
             descriptor(HarnessId::Kimi, true),
+            descriptor(HarnessId::Cline, true),
         ];
         let rows = presence(&snapshot, &harnesses);
         assert_eq!(
@@ -2270,6 +2296,7 @@ mod tests {
             descriptor(HarnessId::Codex, true),
             descriptor(HarnessId::Cursor, true),
             descriptor(HarnessId::Kimi, false),
+            descriptor(HarnessId::Cline, true),
         ];
         let rows = presence(&snapshot, &harnesses);
         assert_eq!(default_hidden_providers(&rows), vec![AccountsProvider::Kimi]);
@@ -2319,6 +2346,7 @@ mod tests {
                 AccountsProvider::ClaudeCode,
                 AccountsProvider::Codex,
                 AccountsProvider::Kimi,
+                AccountsProvider::Cline,
                 AccountsProvider::ApiKeys,
             ]
         );
@@ -2346,6 +2374,7 @@ mod tests {
                 AccountsProvider::ClaudeCode,
                 AccountsProvider::Cursor,
                 AccountsProvider::Kimi,
+                AccountsProvider::Cline,
                 AccountsProvider::ApiKeys,
             ]
         );
@@ -2353,7 +2382,7 @@ mod tests {
         assert!(moved(&order, AccountsProvider::ApiKeys, 1).is_none());
         // A hidden section still occupies a slot, so moving over it works.
         let up = moved(&order, AccountsProvider::ApiKeys, -1).unwrap();
-        assert_eq!(up.0.last(), Some(&AccountsProvider::Kimi));
+        assert_eq!(up.0.last(), Some(&AccountsProvider::Cline));
     }
 
     #[test]
@@ -2365,6 +2394,7 @@ mod tests {
                 AccountsProvider::Codex,
                 AccountsProvider::ClaudeCode,
                 AccountsProvider::Kimi,
+                AccountsProvider::Cline,
                 AccountsProvider::Cursor,
             ]),
             accounts_hidden_providers: Some(vec![AccountsProvider::Cursor]),
@@ -2373,7 +2403,7 @@ mod tests {
         let value = serde_json::to_value(&settings).unwrap();
         assert_eq!(
             value["accountsProviderOrder"],
-            serde_json::json!(["apiKeys", "codex", "claudeCode", "kimi", "cursor"])
+            serde_json::json!(["apiKeys", "codex", "claudeCode", "kimi", "cline", "cursor"])
         );
         assert_eq!(
             value["accountsHiddenProviders"],
@@ -2401,6 +2431,7 @@ mod tests {
                 AccountsProvider::ClaudeCode,
                 AccountsProvider::Codex,
                 AccountsProvider::Cursor,
+                AccountsProvider::Cline,
             ]
         );
     }
@@ -2419,6 +2450,10 @@ mod tests {
             "Add Cursor account"
         );
         assert_eq!(add_menu_label(AccountsProvider::Kimi), "Sign in with Kimi");
+        assert_eq!(
+            add_menu_label(AccountsProvider::Cline),
+            "Sign in with Cline"
+        );
         assert_eq!(add_menu_label(AccountsProvider::ApiKeys), "Add API key");
         for provider in AccountsProvider::ALL {
             // No emoji, no trailing punctuation, and a real brand mark.
@@ -2436,6 +2471,7 @@ mod tests {
         );
         assert_eq!(provider_harness(AccountsProvider::ApiKeys), None);
         assert_eq!(provider_cli(AccountsProvider::Kimi), "kimi");
+        assert_eq!(provider_cli(AccountsProvider::Cline), "cline");
         assert_eq!(provider_cli(AccountsProvider::Cursor), "cursor-agent");
     }
 

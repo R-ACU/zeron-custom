@@ -14,6 +14,17 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
+/// Revision of credentials inherited by newly launched agent processes.
+static CREDENTIAL_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn credentials_changed() {
+    CREDENTIAL_REVISION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+pub(crate) fn credential_revision() -> u64 {
+    CREDENTIAL_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -128,6 +139,7 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 pub mod openrouter_pricing;
+pub mod pi_thinking;
 pub mod pricing_table;
 pub mod shell_env;
 #[cfg(windows)]
@@ -462,3 +474,5 @@ pub fn supports_titles(id: HarnessId) -> bool {
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
 }
+
+mod instructions;

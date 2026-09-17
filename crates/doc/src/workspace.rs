@@ -248,6 +248,10 @@ impl WorkspaceDoc {
         set_opt_str(&row, "cwd", chat.cwd.as_deref())?;
         set_opt_str(&row, "branch", chat.branch.as_deref())?;
         set_opt_str(&row, "checkoutId", chat.checkout_id.as_deref())?;
+        match &chat.automation {
+            Some(identity) => row.insert("automation", LoroValue::from(serde_json::to_value(identity)?))?,
+            None => row.delete("automation")?,
+        }
         match &chat.source_context {
             Some(context) => row.insert(
                 "sourceContext",
@@ -658,6 +662,8 @@ impl From<RawSpace> for Space {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawChat {
+    #[serde(default)]
+    automation: Option<zeron_proto::ChatAutomation>,
     id: String,
     device_id: String,
     #[serde(default)]
@@ -727,6 +733,7 @@ impl From<RawChat> for Chat {
             branch: raw.branch,
             checkout_id: raw.checkout_id,
             source_context: raw.source_context,
+            automation: raw.automation,
             config: raw.config,
             last_message_preview: raw.last_message_preview,
             last_message_at: raw.last_message_at.map(dt),
@@ -798,6 +805,7 @@ mod tests {
             branch: Some("main".into()),
             checkout_id: None,
             source_context: None,
+            automation: None,
             config: Some(ChatConfig {
                 harness: HarnessId::Mock,
                 model: Some("mock-1".into()),

@@ -887,6 +887,13 @@ impl Theme {
     pub const BUBBLE_RADIUS: f32 = 16.0;
     /// Panel / card corner radius.
     pub const PANEL_RADIUS: f32 = 10.0;
+    /// Corner radius of the main pane's two LEFT corners (Arc-style): the
+    /// opaque content pane sits flush with the window's top, right and bottom
+    /// edges — where DWM already rounds the window itself — and is rounded
+    /// only where it meets the glass sidebar, so it reads as one rounded
+    /// panel lying on the glass. Matched by eye to the DWM window corner
+    /// (Windows 11 rounds with roughly this radius in logical pixels).
+    pub const MAIN_CARD_RADIUS: f32 = 10.0;
     /// Small control radius (buttons, chips).
     pub const CONTROL_RADIUS: f32 = 6.0;
     /// Base spacing steps.

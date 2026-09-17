@@ -39,6 +39,24 @@ pub struct Route {
 }
 
 impl Route {
+    pub fn icon(&self) -> Option<&'static str> {
+        use crate::icons::*;
+        Some(match self.id.as_str() {
+            "openrouter" => BRAND_OPENROUTER,
+            "anthropic" => CLAUDE_MARK,
+            "openai" | "openai-codex" => OPENAI_MARK,
+            "google" | "google-gemini-cli" => BRAND_GOOGLE_GEMINI,
+            "deepseek" => BRAND_DEEPSEEK,
+            "groq" => BRAND_GROQ,
+            "xai" => GROK_MARK,
+            "moonshot" | "moonshotai" => KIMI_MARK,
+            "mistral" => BRAND_MISTRAL,
+            "fireworks" | "fireworks-ai" => BRAND_FIREWORKS,
+            "together" | "togetherai" => BRAND_TOGETHER,
+            _ => return None,
+        })
+    }
+
     /// Whether this route is OpenRouter — the one route with its own mark.
     pub fn is_openrouter(&self) -> bool {
         self.id.eq_ignore_ascii_case("openrouter")
@@ -87,7 +105,16 @@ pub fn display_model(harness: HarnessId, id: &str, label: &str) -> ModelDisplay 
             ..Default::default()
         };
     }
-    let (route, rest) = split_route(id, label);
+    let route_id = if harness == HarnessId::Cline {
+        id.split_once("::").map(|(provider, model)| format!("{provider}/{model}"))
+    } else { None };
+    let id = route_id.as_deref().unwrap_or(id);
+    let (mut route, rest) = split_route(id, label);
+    if route.is_none() && harness == HarnessId::Opencode {
+        if let Some((provider, _)) = id.split_once('/') {
+            route = Some(Route { id: provider.to_owned(), name: route_name(provider) });
+        }
+    }
     let (vendor, name) = split_vendor(rest, route.as_ref().map_or(id, |_| after_route(id)));
     ModelDisplay {
         // A label that is nothing BUT a route and a vendor keeps its original
@@ -288,6 +315,16 @@ fn title_case(word: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_marks_follow_billing_route_not_model_vendor() {
+        let cline = display_model(HarnessId::Cline, "openrouter::anthropic/claude-test", "openrouter/Claude Test");
+        assert_eq!(cline.name, "Claude Test");
+        assert_eq!(cline.route.unwrap().icon(), Some(crate::icons::BRAND_OPENROUTER));
+        let opencode = display_model(HarnessId::Opencode, "openrouter/anthropic/claude-test", "Claude Test");
+        assert_eq!(opencode.route.unwrap().icon(), Some(crate::icons::BRAND_OPENROUTER));
+    }
+
+
     /// Verbatim from a live pi catalog: `pi-acp` builds every row as
     /// `modelId = "{provider}/{id}"` and `name = "{provider}/{name}"`, where
     /// the inner id/name pair is OpenRouter's own
@@ -398,15 +435,15 @@ mod tests {
         assert_eq!(bogus.route, None);
         assert_eq!(bogus.name, "openrouter/DeepSeek: DeepSeek V3 0324");
 
-        // opencode labels carry no route (its ids do); nothing to strip.
+        // OpenCode keeps its plain label, but its id still proves the route.
         let opencode = display_model(
             HarnessId::Opencode,
             "openrouter/deepseek/deepseek-chat-v3-0324",
             "DeepSeek V3 0324",
         );
         assert_eq!(opencode.name, "DeepSeek V3 0324");
-        assert_eq!(opencode.route, None);
-        assert_eq!(opencode.tagline(false), None);
+        assert_eq!(opencode.route.as_ref().unwrap().id, "openrouter");
+        assert_eq!(opencode.tagline(false).as_deref(), Some("via OpenRouter"));
     }
 
     #[test]
@@ -421,6 +458,11 @@ mod tests {
             assert_eq!(shown.vendor, None);
             assert_eq!(shown.route, None);
         }
+        // Cline's catalog is routed (301 vendor-prefixed ids) but its labels
+        // are already clean, so the vendor moves to the grey subline.
+        let cline = display_model(HarnessId::Cline, "anthropic/claude-sonnet-5", "Claude Sonnet 5");
+        assert_eq!(cline.name, "Claude Sonnet 5");
+        assert_eq!(cline.route, None);
         // Kimi's ids are namespaced but its labels are curated and terse.
         let kimi = display_model(HarnessId::Kimi, "kimi-code/k3-256k", "K3-256k");
         assert_eq!(kimi.name, "K3-256k");

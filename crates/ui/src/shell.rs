@@ -43,6 +43,9 @@ use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::skills::SkillsPage;
+use crate::settings::general::{GeneralEvent, GeneralPage};
+use crate::settings::search::BoolSetting;
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -61,6 +64,12 @@ use crate::workspace_links::resolve_workspace_file_link;
 
 mod spaces;
 mod tabs;
+mod agents;
+mod workspace;
+mod inbox;
+use inbox::{InboxPage, InboxEvent};
+mod automations;
+use automations::{AutomationsPage, AutomationsEvent};
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
@@ -168,6 +177,51 @@ impl SidebarDisclosureMotion {
     }
 }
 
+/// Interruptible glide of the settings nav's selection highlight — 200ms
+/// ease-out ([`motion::RESIZE`]) of the pill's top offset from the previously
+/// selected row to the clicked one.
+///
+/// The rendered element owns the frame clock (like
+/// [`SidebarDisclosureMotion`], and unlike the shell's [`WidthTween`]s): the
+/// settings nav paints inside the sidebar-pane entity, whose render runs after
+/// the shell's own frame tail has already decided whether to ask for another
+/// frame, so a `motion_active` flag set here would never be read. `epoch` keys
+/// the animation element, so a retarget starts a fresh clock instead of
+/// replaying the finished one; `from` carries the painted offset over.
+#[derive(Clone, Copy)]
+struct SettingsNavPillMotion {
+    epoch: u64,
+    from: f32,
+    to: f32,
+    started: std::time::Instant,
+}
+
+impl SettingsNavPillMotion {
+    fn new(epoch: u64, from: f32, to: f32) -> Self {
+        Self {
+            epoch,
+            from,
+            to,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn current(self) -> f32 {
+        let total = RESIZE.total().mul_f32(motion::speed_scale()).as_secs_f32();
+        let raw = if total > 0.0 {
+            self.started.elapsed().as_secs_f32() / total
+        } else {
+            1.0
+        };
+        motion::lerp(self.from, self.to, RESIZE.progress(raw))
+    }
+
+    fn animating(self) -> bool {
+        self.from != self.to
+            && self.started.elapsed() < RESIZE.total().mul_f32(motion::speed_scale())
+    }
+}
+
 /// Vertical pane resize hitboxes yield the global titlebar. Keeping this in
 /// the shared constructor makes left/right seams mirror each other and avoids
 /// relying on paint order when chrome crosses an animated pane boundary.
@@ -189,6 +243,49 @@ fn right_panel_content_width(
 
 fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
+}
+
+/// Radius of the main pane's two left corners. Only the sidebar side is
+/// rounded (top, right and bottom stay flush with the window, whose own
+/// corners DWM rounds); with the sidebar collapsed there is no glass on the
+/// left either, so the pane goes full-bleed and square.
+fn main_card_left_radius(sidebar_now: f32) -> f32 {
+    if sidebar_now > 0.5 {
+        Theme::MAIN_CARD_RADIUS
+    } else {
+        0.0
+    }
+}
+
+/// The notch beside one of the main pane's rounded left corners (the
+/// `radius`-sized square minus the quarter disc the pane occupies), as thin
+/// horizontal strips: for each row, the run from the sidebar edge to the arc.
+/// `bounds` is the full-height strip of width `radius` right of the sidebar.
+fn notch_strips(bounds: gpui::Bounds<Pixels>, radius: f32, top: bool) -> Vec<gpui::Bounds<Pixels>> {
+    let mut strips = Vec::new();
+    if radius <= 0.0 || f32::from(bounds.size.height) < radius * 2.0 {
+        return strips;
+    }
+    let x0 = f32::from(bounds.origin.x);
+    let y0 = f32::from(bounds.origin.y);
+    let y1 = y0 + f32::from(bounds.size.height);
+    let step = 0.5_f32;
+    let mut d = 0.0_f32; // distance from the window edge
+    while d < radius {
+        // Circle center sits `radius` in from both edges; the arc's x at this
+        // row is where the run from the sidebar edge ends.
+        let dy = radius - (d + step * 0.5);
+        let run = radius - (radius * radius - dy * dy).max(0.0).sqrt();
+        if run > 0.0 {
+            let y = if top { y0 + d } else { y1 - d - step };
+            strips.push(gpui::Bounds::new(
+                gpui::point(px(x0), px(y)),
+                gpui::size(px(run), px(step)),
+            ));
+        }
+        d += step;
+    }
+    strips
 }
 
 fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
@@ -385,9 +482,14 @@ pub fn apply_keymap(
 /// The settings sections (feature-inventory §1.5 routes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
+    /// Keep awake while agents run, and start the window and/or background
+    /// engine at login.
+    General,
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
+    /// Installed agent skills (`SKILL.md` folders), on/off per agent.
+    Skills,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
@@ -399,9 +501,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 11] = [
+        SettingsSection::General,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
+        SettingsSection::Skills,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
@@ -415,8 +519,10 @@ impl SettingsSection {
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
+            SettingsSection::General => "General",
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
+            SettingsSection::Skills => "Skills",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
@@ -432,6 +538,8 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    Automations,
+    Inbox,
     Settings(SettingsSection),
 }
 
@@ -533,6 +641,8 @@ impl SessionPanels {
 /// history — every route the user visited, browser-style).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavEntry {
+    Automations,
+    Inbox,
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
     Settings(SettingsSection),
@@ -688,6 +798,69 @@ const SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP: f32 = 10.0;
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 24.0;
+
+/// Settings nav geometry for the gliding selection pill. The rows are a
+/// fixed-height stack in a `gap`-spaced column, so the highlight's top is
+/// `index × (row height + gap)`. The row height is `py(6)` around one 13px
+/// line, which the UI font-size setting scales — a paint-time canvas measures
+/// the real pitch (`Shell::settings_nav_row_height`); this is the value used
+/// until that first measurement lands.
+const SETTINGS_NAV_ROW_HEIGHT: f32 = 33.0;
+const SETTINGS_NAV_ROW_GAP: f32 = 2.0;
+/// Ramp height of the settings results page's bottom dissolve — the same
+/// glass-safe [`crate::edge_fade`] scope the transcript and the new-thread
+/// canvas fade their lower edge with.
+const SETTINGS_RESULTS_FADE_BAND: f32 = 120.0;
+
+/// Top offset of the settings nav highlight for the row at `index`.
+fn settings_nav_pill_offset(index: usize, row_height: f32, gap: f32) -> f32 {
+    index as f32 * (row_height + gap)
+}
+
+/// Row height back out of a measured rows-container height: `rows` rows of
+/// equal height separated by `gap`. `None` for an empty column.
+fn settings_nav_measured_row_height(container_height: f32, rows: usize, gap: f32) -> Option<f32> {
+    (rows > 0 && container_height > 0.0).then(|| {
+        let rows = rows as f32;
+        ((container_height - gap * (rows - 1.0)) / rows).max(1.0)
+    })
+}
+
+/// Identity of what the settings outlet shows. The entrance animation restarts
+/// when this changes — a different section, or a different set of search hits.
+/// Typing that does not change the hit set keeps the key, so the results column
+/// does not re-enter on every keystroke.
+fn settings_outlet_key(section: SettingsSection, hit_titles: Option<&[&'static str]>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match hit_titles {
+        Some(titles) => {
+            1u8.hash(&mut hasher);
+            titles.len().hash(&mut hasher);
+            for title in titles {
+                title.hash(&mut hasher);
+            }
+        }
+        None => {
+            0u8.hash(&mut hasher);
+            section.label().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Fingerprint of the settings nav's visible rows — a changed row list moves
+/// the selected row to a new index for reasons that are not a selection, so
+/// the pill snaps instead of gliding there.
+fn settings_nav_rows_key(rows: &[SettingsSection]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rows.len().hash(&mut hasher);
+    for row in rows {
+        row.label().hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 /// New-thread controls float over the tail of a top-anchored image hero. The
 /// hero reaches below the composer, giving its lower mask room to dissolve
@@ -927,7 +1100,7 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
-/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
+/// In-app update lifecycle (macOS bundle installs; see `render_update_button`).
 enum UpdateFlow {
     Idle,
     Downloading,
@@ -1267,7 +1440,7 @@ impl Render for SidebarPane {
             let theme = Theme::of(cx).clone();
             match shell.route {
                 Route::Settings(section) => shell.render_settings_nav(section, &theme, cx),
-                Route::Chat => shell.render_chat_sidebar(&theme, cx),
+                Route::Chat | Route::Automations | Route::Inbox => shell.render_chat_sidebar(&theme, cx),
             }
         });
         div().size_full().child(inner).into_any_element()
@@ -1297,11 +1470,28 @@ pub struct Shell {
     bottom_stack_has_composer: std::rc::Rc<std::cell::Cell<bool>>,
     /// Shared route clock and measured prepaint geometry for the persistent composer.
     composer_dock: crate::composer_dock::SharedDock,
+    /// Subscription usage per harness, from the same `ListAgentAccounts`
+    /// probe the Accounts page uses (see `usage_probe_task`). Absent harness =
+    /// not probed yet; empty vec = no linked account.
+    usage_windows: std::collections::HashMap<
+        zeron_proto::HarnessId,
+        Vec<zeron_proto::AgentUsageWindow>,
+    >,
+    /// True once a probe came back: only then does a harness missing from
+    /// `usage_windows` mean "no linked account" rather than "not asked yet".
+    usage_probed: bool,
+    /// Ten-minute subscription-usage probe, also kicked after every local run.
+    usage_probe_task: Option<gpui::Task<()>>,
+    /// Notice keys the user dismissed this app run (never persisted).
+    dismissed_notice_keys: std::collections::HashSet<String>,
+    closing_notice: Option<(crate::composer_notice::ComposerNotice, std::time::Instant)>,
     new_thread_artwork_ready: crate::new_thread_background_effects::Readiness,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
+    /// The sidebar's archived accordion (t3code Sidebar): CLOSED by default
+    /// (user request: a fresh start must not unfold Archived), session-transient. `archived_shown` pages the
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
+    pub(super) automation_chats_open: bool,
+    pub(super) automation_chats_shown: usize,
     pub(super) archived_shown: usize,
     /// Archived slim row under the pointer — swaps its time label for the
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
@@ -1366,14 +1556,26 @@ pub struct Shell {
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
+    inbox_page: Option<Entity<InboxPage>>,
+    inbox_sub: Option<Subscription>,
+    automations_page: Option<Entity<AutomationsPage>>,
+    automations_sub: Option<Subscription>,
     devices_page: Option<Entity<DevicesPage>>,
+    /// The settings sidebar's search box (above the section rows); its text
+    /// narrows the rows via `settings::search`, Enter opens the best hit.
+    settings_search: Entity<ComposerInput>,
+    _settings_search_sub: Subscription,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
+    general_page: Option<Entity<GeneralPage>>,
+    general_sub: Option<Subscription>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    /// Recreated on every visit — the skill folders change on disk.
+    skills_page: Option<Entity<SkillsPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -1420,10 +1622,9 @@ pub struct Shell {
     /// download/stage of it has come in this process.
     update_flow: UpdateFlow,
     update_task: Option<Task<()>>,
-    /// Version whose update strip the user dismissed (advisory installs only —
-    /// a newer release shows the strip again).
-    update_dismissed: Option<String>,
-    /// How this binary was installed — decides the strip's click behavior.
+    /// Instructions for installs without in-app bundle replacement.
+    update_details: popover::Popup<()>,
+    /// How this binary was installed decides the button's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: zeron_update::InstallKind,
     org: Option<OrgGateUi>,
@@ -1493,6 +1694,21 @@ pub struct Shell {
     viewport_width: f32,
     viewport_height: f32,
     terminal_tween: Option<WidthTween>,
+    /// Settings nav selection pill: a 200ms ease-out glide of its top offset
+    /// (px) from the previously selected row to the clicked one
+    /// ([`SettingsNavPillMotion`]).
+    settings_nav_pill: Option<SettingsNavPillMotion>,
+    /// Fingerprint of the rows the pill glides along (`settings_nav_rows_key`)
+    /// and the row pitch it was measured against. A change there is a filter
+    /// or a font-size change, not a selection — the pill snaps.
+    settings_nav_pill_rows: Option<(u64, f32)>,
+    /// Paint-time measured settings-nav row height (the UI font size scales
+    /// it); [`SETTINGS_NAV_ROW_HEIGHT`] until the first measurement lands.
+    settings_nav_row_height: std::rc::Rc<std::cell::Cell<f32>>,
+    /// Settings outlet entrance: the key of what is on screen
+    /// (`settings_outlet_key`) plus when it arrived. A new key restarts the
+    /// rise-and-fade; an unchanged one leaves the settled page alone.
+    settings_outlet_entrance: Option<(u64, std::time::Instant)>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
     /// flips key the traffic-light inset tween.
     fullscreen: Option<bool>,
@@ -1544,6 +1760,8 @@ pub struct Shell {
     _composer_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
+    agents_expanded_chat: Option<String>,
+    agents_motion: crate::agent_avatar::AvatarMotion,
     _transcript_invalidation: Subscription,
 }
 
@@ -1556,6 +1774,23 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let settings_search = cx.new(|cx| {
+            ComposerInput::new("Search settings…", cx)
+                .with_single_line()
+                .with_accessibility_role(gpui::Role::SearchInput)
+        });
+        let settings_search_sub =
+            cx.subscribe(&settings_search, |this: &mut Shell, _, event, cx| match event {
+                ComposerInputEvent::Edited => cx.notify(),
+                ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted => {
+                    // Enter opens the best hit and keeps the query, so the
+                    // narrowed nav still shows where the user landed.
+                    if let Some(section) = this.settings_search_hits(cx).into_iter().next() {
+                        this.open_settings(section, cx);
+                    }
+                }
+                _ => {}
+            });
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -1599,6 +1834,10 @@ impl Shell {
                 let minute_changed = minute != displayed_minute;
                 displayed_minute = minute;
                 let alive = this.update(cx, |shell: &mut Shell, cx| {
+                    // Keep-awake follows local run activity; the per-second
+                    // re-check also catches the 45s staleness expiry, which no
+                    // state change announces.
+                    shell.publish_run_activity(cx);
                     let live = {
                         let s = shell.state.read(cx);
                         s.selected_chat
@@ -1636,13 +1875,18 @@ impl Shell {
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
         let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
-            Some("settings") | Some("settings/devices") => {
+            Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
+            Some("settings/skills") => Route::Settings(SettingsSection::Skills),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
+            // `settings/startup` is the page's former name, kept for old links.
+            Some("settings" | "settings/general" | "settings/startup") => {
+                Route::Settings(SettingsSection::General)
+            }
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -1672,6 +1916,8 @@ impl Shell {
             _ => None,
         };
         let nav = NavHistory::new(match route {
+            Route::Inbox => NavEntry::Inbox,
+            Route::Automations => NavEntry::Automations,
             Route::Chat => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
@@ -1695,11 +1941,22 @@ impl Shell {
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
+            usage_windows: std::collections::HashMap::new(),
+            usage_probed: false,
+            usage_probe_task: None,
+            dismissed_notice_keys: std::collections::HashSet::new(),
+            closing_notice: None,
             new_thread_artwork_ready: Default::default(),
-            archived_open: true,
+            archived_open: false,
+            automation_chats_open: false,
+            automation_chats_shown: 10,
             archived_shown: 0,
             archived_hover: None,
-            sidebar_collapsed_groups: std::collections::HashSet::new(),
+            // The general "Chats" group starts folded too (user request):
+            // a fresh app shows the section headers, unfolding is a click.
+            sidebar_collapsed_groups: std::collections::HashSet::from([
+                "project:workspace".to_string(),
+            ]),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
@@ -1719,6 +1976,8 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            agents_expanded_chat: None,
+            agents_motion: crate::agent_avatar::AvatarMotion::default(),
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -1729,14 +1988,23 @@ impl Shell {
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
             nav,
+            inbox_page: None,
+            inbox_sub: None,
+            automations_page: None,
+            automations_sub: None,
             devices_page: None,
+            settings_search,
+            _settings_search_sub: settings_search_sub,
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
+            general_page: None,
+            general_sub: None,
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            skills_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -1760,7 +2028,7 @@ impl Shell {
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
-            update_dismissed: None,
+            update_details: popover::Popup::default(),
             install: zeron_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -1798,6 +2066,12 @@ impl Shell {
             viewport_width: 1280.0,
             viewport_height: 880.0,
             terminal_tween: None,
+            settings_nav_pill: None,
+            settings_nav_pill_rows: None,
+            settings_nav_row_height: std::rc::Rc::new(std::cell::Cell::new(
+                SETTINGS_NAV_ROW_HEIGHT,
+            )),
+            settings_outlet_entrance: None,
             fullscreen: None,
             titlebar_tween: None,
             titlebar_island: None,
@@ -1984,6 +2258,7 @@ impl Shell {
                 });
             }
         }
+        self.publish_run_activity(cx);
         // Banners and chimes share one session detector. Completion markers survive
         // queue handoffs and never advance for interrupts or stale activity.
         // A row's first appearance seeds the baseline silently (boot/replay).
@@ -2080,6 +2355,15 @@ impl Shell {
             && state.read(cx).selected_chat.is_none()
             && self.settings.space_filter.take().is_some()
         {
+            self.schedule_save(cx);
+        }
+        // Migrate only a previously chosen local project, never a machine-specific path.
+        if !self.settings.workspace_initialized && state.read(cx).spaces_synced {
+            self.settings.workspace_initialized = true;
+            self.settings.workspace_space_id = self.settings.space_filter.clone()
+                .or_else(|| self.settings.last_space_id.clone())
+                .filter(|id| state.read(cx).space_row(id).is_some_and(|s| Some(&s.device_id) == state.read(cx).local_device_id.as_ref()));
+            self.settings.space_filter = None;
             self.schedule_save(cx);
         }
         // Boot: restore the last selected space once the first spaces frame
@@ -2852,6 +3136,23 @@ impl Shell {
         self.set_right_active(RightSurface::File(id), cx);
     }
 
+    fn open_inbox_file(&mut self, chat_id: &str, device_id: &str, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.read(cx).chats.iter().any(|chat| chat.id == chat_id && chat.device_id == device_id) {
+            return;
+        }
+        self.open_chat(chat_id.into(), cx);
+        // Apply selection before creating a chat-owned surface; observers run after the callback.
+        self.on_state_changed(&self.state.clone(), cx);
+        let key = self.panel_key(cx);
+        let from = self.right_target(cx);
+        let was_open = self.panels.get(&key).changes_open;
+        self.panels.update(&key, |panel| panel.changes_open = true);
+        if !was_open {
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        self.add_file_surface(path.into(), window, cx);
+        cx.notify();
+    }
     fn open_workspace_file_link(
         &mut self,
         target: &str,
@@ -3484,8 +3785,114 @@ impl Shell {
 
     /// Controls outside the Shell mutate these choices directly. A geometry
     /// save must never publish the Shell's older values over those selections.
+    /// Forward "is any local agent run in progress" to the keep-awake veto
+    /// (`crate::power`). Idempotent and cheap: the module only reacts to
+    /// changes. Called on every state change and from the one-second ticker.
+    fn publish_run_activity(&self, cx: &App) {
+        let state = self.state.read(cx);
+        let running = crate::power::any_local_run_active(
+            &state.sessions,
+            state.local_device_id.as_deref(),
+            Utc::now(),
+        );
+        crate::power::set_agents_running(running);
+    }
+
+    /// Subscription-usage source for the composer notice strip. Deliberately
+    /// the same engine call the Accounts page makes (`ListAgentAccounts` with
+    /// `forceUsage`), so there is one probe path and one cache, not two: the
+    /// Accounts page only probes while it is open, which is why the shell needs
+    /// its own slow cadence. Ten minutes, plus an immediate probe whenever a
+    /// local run finishes (that is when the numbers actually moved).
+    fn spawn_usage_probe(&mut self, cx: &mut Context<Self>) {
+        self.usage_probe_task = Some(cx.spawn(async move |this, cx| {
+            let mut was_running = false;
+            let mut probed_at: Option<std::time::Instant> = None;
+            loop {
+                let due = probed_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(600));
+                let (engine, running) = match this.update(cx, |shell: &mut Shell, cx| {
+                    let state = shell.state.read(cx);
+                    (
+                        state.engine().cloned(),
+                        crate::power::any_local_run_active(
+                            &state.sessions,
+                            state.local_device_id.as_deref(),
+                            Utc::now(),
+                        ),
+                    )
+                }) {
+                    Ok(pair) => pair,
+                    // The shell is gone: nothing left to refresh.
+                    Err(_) => return,
+                };
+                let run_finished = was_running && !running;
+                was_running = running;
+                if let Some(engine) = engine
+                    && (due || run_finished)
+                {
+                    probed_at = Some(std::time::Instant::now());
+                    let reply = engine
+                        .client()
+                        .call(
+                            methods::LIST_AGENT_ACCOUNTS,
+                            serde_json::json!({ "forceUsage": true }),
+                        )
+                        .await;
+                    let snapshot = reply.ok().and_then(|value| {
+                        serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(value).ok()
+                    });
+                    // A failed probe keeps the previous numbers: the strip must
+                    // never invent a threshold out of a dropped RPC.
+                    if let Some(snapshot) = snapshot
+                        && this
+                            .update(cx, |shell: &mut Shell, cx| {
+                                shell.usage_windows = snapshot
+                                    .accounts
+                                    .iter()
+                                    .filter(|account| account.active)
+                                    .map(|account| {
+                                        (account.harness, account.usage_windows.clone())
+                                    })
+                                    .collect();
+                                shell.usage_probed = true;
+                                cx.notify();
+                            })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                cx.background_executor().timer(Duration::from_secs(30)).await;
+            }
+        }));
+    }
+
+    /// The notice the strip shows right now: notices for the harness a send
+    /// would use, minus everything dismissed this run, loudest first.
+    fn composer_notice(&self, cx: &App) -> Option<crate::composer_notice::ComposerNotice> {
+        let harness = self
+            .composer
+            .read(cx)
+            .pickers()
+            .read(cx)
+            .resolved(cx)
+            .harness?;
+        // A signed-in account with an empty window list (a CLI that exposes no
+        // usage at all, e.g. Kimi) must NOT produce the "sign in" notice — that
+        // contradicts the Accounts page, which shows it as signed in.
+        let source = crate::composer_notice::usage_source(
+            self.usage_windows.get(&harness).map(Vec::as_slice),
+            self.usage_probed,
+        )?;
+        let composer_notices = crate::composer_notice::notices_for(harness, source);
+        composer_notices
+            .into_iter()
+            .find(|notice| !self.dismissed_notice_keys.contains(&notice.key()))
+    }
+
     fn sync_independent_settings(&mut self, cx: &App) {
         let current = settings::current(cx);
+        self.settings.chat_folder_assignments = current.chat_folder_assignments;
         self.settings.new_thread_composer_background = current.new_thread_composer_background;
         self.settings.new_thread_background_effect = current.new_thread_background_effect;
         self.settings.open_web_links_in_zeron = current.open_web_links_in_zeron;
@@ -3578,6 +3985,17 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        // Same for General: the OS login registrations are the source of
+        // truth and may have changed outside Zeron (Task Manager, daemon CLI).
+        if section == SettingsSection::General {
+            self.general_page = None;
+            self.general_sub = None;
+        }
+        // Same for Skills: the folders and their SKILL.md files are the source
+        // of truth and change outside Zeron (an agent CLI, an editor).
+        if section == SettingsSection::Skills {
+            self.skills_page = None;
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
@@ -3585,11 +4003,281 @@ impl Shell {
         cx.notify();
     }
 
+    /// The default workspace's folder on THIS device — the "project" whose
+    /// `.claude/skills` etc. the Skills page lists. `None` when no workspace
+    /// is chosen or it belongs to another device.
+    fn workspace_project_path(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let state = self.state.read(cx);
+        let local = state.local_device_id.as_ref();
+        let from_space = |id: &str| -> Option<std::path::PathBuf> {
+            let space = state.space_row(id)?;
+            (Some(&space.device_id) == local).then(|| std::path::PathBuf::from(&space.path))
+        };
+        // The chosen workspace first. A fresh profile has none, so fall back to
+        // the newest local chat's cwd and then to any local space — otherwise
+        // the page would claim the user has no project skills at all.
+        if let Some(path) = self
+            .settings
+            .workspace_space_id
+            .as_deref()
+            .and_then(from_space)
+        {
+            return Some(path);
+        }
+        let newest_chat_cwd = state
+            .chats
+            .iter()
+            .filter(|chat| Some(&chat.device_id) == local && !chat.archived)
+            .filter_map(|chat| {
+                chat.cwd
+                    .as_deref()
+                    .filter(|cwd| !cwd.trim().is_empty())
+                    .map(|cwd| (chat.last_message_at.unwrap_or(chat.created_at), cwd))
+            })
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, cwd)| std::path::PathBuf::from(cwd));
+        if let Some(path) = newest_chat_cwd {
+            return Some(path);
+        }
+        state
+            .spaces_sorted()
+            .into_iter()
+            .find(|space| Some(&space.device_id) == local)
+            .map(|space| std::path::PathBuf::from(&space.path))
+    }
+
+    /// The settings sections the nav offers on this build, in nav order.
+    fn offered_settings_sections() -> Vec<SettingsSection> {
+        SettingsSection::ALL
+            .into_iter()
+            .filter(|item| *item != SettingsSection::Appshots || crate::appshots::is_desktop())
+            .collect()
+    }
+
+    /// The sections the settings search box currently matches, best first
+    /// (every offered section on an empty query).
+    fn settings_search_hits(&self, cx: &App) -> Vec<SettingsSection> {
+        let query = self.settings_search.read(cx).text().to_owned();
+        crate::settings::search::matching_sections(&query, Self::offered_settings_sections().iter())
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
+        // A stale query must not greet the next visit with a narrowed nav.
+        self.settings_search.update(cx, |input, cx| input.set_text("", cx));
+        // Leaving settings retires the nav pill and the outlet entrance: the
+        // next visit starts from its own selection, not from a glide that was
+        // in flight when the user walked away.
+        self.settings_nav_pill = None;
+        self.settings_nav_pill_rows = None;
+        self.settings_outlet_entrance = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
+    }
+
+    /// The titles of the settings the query currently matches, best first —
+    /// the identity of the results column for its entrance animation (an
+    /// unchanged list means the same results, so no re-entrance).
+    fn settings_search_hit_titles(&self, cx: &App) -> Vec<&'static str> {
+        let query = self.settings_search.read(cx).text().to_owned();
+        let offered = Self::offered_settings_sections();
+        crate::settings::search::matching_entries(&query)
+            .into_iter()
+            .filter(|entry| offered.contains(&entry.section))
+            .map(|entry| entry.title)
+            .collect()
+    }
+
+    /// Whether the settings search box holds a query — then the outlet shows
+    /// the matching settings instead of the current section page.
+    fn settings_search_active(&self, cx: &App) -> bool {
+        !self.settings_search.read(cx).text().trim().is_empty()
+    }
+
+    /// A result row was clicked: land on the setting's page and clear the
+    /// query, so the page (not the results) is what the user sees.
+    fn open_settings_from_search(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.settings_search.update(cx, |input, cx| input.set_text("", cx));
+        self.open_settings(section, cx);
+    }
+
+    /// The persisted value behind one plain on/off setting — what the results
+    /// view draws in the row's switch.
+    fn bool_setting_value(&self, setting: BoolSetting) -> bool {
+        match setting {
+            BoolSetting::KeepAwakeWhileRunning => self.settings.keep_awake_while_running,
+            BoolSetting::FilesAutosave => self.settings.files_autosave_enabled,
+            BoolSetting::FilesWordWrap => self.settings.files_word_wrap,
+            BoolSetting::FilesShowAll => self.settings.files_show_all,
+            BoolSetting::SessionSounds => self.settings.sound_enabled,
+            BoolSetting::TaskCompletedSound => self.settings.sound_completion_enabled,
+            BoolSetting::InputRequiredSound => self.settings.sound_input_enabled,
+            BoolSetting::ErrorSound => self.settings.sound_attention_enabled,
+            BoolSetting::DesktopNotifications => self.settings.notifications_enabled,
+            BoolSetting::NotificationsBackgroundOnly => self.settings.notifications_background_only,
+            BoolSetting::EscapeStopsActiveAgent => self.settings.escape_stops_active_agent,
+            BoolSetting::AppshotsEnabled => self.settings.appshots_enabled,
+            BoolSetting::AppshotSound => self.settings.appshot_sound_enabled,
+        }
+    }
+
+    /// Flip one plain on/off setting from the search results, with the same
+    /// side effects the owning page's event handler applies. Pages that cache
+    /// the value in their own entity are dropped afterwards, so the next visit
+    /// renders the new state (the Files page updates itself in place).
+    fn set_bool_setting(
+        &mut self,
+        setting: BoolSetting,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match setting {
+            BoolSetting::KeepAwakeWhileRunning => {
+                self.settings.keep_awake_while_running = on;
+                crate::power::set_enabled(on);
+                self.general_page = None;
+                self.general_sub = None;
+            }
+            BoolSetting::FilesAutosave => {
+                self.settings.files_autosave_enabled = on;
+                let surfaces = self
+                    .files
+                    .values()
+                    .chain(self.file_surfaces.values())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for surface in surfaces {
+                    surface.update(cx, |surface, cx| surface.set_autosave_enabled(on, cx));
+                }
+                self.files_settings_page = None;
+                self.files_settings_sub = None;
+            }
+            BoolSetting::FilesWordWrap => {
+                // Already persists, re-renders and updates the page itself.
+                self.set_files_word_wrap(on, window, cx);
+                return;
+            }
+            BoolSetting::FilesShowAll => {
+                self.set_files_show_all(on, cx);
+                return;
+            }
+            BoolSetting::SessionSounds
+            | BoolSetting::TaskCompletedSound
+            | BoolSetting::InputRequiredSound
+            | BoolSetting::ErrorSound
+            | BoolSetting::DesktopNotifications
+            | BoolSetting::NotificationsBackgroundOnly => {
+                match setting {
+                    BoolSetting::SessionSounds => self.settings.sound_enabled = on,
+                    BoolSetting::TaskCompletedSound => self.settings.sound_completion_enabled = on,
+                    BoolSetting::InputRequiredSound => self.settings.sound_input_enabled = on,
+                    BoolSetting::ErrorSound => self.settings.sound_attention_enabled = on,
+                    BoolSetting::DesktopNotifications => self.settings.notifications_enabled = on,
+                    _ => self.settings.notifications_background_only = on,
+                }
+                self.notifications_page = None;
+                self.notifications_sub = None;
+            }
+            BoolSetting::EscapeStopsActiveAgent
+            | BoolSetting::AppshotsEnabled
+            | BoolSetting::AppshotSound => {
+                match setting {
+                    BoolSetting::EscapeStopsActiveAgent => {
+                        self.settings.escape_stops_active_agent = on
+                    }
+                    BoolSetting::AppshotsEnabled => {
+                        self.settings.appshots_enabled = on;
+                        crate::appshots::set_enabled(on);
+                    }
+                    _ => {
+                        self.settings.appshot_sound_enabled = on;
+                        crate::appshots::set_capture_sound_enabled(on);
+                    }
+                }
+                apply_keymap(cx, &self.settings.keymap, self.settings.composer_send_behavior);
+                self.shortcuts_page = None;
+                self.shortcuts_sub = None;
+            }
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// The outlet while the search box holds a query: every setting the query
+    /// matches, grouped by page (`settings::search_results`). Rendered inline
+    /// from the shell's own render pass, so each keystroke's `cx.notify()`
+    /// refreshes it without an entity of its own.
+    fn render_settings_search_results(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.settings_search.read(cx).text().to_owned();
+        let offered = Self::offered_settings_sections();
+        let entries: Vec<&'static crate::settings::search::SettingEntry> =
+            crate::settings::search::matching_entries(&query)
+                .into_iter()
+                .filter(|entry| offered.contains(&entry.section))
+                .collect();
+        // The switch glides are driven here, before the row builders borrow
+        // `cx`: the store is keyed per setting (`BoolSetting::motion_key`), so
+        // a flip keeps animating although this outlet is rebuilt on every
+        // keystroke and the page entities are recreated.
+        let switch_progress: Vec<(crate::settings::search::BoolSetting, f32)> = entries
+            .iter()
+            .filter_map(|entry| match entry.control {
+                crate::settings::search::Control::Toggle(setting) => Some(setting),
+                crate::settings::search::Control::OpenPage => None,
+            })
+            .map(|setting| {
+                let on = self.bool_setting_value(setting);
+                let t = crate::settings::widgets::switch_progress(setting.motion_key(), on, cx);
+                (setting, t)
+            })
+            .collect();
+        crate::settings::search_results::render(
+            theme,
+            &query,
+            &entries,
+            Self::settings_section_icon,
+            |section| {
+                Box::new(cx.listener(move |this, _, _, cx| {
+                    this.open_settings_from_search(section, cx)
+                }))
+            },
+            |setting| {
+                switch_progress
+                    .iter()
+                    .find(|(candidate, _)| *candidate == setting)
+                    .map(|(_, t)| *t)
+                    .unwrap_or(0.0)
+            },
+            |setting| {
+                Box::new(cx.listener(move |this, _, window, cx| {
+                    // The switch owns its click: the row's open handler sits on
+                    // the text half, and nothing behind it may fire either.
+                    cx.stop_propagation();
+                    let next = !this.bool_setting_value(setting);
+                    this.set_bool_setting(setting, next, window, cx);
+                }))
+            },
+        )
+    }
+
+    /// The nav icon per settings section — shared by the settings sidebar
+    /// rows and the search results' row tiles.
+    fn settings_section_icon(item: SettingsSection) -> &'static str {
+        match item {
+            SettingsSection::General => icons::SETTINGS_MINIMALISTIC,
+            SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Harnesses => icons::WIDGET,
+            SettingsSection::Skills => icons::BOLT,
+            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Files => icons::FOLDER,
+            SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Appshots => icons::MONITOR,
+            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+        }
     }
 
     // ---- back/forward (route history) ----
@@ -3612,6 +4300,8 @@ impl Shell {
     fn apply_nav(&mut self, entry: NavEntry, cx: &mut Context<Self>) {
         self.suspend_file_images(cx);
         match entry {
+            NavEntry::Inbox => { self.route = Route::Inbox; }
+            NavEntry::Automations => { self.route = Route::Automations; }
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
                 self.focus_composer(cx);
@@ -3653,6 +4343,18 @@ impl Shell {
                     self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
                 }
                 match &self.harnesses_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Skills => {
+                if self.skills_page.is_none() {
+                    let state = self.state.clone();
+                    let project = self.workspace_project_path(cx);
+                    self.skills_page =
+                        Some(cx.new(|cx| SkillsPage::new(state, project, cx)));
+                }
+                match &self.skills_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -3772,6 +4474,30 @@ impl Shell {
                     self.notifications_page = Some(page);
                 }
                 match &self.notifications_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::General => {
+                if self.general_page.is_none() {
+                    // Recreated per visit (`open_settings`), so the switch
+                    // always starts from the persisted value.
+                    let keep_awake = self.settings.keep_awake_while_running;
+                    let page = cx.new(|cx| GeneralPage::new(keep_awake, cx));
+                    // Persist and apply the sleep veto whenever it flips.
+                    self.general_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &GeneralEvent, cx| {
+                            let GeneralEvent::KeepAwakeChanged(keep_awake) = *event;
+                            this.settings.keep_awake_while_running = keep_awake;
+                            crate::power::set_enabled(keep_awake);
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.general_page = Some(page);
+                }
+                match &self.general_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -4639,6 +5365,49 @@ impl Shell {
         motion::resize_bounce_offset(bounce.edge, raw)
     }
 
+    /// Rise-and-fade entrance for the settings outlet: opacity 0→1 while the
+    /// content settles up from `distance` px below, over `spec`. `key`
+    /// identifies what the outlet shows (`settings_outlet_key`) — a new key
+    /// restarts the entrance, an unchanged one leaves a settled page alone
+    /// (so typing inside an unchanged hit set does not re-enter).
+    ///
+    /// Driven manually for the same reason as [`WidthTween`]: the outlet's
+    /// element tree is rebuilt on every keystroke and every route change, and
+    /// a `with_animation` wrapper keyed by that tree would replay from zero.
+    fn with_settings_entrance(
+        &mut self,
+        key: u64,
+        spec: &motion::MotionSpec,
+        distance: f32,
+        content: AnyElement,
+    ) -> AnyElement {
+        let now = self.render_time.unwrap_or_else(std::time::Instant::now);
+        let started = match self.settings_outlet_entrance {
+            Some((seen, started)) if seen == key => started,
+            _ => {
+                self.settings_outlet_entrance = Some((key, now));
+                now
+            }
+        };
+        if self.reduced_motion {
+            return content;
+        }
+        let total = spec.total().mul_f32(motion::speed_scale());
+        let raw = self.tween_elapsed(started).as_secs_f32() / total.as_secs_f32();
+        if raw >= 1.0 {
+            return content;
+        }
+        self.motion_active.set(true);
+        let t = spec.progress(raw);
+        div()
+            .relative()
+            .size_full()
+            .opacity(t)
+            .top(px(distance * (1.0 - t)))
+            .child(content)
+            .into_any_element()
+    }
+
     pub(super) fn sidebar_now(&self) -> f32 {
         self.eval_tween(self.sidebar_tween, self.sidebar_target())
             + self
@@ -4747,7 +5516,7 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
-            Route::Settings(_) => {
+            Route::Settings(_) | Route::Automations | Route::Inbox => {
                 let inner = div()
                     .size_full()
                     .flex()
@@ -5164,17 +5933,119 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let section_icon = |item: SettingsSection| match item {
-            SettingsSection::Devices => icons::MONITOR,
-            SettingsSection::Harnesses => icons::WIDGET,
-            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
-            SettingsSection::Appearance => icons::TUNING,
-            SettingsSection::Files => icons::FOLDER,
-            SettingsSection::Notifications => icons::BELL,
-            SettingsSection::Shortcuts => icons::KEYBOARD,
-            SettingsSection::Appshots => icons::MONITOR,
-            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
-        };
+        let section_icon = Self::settings_section_icon;
+        // The search box narrows the rows below it (label + per-page
+        // keywords, `settings::search`); an empty query lists every section.
+        // A query with no hit says so instead of showing an empty column.
+        let hits = self.settings_search_hits(cx);
+        let query_empty = self.settings_search.read(cx).text().trim().is_empty();
+        // ONE selection highlight behind the rows: its top offset glides from
+        // the previously selected row to the clicked one (200ms ease-out, the
+        // shell's standard [`WidthTween`] drive), so a click never teleports
+        // the wash. The rows stay static and only take the selected weight and
+        // color. A changed row list — search filter, UI font size — is not a
+        // selection, so the pill snaps to the selected row's new index.
+        let row_height = self.settings_nav_row_height.get();
+        let rows_key = (settings_nav_rows_key(&hits), row_height);
+        if self.settings_nav_pill_rows != Some(rows_key) {
+            self.settings_nav_pill_rows = Some(rows_key);
+            self.settings_nav_pill = None;
+        }
+        let selected_row = hits.iter().position(|item| *item == section);
+        let reduced_motion = self.reduced_motion;
+        let pill = selected_row.map(|index| {
+            let target = settings_nav_pill_offset(index, row_height, SETTINGS_NAV_ROW_GAP);
+            let previous = self.settings_nav_pill;
+            if previous.map(|glide| glide.to) != Some(target) {
+                // Glide from wherever the pill sits right now — a retarget
+                // mid-flight continues from the painted offset.
+                let from = previous
+                    .filter(|glide| glide.animating())
+                    .map(SettingsNavPillMotion::current)
+                    .unwrap_or(target);
+                let epoch = previous.map_or(1, |glide| glide.epoch + 1);
+                self.settings_nav_pill = Some(SettingsNavPillMotion::new(epoch, from, target));
+            }
+            let pill = div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .h(px(row_height))
+                .rounded(px(8.0))
+                // Same tokens as the main sidebar's session rows — the two
+                // sidebars must feel alike.
+                .bg(crate::theme::glass_selected_bg());
+            match self
+                .settings_nav_pill
+                .filter(|glide| glide.animating() && !reduced_motion)
+            {
+                Some(glide) => pill
+                    .with_animation(
+                        SharedString::from(format!("settings-nav-pill-{}", glide.epoch)),
+                        RESIZE.animation(),
+                        move |el, t| el.top(px(motion::lerp(glide.from, glide.to, t))),
+                    )
+                    .into_any_element(),
+                None => pill.top(px(target)).into_any_element(),
+            }
+        });
+        if selected_row.is_none() {
+            // The selected section is filtered out: no pill to glide.
+            self.settings_nav_pill = None;
+        }
+        // Paint-time row pitch: the rows are the column's only flex children
+        // (the pill is absolute), so the measured height divides back into one
+        // row height — the UI font-size setting scales the pill with the rows.
+        let measured_rows = hits.len();
+        let measured_height = self.settings_nav_row_height.clone();
+        let row_measure = gpui::canvas(
+            move |bounds, window, _cx| {
+                if let Some(height) = settings_nav_measured_row_height(
+                    f32::from(bounds.size.height),
+                    measured_rows,
+                    SETTINGS_NAV_ROW_GAP,
+                ) && (measured_height.get() - height).abs() > 0.5
+                {
+                    measured_height.set(height);
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        let search_box = div()
+            // No own margin: the pill shares the nav container's
+            // `.px(SPACE_SM)`, so its edges line up with the rows' selected
+            // highlight below (user-reported: it looked narrower than the tabs).
+            .mx(px(0.0))
+            .mt(px(4.0))
+            .mb(px(6.0))
+            .px(px(10.0))
+            .py(px(3.0))
+            .rounded(px(999.0))
+            .bg(crate::theme::ink(0.05))
+            .border_1()
+            .border_color(crate::theme::hairline(0.08))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(crate::typography::ui_rems(11.5))
+            .child(
+                icon(icons::MAGNIFER)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(div().flex_1().min_w_0().child(self.settings_search.clone()));
+        let no_hits = (!query_empty && hits.is_empty()).then(|| {
+            div()
+                .px(px(Theme::SPACE_SM))
+                .py(px(6.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from("No matching settings"))
+        });
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
         // the sidebar's right edge (user-reported). Device identity lives on
@@ -5200,14 +6071,22 @@ impl Shell {
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from("Settings")),
                     )
+                    .child(search_box)
+                    .children(no_hits)
                     .child(
-                        div().flex().flex_col().gap(px(2.0)).children(
-                            SettingsSection::ALL
+                        div()
+                            .relative()
+                            .flex()
+                            .flex_col()
+                            .gap(px(SETTINGS_NAV_ROW_GAP))
+                            // Behind the rows: the gliding highlight, then the
+                            // paint-time pitch measurement (neither takes part
+                            // in the flex layout or owns a hitbox).
+                            .children(pill)
+                            .child(row_measure)
+                            .children(
+                            hits
                                 .into_iter()
-                                .filter(|item| {
-                                    *item != SettingsSection::Appshots
-                                        || crate::appshots::is_desktop()
-                                })
                                 .map(|item| {
                                     let selected = item == section;
                                     div()
@@ -5224,10 +6103,10 @@ impl Shell {
                                         .py(px(6.0))
                                         .text_size(crate::typography::ui_rems(13.0))
                                         .when(selected, |el| {
-                                            // Same tokens as the main sidebar's session
-                                            // rows — the two sidebars must feel alike.
-                                            el.bg(crate::theme::glass_selected_bg())
-                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                            // The wash is the gliding pill behind the
+                                            // rows; the row itself only takes the
+                                            // selected weight, so nothing jumps.
+                                            el.font_weight(gpui::FontWeight::MEDIUM)
                                         })
                                         .text_color(if selected {
                                             theme.text
@@ -5498,6 +6377,7 @@ impl Shell {
         let menu_id = id.clone();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
+        let (context_corner, title_corner) = if space_name.is_empty() { (None, Some(corner)) } else { (Some(corner), None) };
         let fade_key = format!("chat-row-{id}");
         let rest_bg = if selected {
             selected_wash
@@ -5548,6 +6428,7 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
                     this.chat_menu.open(ChatMenuState {
                         chat_id: menu_id.clone(),
                         position: event.position,
@@ -5557,7 +6438,7 @@ impl Shell {
                 }),
             )
             // Line 1: "project @ device", status word / time-ago right.
-            .child(
+            .when_some(context_corner, |el, corner| el.child(
                 div()
                     .w_full()
                     .flex()
@@ -5575,7 +6456,7 @@ impl Shell {
                             .child(space_name),
                     )
                     .child(div().text_color(subline).child(corner)),
-            )
+            ))
             // Line 2: harness identity belongs directly with the title,
             // instead of floating as unrelated metadata below it.
             .child(
@@ -5604,7 +6485,7 @@ impl Shell {
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(17.0))
                             .child(title),
-                    ),
+                    ).when_some(title_corner, |el, corner| el.child(div().text_color(subline).child(corner))),
             )
             // Line 3 is structural, not reserved whitespace: compact states
             // omit it completely when both Branch and Pull request are hidden.
@@ -5778,7 +6659,8 @@ impl Shell {
             .collect();
 
         // t3code's archived accordion, below the active list.
-        let archived_section = self.render_archived_section(theme, cx);
+        let automation_section = self.render_chat_shelf(true, theme, cx);
+        let archived_section = self.render_chat_shelf(false, theme, cx);
 
         let (user_line, trigger_subline, menu_identity): (
             SharedString,
@@ -5824,6 +6706,22 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
+            .child(div().id("sidebar-inbox").mx(px(Theme::SPACE_SM)).px(px(Theme::SPACE_SM)).h(px(32.0))
+                .flex().items_center().gap(px(8.0)).rounded(px(8.0)).text_size(crate::typography::ui_rems(13.0))
+                .text_color(theme.text_muted).cursor_pointer().hover(|s|s.bg(theme.glass_hover()))
+                .on_click(cx.listener(|this,_,_,cx| {
+                    this.route = Route::Inbox;
+                    this.nav.push(NavEntry::Inbox);
+                    cx.notify();
+                })).child(icon(icons::ARCHIVE_UP_MINIMALISTIC).size(px(16.0)).text_color(theme.text_muted)).child("Inbox"))
+            .child(div().id("sidebar-automations").mx(px(Theme::SPACE_SM)).px(px(Theme::SPACE_SM)).h(px(32.0))
+                .flex().items_center().gap(px(8.0)).rounded(px(8.0)).text_size(crate::typography::ui_rems(13.0))
+                .text_color(theme.text_muted).cursor_pointer().hover(|s|s.bg(theme.glass_hover()))
+                .on_click(cx.listener(|this,_,_,cx| {
+                    this.route = Route::Automations;
+                    this.nav.push(NavEntry::Automations);
+                    cx.notify();
+                })).child(icon(icons::CLOCK_CIRCLE).size(px(16.0)).text_color(theme.text_muted)).child("Automations"))
             .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
             // a true per-glyph gradient at active overflow edges. Glass-safe
@@ -5842,6 +6740,9 @@ impl Shell {
                     div().relative().flex_1().min_h_0().child(
                         div()
                             .id("sidebar-lists")
+                            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| {
+                                this.open_spaces_menu(window, cx);
+                            }))
                             .size_full()
                             .overflow_y_scroll()
                             .track_scroll(&self.sidebar_scroll)
@@ -5866,8 +6767,7 @@ impl Shell {
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from("No sessions yet"))
                                     .into_any_element()
-                            })
-                            .children(archived_section),
+                            }),
                     ),
                 )
                 .fade_overflow_y(&self.sidebar_scroll),
@@ -5877,10 +6777,6 @@ impl Shell {
             // appearing IS the signal.
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
-            })
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
             })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
@@ -5904,36 +6800,40 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .when_some(automation_section, |el, section| el.child(
+                div().id("sidebar-automation-footer").flex_none().max_h(px(260.0))
+                    .overflow_y_scroll().px(px(Theme::SPACE_SM)).child(section)))
+            .when_some(archived_section, |el, archive| el.child(
+                div().id("sidebar-archive-footer").flex_none().max_h(px(260.0))
+                    .overflow_y_scroll().px(px(Theme::SPACE_SM)).child(archive)))
+            .child(
+                div().p(px(Theme::SPACE_SM)).flex_none().flex().items_center().gap(px(4.0))
+                    .child(div().flex_1().min_w_0().child(user_menu))
+                    .when_some(self.render_update_button(theme, cx), |row, button| row.child(button)),
+            )
             .into_any_element()
     }
 
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Compact update action next to the sidebar identity. macOS bundles can
+    /// download and restart; other installs show update instructions.
+    fn render_update_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
         }
         let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
         let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
 
         let (label, clickable): (SharedString, bool) = if mac_app {
             match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
+                UpdateFlow::Idle => (format!("Update available: v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
+                UpdateFlow::Ready(_) => ("Update ready: restart to apply".into(), true),
                 UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else {
             (
-                format!("Update available — v{latest} · run `zeron update`").into(),
+                format!("Update available: v{latest}. View update details").into(),
                 true,
             )
         };
@@ -5947,41 +6847,91 @@ impl Shell {
             (theme.accent_wash, theme.accent.opacity(0.16))
         };
 
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
+        let glyph = if matches!(self.update_flow, UpdateFlow::Downloading) {
+            crate::loaders::mini_mono_spinner(
+                "sidebar-update-progress", 2.0, tone, self.sidebar_pane.entity_id(), cx,
+            ).into_any_element()
+        } else {
+            let path = match self.update_flow {
+                UpdateFlow::Ready(_) => icons::RESTART,
+                UpdateFlow::Failed(_) => icons::REFRESH,
+                _ => icons::ARROW_DOWN,
+            };
+            icon(path).size(px(18.0)).text_color(tone).into_any_element()
+        };
+        let mut button = div()
+            .id("sidebar-update-button")
+            .size(px(32.0))
+            .flex_none()
+            .rounded(px(8.0))
             .bg(chip_bg)
             .flex()
-            .flex_row()
             .items_center()
-            .text_size(crate::typography::ui_rems(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
+            .justify_center()
+            .role(gpui::Role::Button)
+            .aria_label(label.to_string())
+            .tooltip(move |_, cx| cx.new(|_| SurfaceTabTooltip { text: label.clone() }).into())
+            .tooltip_show_delay(Duration::from_millis(250))
+            .child(glyph)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| {
+                this.update_details.note_trigger_press();
+            }));
+        if self.update_details.get().is_some() {
+            let instructions = if cfg!(windows) {
+                "This Windows build is maintained separately. Official releases cannot be installed here automatically. Update with a newer Windows build."
+            } else if matches!(self.install, zeron_update::InstallKind::Managed { .. }) {
+                "Run `zeron update` in a terminal to install this release."
+            } else {
+                "This app was built from source. Update your checkout and rebuild to install the new version."
+            };
+            let details = popover::popover_card(theme)
+                .id("sidebar-update-details-card")
+                .w(px(280.0)).p(px(12.0)).flex().flex_col().gap(px(8.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_update_details(cx)))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(format!("Zeron v{latest} available")))
+                .child(div().text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted)
+                    .child(format!("Installed: v{}", zeron_update::current_version())))
+                .child(div().text_size(crate::typography::ui_rems(12.0)).text_color(theme.text_muted).child(instructions))
+                .child(popover::menu_row(theme, false, "update-release-notes")
+                    .id("update-release-notes").cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.open_url("https://github.com/zeronsh/zeron/releases");
+                        this.close_update_details(cx);
+                    }))
+                    .child(icon(icons::ARROW_UP_RIGHT).size(px(16.0)).text_color(theme.accent))
+                    .child("View releases"))
+                .into_any_element();
+            button = button.child(popover::anchored_menu_above(
+                "sidebar-update-details", details, self.update_details.closing_since(),
+            ));
+        }
         if clickable {
-            strip = strip
+            button = button
                 .cursor_pointer()
                 .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
+                .on_click(cx.listener(move |this, _, _, cx| this.on_update_button_click(cx)));
         }
-        Some(strip.into_any_element())
+        Some(button.into_any_element())
     }
 
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+    fn close_update_details(&mut self, cx: &mut Context<Self>) {
+        if self.update_details.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.update_details);
+            cx.notify();
+        }
+    }
+
+    /// Idle downloads, ready restarts, failures retry. Other installs expose
+    /// update instructions without dismissing the available-release indicator.
+    fn on_update_button_click(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
+            if self.update_details.take_press_was_open() {
+                self.close_update_details(cx);
+            } else {
+                self.close_user_menu(cx);
+                self.update_details.open(());
+            }
             cx.notify();
             return;
         }
@@ -5993,7 +6943,7 @@ impl Shell {
     }
 
     /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    /// (tokio / reqwest); the button offers "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
@@ -6100,6 +7050,7 @@ impl Shell {
                 if this.user_menu.take_press_was_open() {
                     this.close_user_menu(cx);
                 } else {
+                    this.close_update_details(cx);
                     this.user_menu.open(());
                 }
                 cx.notify();
@@ -6227,7 +7178,7 @@ impl Shell {
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
+                            this.open_settings(SettingsSection::General, cx)
                         }))
                         .child(
                             icon(icons::SETTINGS_MINIMALISTIC)
@@ -6637,6 +7588,10 @@ impl Shell {
     /// Resolve shell-owned Escape surfaces in capture phase, before focused
     /// descendants such as an integrated terminal can consume the key.
     fn capture_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.update_details.is_open() {
+            self.close_update_details(cx);
+            return true;
+        }
         // Modals and context menus sit above the rest of the shell. Preserve
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
@@ -6700,6 +7655,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" && self.agents_expanded_chat.take().is_some() {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         // Inputs and completion menus consume Tab first. Unhandled Tab walks
         // accessible controls, including individual transcript link ranges.
         let modifiers = event.keystroke.modifiers;
@@ -6761,6 +7721,27 @@ impl Shell {
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let chat_space = self.state.read(cx).chats.iter().find(|c| c.id == chat_id).and_then(|c| c.space_id.clone());
+            let mut folder_moves = Vec::new();
+            let folders: Vec<_> = self.settings.chat_folders.iter().filter(|f| f.workspace == chat_space).cloned().collect();
+            if !folders.is_empty() {
+                folder_moves.push(popover::menu_heading(&theme, "Move to").into_any_element());
+                for (id, name) in std::iter::once((None, "Chats".to_string())).chain(folders.into_iter().map(|f| (Some(f.id), f.name))) {
+                    let chat = chat_id.clone();
+                    let key = format!("move-folder-{}", id.as_deref().unwrap_or("chats"));
+                    folder_moves.push(popover::menu_row(&theme, false, key.clone()).id(SharedString::from(key))
+                        .child(icon(icons::FOLDER).size(px(16.0)).text_color(theme.text_muted))
+                        .child(div().truncate().child(name))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            settings::update(SavePolicy::Immediate, cx, |settings| {
+                                if let Some(id) = &id { settings.chat_folder_assignments.insert(chat.clone(), id.clone()); }
+                                else { settings.chat_folder_assignments.remove(&chat); }
+                            });
+                            this.sync_independent_settings(cx); this.close_chat_menu(cx); cx.notify();
+                        })).into_any_element());
+                }
+                folder_moves.push(popover::menu_separator().into_any_element());
+            }
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -6770,6 +7751,7 @@ impl Shell {
                 .flex_col();
             let menu = match menu_state.page {
                 ChatMenuPage::Root => menu
+                    .children(folder_moves)
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
                             .id("chat-menu-rename")
@@ -7137,7 +8119,45 @@ impl Shell {
         // the unified window titlebar now (render_title_bar). Settings never
         // underlaps: pad below the overlaid titlebar.
         if let Route::Settings(section) = self.route {
-            let outlet = self.settings_outlet(section, window, cx);
+            // A live search query takes the outlet over: the matching settings
+            // themselves (re-rendered on every keystroke, see the search box's
+            // Edited subscription) instead of the section page, until the box
+            // is cleared or a hit is opened.
+            // Both outlets enter with a rise-and-fade keyed by what they show
+            // (`settings_outlet_key`): the results column pops up from below
+            // whenever the hit set changes, a section page fades in shorter
+            // and shallower on a page switch, and neither re-runs while the
+            // key stays the same (typing inside an unchanged hit set).
+            let outlet = if self.settings_search_active(cx) {
+                let titles = self.settings_search_hit_titles(cx);
+                let key = settings_outlet_key(section, Some(&titles));
+                let results = self.render_settings_search_results(theme, cx);
+                // Bottom dissolve like the new-thread canvas: the glass-safe
+                // EdgeFade scope, not a painted overlay (no hitbox, so it can
+                // never eat a scroll or a click on the rows below).
+                let faded = crate::edge_fade::edge_faded(
+                    SETTINGS_RESULTS_FADE_BAND,
+                    false,
+                    true,
+                    results,
+                )
+                .into_any_element();
+                self.with_settings_entrance(
+                    key,
+                    &motion::SETTINGS_RESULTS_RISE,
+                    motion::SETTINGS_RESULTS_RISE_DISTANCE,
+                    faded,
+                )
+            } else {
+                let key = settings_outlet_key(section, None);
+                let page = self.settings_outlet(section, window, cx);
+                self.with_settings_entrance(
+                    key,
+                    &motion::SETTINGS_PAGE_RISE,
+                    motion::SETTINGS_PAGE_RISE_DISTANCE,
+                    page,
+                )
+            };
             return div()
                 .flex_1()
                 .min_w_0()
@@ -7149,6 +8169,31 @@ impl Shell {
                 .into_any_element();
         }
 
+        if self.route == Route::Inbox {
+            if self.inbox_page.is_none() {
+                let state = self.state.clone();
+                let page = cx.new(|cx| InboxPage::new(state, cx));
+                self.inbox_sub = Some(cx.subscribe_in(&page, window, |this, _, event, window, cx| match event {
+                    InboxEvent::OpenChat(id) => this.open_chat(id.clone(), cx),
+                    InboxEvent::OpenFile { chat_id, device_id, path } => this.open_inbox_file(chat_id, device_id, path, window, cx),
+                }));
+                self.inbox_page = Some(page);
+            }
+            return div().flex_1().min_w_0().h_full().pt(px(Theme::TITLEBAR_HEIGHT))
+                .child(self.inbox_page.clone().unwrap()).into_any_element();
+        }
+        if self.route == Route::Automations {
+            if self.automations_page.is_none() {
+                let state = self.state.clone();
+                let page = cx.new(|cx| AutomationsPage::new(state,cx));
+                self.automations_sub = Some(cx.subscribe(&page, |this,_,event,cx| match event {
+                    AutomationsEvent::OpenChat(id) => this.open_chat(id.clone(),cx),
+                }));
+                self.automations_page = Some(page);
+            }
+            return div().flex_1().min_w_0().h_full().pt(px(Theme::TITLEBAR_HEIGHT))
+                .child(self.automations_page.clone().unwrap()).into_any_element();
+        }
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
@@ -7196,6 +8241,26 @@ impl Shell {
         self.composer.update(cx, |composer, cx| {
             composer.set_available_width(composer_width, cx)
         });
+        // The composer notice strip (usage warnings first). Resolved before the
+        // element tree so the composer can lift its floating destination chips
+        // above the strip instead of painting them under it.
+        let mut composer_notice = self.composer_notice(cx);
+        let mut notice_visibility = 1.0_f32;
+        if let Some((notice, started)) = &self.closing_notice {
+            let t = (started.elapsed().as_secs_f32() / 0.18).min(1.0);
+            if self.reduced_motion || t >= 1.0 {
+                self.closing_notice = None;
+            } else {
+                composer_notice = Some(notice.clone());
+                notice_visibility = (1.0 - t).powi(3);
+                crate::motion::pulse_lease(cx.entity_id(), cx);
+            }
+        }
+        let notice_height = if composer_notice.is_some() {
+            crate::composer_notice::NOTICE_HEIGHT * notice_visibility
+        } else { 0.0 };
+        self.composer
+            .update(cx, |composer, cx| composer.set_notice_height(notice_height, cx));
         let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
         let new_thread_background_layer = (!has_selection || dock_frame.active).then(|| {
             if artwork.is_some() && artwork_opacity < 1.0 {
@@ -7419,6 +8484,27 @@ impl Shell {
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
+                        // Notice strip docked on the card's top edge. It lives
+                        // inside the measured bottom stack, so the transcript
+                        // clearance follows it.
+                        let notice = composer_notice.as_ref().map(|notice| {
+                            let key = notice.key();
+                            let closing_notice = notice.clone();
+                            let strip = crate::composer_notice::render(
+                                notice,
+                                theme,
+                                cx.listener(move |shell: &mut Self, _, _, cx| {
+                                    shell.dismissed_notice_keys.insert(key.clone());
+                                    if shell.closing_notice.is_none() && !shell.reduced_motion {
+                                        shell.closing_notice = Some((closing_notice.clone(), std::time::Instant::now()));
+                                    }
+                                    cx.notify();
+                                }),
+                            );
+                            div().h(px(notice_height)).flex_none().overflow_hidden()
+                                .child(strip.relative().top(px(crate::composer_notice::NOTICE_HEIGHT - notice_height))
+                                    .opacity(notice_visibility))
+                        });
                         el.child(crate::composer_dock::docked_composer(
                             div()
                                 .id("persistent-composer")
@@ -7426,6 +8512,10 @@ impl Shell {
                                 .w(px(composer_width))
                                 .opacity(composer_opacity)
                                 .mx_auto()
+                                .flex()
+                                .flex_col()
+                                .children(self.render_agent_dock(cx))
+                                .children(notice)
                                 .child(self.composer.clone())
                                 .children(if has_selection {
                                     self.render_jump_to_bottom(cx)
@@ -9265,6 +10355,11 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_time = Some(std::time::Instant::now());
+        // One slow subscription-usage probe for the composer notice strip,
+        // started on the first frame (the engine handle only exists by then).
+        if self.usage_probe_task.is_none() {
+            self.spawn_usage_probe(cx);
+        }
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()
         {
@@ -9444,7 +10539,10 @@ impl Render for Shell {
             .flex()
             .flex_row()
             .size_full()
-            .bg(frost)
+            // On the ready page the frost is painted per column (sidebar
+            // tone + main pane) so the pane's rounded left corners reveal the
+            // sidebar underneath; the gate screens still fill the root.
+            .bg(if matches!(gate, GatePhase::Ready) { crate::theme::ink(0.0) } else { frost })
             .text_color(text)
             .font_family(font)
             .text_size(crate::typography::ui_rems(14.0))
@@ -9481,7 +10579,7 @@ impl Render for Shell {
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) always land on the default section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.open_settings(SettingsSection::Devices, cx)
+                this.open_settings(SettingsSection::General, cx)
             }))
             // Chat-scoped, unlike new-session — `cycle_session` holds the guard
             // and says why.
@@ -9666,6 +10764,12 @@ impl Render for Shell {
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
+                // The main pane keeps the window's frost untouched: NO fill at
+                // all (user request: any tint reads as a lighter, washed-out
+                // pane). Its left edge carries the hairline that used to sit on
+                // the sidebar tone, so the line follows the two rounded notches
+                // instead of running straight past them.
+                let card_surface = frost;
                 // No inset cards (user request): the conversation column sits
                 // flush and unbordered, the transcript directly on the frost
                 // glass; the changes pane is a flush left-bordered glass panel
@@ -9721,6 +10825,34 @@ impl Render for Shell {
                 } else {
                     Empty.into_any_element()
                 };
+                // Everything right of the sidebar is ONE opaque pane
+                // (Arc-style): conversation column plus the right-pane
+                // surfaces. It stays FLUSH with the window's top, right and
+                // bottom edges — DWM rounds the window there — and is rounded
+                // only on its two left corners, where the glass sidebar shows
+                // through the notches. No margins: it is still one window.
+                // Takeover only reshuffles the children's widths.
+                let card_radius = px(main_card_left_radius(self.sidebar_now()));
+                let main_card = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .rounded_tl(card_radius)
+                    .rounded_bl(card_radius)
+                    .bg(card_surface)
+                    .border_l_1()
+                    .border_color(border_color)
+                    .overflow_hidden()
+                    .child(card)
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .relative()
+                            .child(right)
+                            .child(right_seam),
+                    );
                 let title_bar = self.render_title_bar(cx);
                 // Sidebar tone: a slightly lighter column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,
@@ -9730,15 +10862,42 @@ impl Render for Shell {
                 let sidebar_now = self.sidebar_now();
                 // Hairline on its right edge — full height like the tone,
                 // so the sidebar column reads as its own surface.
+                // It carries its own frost. The two notches the main pane's
+                // rounded left corners leave next to it are filled by
+                // `notch_fills` below with the same tone, drawn as exact
+                // square-minus-quarter-disc shapes so nothing of the tone
+                // bleeds under the translucent pane (user request).
                 let sidebar_tone = div()
                     .absolute()
                     .top_0()
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
-                    .border_r_1()
-                    .border_color(border_color);
+                    .bg(frost)
+                    .child(div().size_full().bg(crate::theme::wash(0.05)));
+                let notch_radius = main_card_left_radius(sidebar_now);
+                let notch_fills = (notch_radius > 0.0).then(|| {
+                    let tone = crate::theme::wash(0.05);
+                    gpui::canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            // Quads, not a path: the path rasterizer blends
+                            // translucent fills differently from quads, and
+                            // the notch must match the sidebar tone exactly.
+                            for top in [true, false] {
+                                for strip in notch_strips(bounds, notch_radius, top) {
+                                    window.paint_quad(gpui::fill(strip, frost));
+                                    window.paint_quad(gpui::fill(strip, tone));
+                                }
+                            }
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(sidebar_now))
+                    .w(px(notch_radius))
+                });
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
@@ -9754,20 +10913,13 @@ impl Render for Shell {
                             .flex_row()
                             .child(sidebar)
                             .child(sidebar_seam)
-                            .child(card)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_none()
-                                    .relative()
-                                    .child(right)
-                                    .child(right_seam),
-                            ),
+                            .child(main_card),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
+                    .children(notch_fills)
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
@@ -9844,6 +10996,15 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_card_rounds_only_against_a_visible_sidebar() {
+        // Sidebar open (also mid-tween): the pane's left corners are rounded.
+        assert_eq!(main_card_left_radius(260.0), Theme::MAIN_CARD_RADIUS);
+        assert_eq!(main_card_left_radius(12.0), Theme::MAIN_CARD_RADIUS);
+        // Fully collapsed: no glass on the left, so the pane is full-bleed.
+        assert_eq!(main_card_left_radius(0.0), 0.0);
+    }
 
     #[test]
     fn sidebar_drag_nudges_each_edge_once_until_rearmed() {
@@ -9972,6 +11133,62 @@ mod tests {
         assert_eq!(center, 21.0);
         assert_eq!(center - 12.0 - top, 4.0);
         assert_eq!(top + height - (center + 12.0), 4.0);
+    }
+
+    #[test]
+    fn settings_nav_pill_geometry_is_index_times_pitch() {
+        // Row 0 sits at the top; every further row adds height + gap.
+        assert_eq!(settings_nav_pill_offset(0, 33.0, 2.0), 0.0);
+        assert_eq!(settings_nav_pill_offset(1, 33.0, 2.0), 35.0);
+        assert_eq!(settings_nav_pill_offset(4, 33.0, 2.0), 140.0);
+        // A measured column divides back into exactly that row height.
+        assert_eq!(
+            settings_nav_measured_row_height(35.0 * 5.0 - 2.0, 5, 2.0),
+            Some(33.0)
+        );
+        assert_eq!(settings_nav_measured_row_height(33.0, 1, 2.0), Some(33.0));
+        assert_eq!(settings_nav_measured_row_height(0.0, 0, 2.0), None);
+        assert_eq!(settings_nav_measured_row_height(120.0, 0, 2.0), None);
+    }
+
+    #[test]
+    fn settings_outlet_key_tracks_the_hit_set_not_the_keystroke() {
+        let hits = ["Keep awake", "Autostart"];
+        // Same hits (a keystroke that narrows nothing) — same key, so the
+        // entrance does not restart.
+        assert_eq!(
+            settings_outlet_key(SettingsSection::General, Some(&hits)),
+            settings_outlet_key(SettingsSection::Appearance, Some(&hits)),
+        );
+        // A changed hit set, including its order, re-runs the entrance.
+        assert_ne!(
+            settings_outlet_key(SettingsSection::General, Some(&hits)),
+            settings_outlet_key(SettingsSection::General, Some(&["Keep awake"])),
+        );
+        assert_ne!(
+            settings_outlet_key(SettingsSection::General, Some(&hits)),
+            settings_outlet_key(SettingsSection::General, Some(&["Autostart", "Keep awake"])),
+        );
+        // Pages key by section, and a page is never the results view.
+        assert_eq!(
+            settings_outlet_key(SettingsSection::General, None),
+            settings_outlet_key(SettingsSection::General, None),
+        );
+        assert_ne!(
+            settings_outlet_key(SettingsSection::General, None),
+            settings_outlet_key(SettingsSection::Files, None),
+        );
+        assert_ne!(
+            settings_outlet_key(SettingsSection::General, None),
+            settings_outlet_key(SettingsSection::General, Some(&[])),
+        );
+        // The pill snaps when the visible row list changes.
+        let rows = [SettingsSection::General, SettingsSection::Files];
+        assert_eq!(settings_nav_rows_key(&rows), settings_nav_rows_key(&rows));
+        assert_ne!(
+            settings_nav_rows_key(&rows),
+            settings_nav_rows_key(&[SettingsSection::General]),
+        );
     }
 
     #[test]
@@ -10918,7 +12135,7 @@ mod exit_regressions {
                     state.select_chat(Some("last".into()), cx);
                 });
                 shell.on_state_changed(&shell.state.clone(), cx);
-                shell.settings.space_filter = Some("b".into());
+                shell.settings.workspace_space_id = Some("b".into());
                 shell.open_new_session(cx);
                 shell.on_state_changed(&shell.state.clone(), cx);
                 assert!(shell.active_chat.is_empty());

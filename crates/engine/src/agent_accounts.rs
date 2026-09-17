@@ -77,6 +77,10 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Managed Kimi Code API bases (the CLI's own `DEFAULT_KIMI_CODE_BASE_URL` /
+/// `GLOBAL_KIMI_CODE_BASE_URL`); usage lives at `<base>/usages`.
+const KIMI_BASE_URL_CN: &str = "https://api.kimi.com/coding/v1";
+const KIMI_BASE_URL_GLOBAL: &str = "https://api.kimi.ai/coding/v1";
 /// The Cursor dashboard's current-period usage RPC (Connect-style POST).
 const CURSOR_CURRENT_PERIOD_USAGE: &str = "aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const CURSOR_DEFAULT_BACKEND: &str = "https://api2.cursor.sh";
@@ -119,6 +123,9 @@ pub struct AgentAccountsConfig {
     /// Kimi Code CLI home (`~/.kimi-code`) — holds `config.toml`, `region` and
     /// the `credentials/` token sets.
     pub kimi_dir: PathBuf,
+    /// Cline CLI home (`$CLINE_CONFIG_DIR`/`--config`, default `~/.cline`) —
+    /// holds `data/settings/providers.json` with the live sign-in.
+    pub cline_dir: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -142,6 +149,7 @@ impl AgentAccountsConfig {
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
             kimi_dir: home_dir().join(".kimi-code"),
+            cline_dir: env_dir("CLINE_CONFIG_DIR").unwrap_or_else(|| home_dir().join(".cline")),
         }
     }
 
@@ -161,6 +169,15 @@ impl AgentAccountsConfig {
     /// provider environment.
     fn kimi_credentials_dir(&self) -> PathBuf {
         self.kimi_dir.join("credentials")
+    }
+
+    /// Where `cline auth` writes the live provider settings — one file holding
+    /// every configured provider plus `lastUsedProvider`.
+    fn cline_providers_file(&self) -> PathBuf {
+        self.cline_dir
+            .join("data")
+            .join("settings")
+            .join("providers.json")
     }
 }
 
@@ -367,6 +384,16 @@ impl AgentAccounts {
             unreadable.insert(HarnessId::Kimi, detected);
         }
 
+        // Cline, same read-only deal: `cline auth` keeps the live sign-in in
+        // ONE `providers.json` next to every other provider entry, keyed by
+        // `lastUsedProvider`. Copying that file out would take the whole CLI
+        // configuration with it (base urls, model picks, API keys for other
+        // providers), so zeron reads the identity and swaps nothing.
+        if let Some(detected) = self.detect_cline() {
+            active_keys.insert(HarnessId::Cline, detected.account_key.clone());
+            unreadable.insert(HarnessId::Cline, detected);
+        }
+
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
         let mut accounts: Vec<AgentAccount> = Vec::new();
@@ -375,6 +402,7 @@ impl AgentAccounts {
             HarnessId::Codex,
             HarnessId::Cursor,
             HarnessId::Kimi,
+            HarnessId::Cline,
         ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
@@ -406,13 +434,21 @@ impl AgentAccounts {
             if let Some(u) = unreadable.get(&harness)
                 && !slots.iter().any(|s| s.account_key == u.account_key)
             {
+                // Kimi is signed in without a slot (its token set is never
+                // snapshotted), so its usage is probed from the live login.
+                let usage = if harness == HarnessId::Kimi {
+                    self.cached_usage(harness, &u.account_key, force_usage, || self.kimi_usage())
+                        .await
+                } else {
+                    None
+                };
                 accounts.push(AgentAccount {
                     id: slot_id_for(harness, &u.account_key),
                     harness,
                     email: Some(u.profile.email.clone()),
                     plan_label: u.profile.plan.clone(),
                     active: true,
-                    usage_windows: Vec::new(),
+                    usage_windows: usage.map(|usage| usage.windows).unwrap_or_default(),
                     display_name: u.profile.display_name.clone(),
                     organization: u.profile.organization.clone(),
                     auth_kind: Some(u.profile.auth_kind),
@@ -564,6 +600,7 @@ impl AgentAccounts {
             HarnessId::Codex => self.start_codex_login().await,
             HarnessId::Cursor => self.start_cursor_login().await,
             HarnessId::Kimi => self.start_kimi_login().await,
+            HarnessId::Cline => self.start_cline_login().await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -733,6 +770,75 @@ impl AgentAccounts {
         Ok(AgentLoginStart {
             login_id,
             url,
+            mode: AgentLoginMode::Browser,
+        })
+    }
+
+    /// Cline: `cline auth` is an interactive picker (provider, then a browser
+    /// hand-off, then a model choice) — there is nothing zeron can drive
+    /// headlessly, so the CLI gets a console of its own and the flow completes
+    /// when it rewrites `providers.json`. Like Kimi this is a sign-in, not an
+    /// add-account: the CLI keeps ONE live provider set and no throwaway store
+    /// could be promoted into it later.
+    async fn start_cline_login(&self) -> Result<AgentLoginStart, EngineError> {
+        self.reap_spawned_flows(HarnessId::Cline);
+        let login_id = new_id();
+        // Kept only so the shared cancel/reap path has a directory to reclaim.
+        let home = self
+            .inner
+            .config
+            .root_dir()
+            .join(format!(".login-{login_id}"));
+        std::fs::create_dir_all(&home)?;
+        let baseline = self.cline_providers_mtime();
+        let mut command = tokio::process::Command::new(crate::exec::resolve_tool("cline"));
+        command.arg("auth");
+        #[cfg(windows)]
+        {
+            // CREATE_NEW_CONSOLE: `cline auth` REQUIRES a TTY on both ends
+            // (it refuses with "interactive mode requires a TTY" otherwise),
+            // and the picker is the user interface here.
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            command.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        #[cfg(not(windows))]
+        {
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        "The `cline` CLI was not found on this device — install it first.".into()
+                    } else {
+                        format!("Could not start the Cline sign-in: {err}")
+                    },
+                ));
+            }
+        };
+        let (child, output, exit) = wire_login_child(child);
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Spawned {
+                harness: HarnessId::Cline,
+                child,
+                home,
+                started_at: Instant::now(),
+                output,
+                exit,
+                baseline,
+            },
+        );
+        // The CLI owns its console and hands back no URL on either platform
+        // (it opens the browser itself), so there is no link to offer.
+        Ok(AgentLoginStart {
+            login_id,
+            url: String::new(),
             mode: AgentLoginMode::Browser,
         })
     }
@@ -1004,13 +1110,21 @@ impl AgentAccounts {
         };
         // Kimi rewrites the CLI's own store, so completion is "the live token
         // set is newer than when we started" rather than a file under `home`.
-        if harness == HarnessId::Kimi {
-            let landed = match (self.kimi_credentials_mtime(), baseline) {
+        if matches!(harness, HarnessId::Kimi | HarnessId::Cline) {
+            let live = match harness {
+                HarnessId::Cline => self.cline_providers_mtime(),
+                _ => self.kimi_credentials_mtime(),
+            };
+            let landed = match (live, baseline) {
                 (Some(now), Some(before)) => now > before,
                 (Some(_), None) => true,
                 (None, _) => false,
             };
-            if landed && self.detect_kimi().is_some() {
+            let detected = match harness {
+                HarnessId::Cline => self.detect_cline().is_some(),
+                _ => self.detect_kimi().is_some(),
+            };
+            if landed && detected {
                 self.cancel_login(login_id);
                 return Ok(AgentLoginPoll {
                     status: AgentLoginStatus::Done,
@@ -1165,6 +1279,21 @@ impl AgentAccounts {
         let region = str_field(&auth, "region")
             .or_else(|| read_trimmed(&self.inner.config.kimi_dir.join("region")));
         parse_kimi_auth(auth, &stem, region.as_deref())
+    }
+
+    /// The live `cline auth` sign-in, if there is one. Read-only: the tokens
+    /// stay in the file, only the identity claims travel.
+    fn detect_cline(&self) -> Option<Detected> {
+        parse_cline_auth(read_json(&self.inner.config.cline_providers_file())?)
+    }
+
+    /// Modification time of the live Cline provider settings — the login
+    /// flow's completion baseline.
+    fn cline_providers_mtime(&self) -> Option<std::time::SystemTime> {
+        std::fs::metadata(self.inner.config.cline_providers_file())
+            .ok()?
+            .modified()
+            .ok()
     }
 
     /// Modification time of the live Kimi token set — the login flow's
@@ -1348,6 +1477,34 @@ impl AgentAccounts {
         usage
     }
 
+    /// The shared usage cache around one probe: the same TTL and the same
+    /// "non-forced lists never hit the network" rule `usage_for` follows, for a
+    /// live login that has no slot to key on (Kimi).
+    async fn cached_usage<F, Fut>(
+        &self,
+        harness: HarnessId,
+        account_key: &str,
+        force: bool,
+        probe: F,
+    ) -> Option<UsageSnapshot>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<UsageSnapshot>>,
+    {
+        let key = format!("{}:{account_key}", harness_slug(harness));
+        if let Some((usage, at)) = lock(&self.inner.usage_cache).get(&key)
+            && at.elapsed() < USAGE_TTL
+        {
+            return usage.clone();
+        }
+        if !force {
+            return None;
+        }
+        let usage = probe().await;
+        lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
+        usage
+    }
+
     async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<UsageSnapshot> {
         let oauth = slot.credentials.get("claudeAiOauth")?;
         let access_token = str_field(oauth, "accessToken")?;
@@ -1441,6 +1598,50 @@ impl AgentAccounts {
             windows,
             plan_label,
         })
+    }
+
+    /// Kimi Code's managed usage endpoint (`<base>/usages`), read with the
+    /// access token the CLI itself stored.
+    ///
+    /// Deliberately refresh-free: the Kimi token set is the CLI's own store and
+    /// its refresh grant rotates, so refreshing here would invalidate the
+    /// token pair the running CLI holds. The access token lives only 15
+    /// minutes, so numbers appear while Kimi is (or just was) in use — which is
+    /// when a usage warning matters — and are simply absent otherwise.
+    async fn kimi_usage(&self) -> Option<UsageSnapshot> {
+        let file = newest_kimi_credentials(&self.inner.config.kimi_credentials_dir())?;
+        let auth = read_json(&file)?;
+        let access_token = str_field(&auth, "access_token")?;
+        // Expired token: a request would only earn a 401, and refreshing is
+        // not ours to do.
+        if auth
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .is_none_or(|secs| secs * 1000 <= now_ms())
+        {
+            return None;
+        }
+        let region = str_field(&auth, "region")
+            .or_else(|| read_trimmed(&self.inner.config.kimi_dir.join("region")));
+        let base = kimi_base_url(
+            read_trimmed(&self.inner.config.kimi_dir.join("config.toml")).as_deref(),
+            region.as_deref(),
+        );
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .get(format!("{base}/usages"))
+            .bearer_auth(&access_token)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        kimi_usage_windows(&body)
     }
 
     async fn cursor_usage(&self, slot: &Slot) -> Option<UsageSnapshot> {
@@ -1657,6 +1858,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Kimi => "kimi",
+        HarnessId::Cline => "cline",
         HarnessId::Opencode => "opencode",
         HarnessId::Mock => "mock",
     }
@@ -1967,6 +2169,148 @@ fn parse_kimi_auth(
         credentials: None,
         claude_config: None,
     })
+}
+
+/// The live Cline sign-in out of `~/.cline/data/settings/providers.json`
+/// (`version: 1`): `lastUsedProvider` names the active entry, whose
+/// `settings.auth` carries the WorkOS session. Identity comes from
+/// `auth.metadata.userInfo` (email, name) with `auth.accountId` as the stable
+/// key; the plan chip names the billing route the entry authenticates against
+/// (`cline` → Cline, `cline-pass` → ClinePass, `openai-codex` → a ChatGPT
+/// subscription), which is the one fact the card can state truthfully without
+/// a network call. An entry whose `tokenSource` is a bare API key has no
+/// `auth` block; it is reported under the provider id so the row is not empty.
+/// Read-only: `credentials: None`, so nothing here is ever written back.
+/// Pure.
+fn parse_cline_auth(settings: serde_json::Value) -> Option<Detected> {
+    let providers = settings.get("providers")?.as_object()?;
+    let active = str_field(&settings, "lastUsedProvider")
+        .filter(|id| providers.contains_key(id))
+        .or_else(|| providers.keys().next().cloned())?;
+    let entry = providers.get(&active)?;
+    let auth = entry.get("settings").and_then(|s| s.get("auth"));
+    let user = auth.and_then(|a| a.get("metadata")).and_then(|m| m.get("userInfo"));
+    let email = user.and_then(|u| str_field(u, "email"));
+    let account_key = auth
+        .and_then(|a| str_field(a, "accountId"))
+        .or_else(|| user.and_then(|u| str_field(u, "clineUserId")))
+        .or_else(|| user.and_then(|u| str_field(u, "subject")))
+        .or_else(|| email.clone())
+        .unwrap_or_else(|| format!("cline:{active}"));
+    let display_name = user
+        .and_then(|u| str_field(u, "name"))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    Some(Detected {
+        account_key,
+        profile: SlotProfile {
+            email: email.unwrap_or_else(|| cline_provider_label(&active).to_string()),
+            display_name,
+            organization: None,
+            plan: Some(cline_provider_label(&active).to_string()),
+            auth_kind: match entry.get("tokenSource").and_then(|v| v.as_str()) {
+                Some("oauth") | None => AgentAuthKind::Oauth,
+                _ => AgentAuthKind::ApiKey,
+            },
+        },
+        credentials: None,
+        claude_config: None,
+    })
+}
+
+/// Badge for the Cline provider an entry authenticates against. Unknown ids
+/// (Cline adds BYO-key providers regularly) keep their own id. Pure.
+fn cline_provider_label(provider: &str) -> &str {
+    match provider {
+        "cline" => "Cline",
+        "cline-pass" => "ClinePass",
+        "openai-codex" => "ChatGPT subscription",
+        other => other,
+    }
+}
+
+/// Managed API base for the live Kimi login: the CLI's configured `base_url`
+/// wins (it is what the login was minted against), otherwise the region decides
+/// between the mainland and the global deployment. Pure.
+fn kimi_base_url(config_toml: Option<&str>, region: Option<&str>) -> String {
+    if let Some(config) = config_toml
+        && let Some(base) = config
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("base_url"))
+            .filter_map(|rest| rest.trim_start().strip_prefix('='))
+            .map(|value| value.trim().trim_matches('"').trim_end_matches('/'))
+            .find(|value| value.ends_with("/coding/v1"))
+    {
+        return base.to_string();
+    }
+    match region {
+        Some("global") | Some("overseas") => KIMI_BASE_URL_GLOBAL.to_string(),
+        Some("mainland-cn") | Some("cn") => KIMI_BASE_URL_CN.to_string(),
+        _ => KIMI_BASE_URL_GLOBAL.to_string(),
+    }
+}
+
+/// Windows from Kimi Code's `/usages`: a `summary` row plus a `limits` array,
+/// each `{window: {duration, unit}, used, limit, reset_at}` with absolute
+/// counts (not percents). Pure.
+fn kimi_usage_windows(body: &serde_json::Value) -> Option<UsageSnapshot> {
+    // The CLI's local server wraps the payload as `{code, msg, data}`; the API
+    // itself answers with the bare object.
+    let data = body.get("data").unwrap_or(body);
+    if data.get("kind").and_then(|v| v.as_str()) == Some("error") {
+        return None;
+    }
+    let mut windows = Vec::new();
+    let rows = data
+        .get("limits")
+        .and_then(|v| v.as_array())
+        .map(|rows| rows.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for row in rows.into_iter().chain(data.get("summary")) {
+        let (Some(used), Some(limit)) = (
+            row.get("used").and_then(|v| v.as_f64()),
+            row.get("limit").and_then(|v| v.as_f64()),
+        ) else {
+            continue;
+        };
+        if limit <= 0.0 {
+            continue;
+        }
+        windows.push(AgentUsageWindow {
+            label: row
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| kimi_window_label(row.get("window"))),
+            used_fraction: (used / limit) as f32,
+            resets_at: parse_when(row.get("reset_at")),
+        });
+    }
+    (!windows.is_empty()).then_some(UsageSnapshot {
+        windows,
+        plan_label: None,
+    })
+}
+
+/// Window name from Kimi's `{duration, unit}` pair ("Session" for the rolling
+/// hours bucket, otherwise the calendar span). Pure.
+fn kimi_window_label(window: Option<&serde_json::Value>) -> String {
+    let duration = window
+        .and_then(|w| w.get("duration"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let unit = window
+        .and_then(|w| w.get("unit"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match (unit, duration) {
+        ("week", _) => "Week".to_string(),
+        ("day", d) if d >= 28 => "Month".to_string(),
+        ("day", _) => "Day".to_string(),
+        ("hour" | "minute", _) => "Session".to_string(),
+        _ => "Session".to_string(),
+    }
 }
 
 /// Row title for a Kimi login with no human claim: the account id, shortened.
@@ -2352,6 +2696,65 @@ mod tests {
     }
 
     #[test]
+    fn kimi_usage_windows_map_counts_to_fractions() {
+        // Shape observed live from the Kimi Code CLI's own usage call: a
+        // weekly `summary` plus a rolling `limits` row, absolute counts.
+        let body = serde_json::json!({
+            "kind": "ok",
+            "summary": {
+                "window": { "duration": 1, "unit": "week" },
+                "used": 9, "limit": 100,
+                "reset_at": "2026-09-18T17:55:47.597758Z"
+            },
+            "limits": [{
+                "window": { "duration": 5, "unit": "hour" },
+                "used": 42, "limit": 100,
+                "reset_at": "2026-09-17T05:55:47.597758Z"
+            }],
+            "extra_usage": serde_json::Value::Null
+        });
+        let usage = kimi_usage_windows(&body).unwrap();
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "Session");
+        assert!((usage.windows[0].used_fraction - 0.42).abs() < 1e-6);
+        assert!(usage.windows[0].resets_at.is_some());
+        assert_eq!(usage.windows[1].label, "Week");
+        assert!((usage.windows[1].used_fraction - 0.09).abs() < 1e-6);
+        // The CLI's local server wraps the same payload in `{code,msg,data}`.
+        assert_eq!(
+            kimi_usage_windows(&serde_json::json!({ "code": 0, "data": body }))
+                .unwrap()
+                .windows
+                .len(),
+            2
+        );
+        // An error payload or a limit-less answer is no usage, not zero usage.
+        assert!(kimi_usage_windows(&serde_json::json!({ "kind": "error" })).is_none());
+        assert!(
+            kimi_usage_windows(&serde_json::json!({ "limits": [{ "used": 1, "limit": 0 }] }))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn kimi_base_url_prefers_the_configured_provider_base() {
+        let config = "[providers.\"managed:kimi-code\"]\nbase_url = \"https://api.kimi.ai/coding/v1\"\n";
+        assert_eq!(
+            kimi_base_url(Some(config), Some("mainland-cn")),
+            "https://api.kimi.ai/coding/v1"
+        );
+        // No config: the login region picks the deployment.
+        assert_eq!(kimi_base_url(None, Some("mainland-cn")), KIMI_BASE_URL_CN);
+        assert_eq!(kimi_base_url(None, Some("global")), KIMI_BASE_URL_GLOBAL);
+        assert_eq!(kimi_base_url(None, None), KIMI_BASE_URL_GLOBAL);
+        // A `base_url` of some other service in the same file is ignored.
+        assert_eq!(
+            kimi_base_url(Some("base_url = \"https://api.kimi.ai/coding/v1/search\"\n"), None),
+            KIMI_BASE_URL_GLOBAL
+        );
+    }
+
+    #[test]
     fn codex_window_labels_track_the_window_span() {
         // Codex free tier: one 30-day window (observed live:
         // limit_window_seconds = 2_592_000) — NOT a week.
@@ -2589,6 +2992,65 @@ mod tests {
             api_key,
             "opaque/API-key shapes activate verbatim"
         );
+    }
+
+    #[test]
+    fn cline_auth_reads_the_live_provider_entry() {
+        // Shape taken from a real ~/.cline/data/settings/providers.json.
+        let settings = serde_json::json!({
+            "version": 1,
+            "lastUsedProvider": "cline",
+            "providers": {
+                "openai-codex": { "tokenSource": "oauth", "settings": {
+                    "auth": { "accountId": "other", "metadata": { "userInfo": {
+                        "email": "nope@example.com" } } } } },
+                "cline": { "tokenSource": "oauth", "settings": {
+                    "model": "anthropic/claude-sonnet-5",
+                    "auth": {
+                        "accessToken": "workos:jwt",
+                        "refreshToken": "r",
+                        "accountId": "usr-01ABC",
+                        "metadata": { "provider": "cline", "userInfo": {
+                            "email": "remo@example.com",
+                            "clineUserId": "usr-01ABC",
+                            "name": "remo "
+                        } }
+                    } } }
+            }
+        });
+        let detected = parse_cline_auth(settings).expect("live entry");
+        assert_eq!(detected.account_key, "usr-01ABC");
+        assert_eq!(detected.profile.email, "remo@example.com");
+        assert_eq!(detected.profile.display_name.as_deref(), Some("remo"));
+        assert_eq!(detected.profile.plan.as_deref(), Some("Cline"));
+        assert_eq!(detected.profile.auth_kind, AgentAuthKind::Oauth);
+        // Read-only: the tokens never travel out of the CLI's own file.
+        assert!(detected.credentials.is_none());
+    }
+
+    #[test]
+    fn cline_auth_falls_back_and_names_byo_key_entries() {
+        // An API-key entry has no `auth` block; the provider id carries the row.
+        let keyed = serde_json::json!({
+            "lastUsedProvider": "cline-pass",
+            "providers": { "cline-pass": { "tokenSource": "apiKey", "settings": {
+                "provider": "cline-pass", "model": "x" } } }
+        });
+        let detected = parse_cline_auth(keyed).expect("keyed entry");
+        assert_eq!(detected.account_key, "cline:cline-pass");
+        assert_eq!(detected.profile.email, "ClinePass");
+        assert_eq!(detected.profile.auth_kind, AgentAuthKind::ApiKey);
+
+        // `lastUsedProvider` naming an absent entry falls back to what is there.
+        let stale = serde_json::json!({
+            "lastUsedProvider": "gone",
+            "providers": { "openai-codex": { "settings": {} } }
+        });
+        let detected = parse_cline_auth(stale).expect("fallback entry");
+        assert_eq!(detected.profile.plan.as_deref(), Some("ChatGPT subscription"));
+
+        assert!(parse_cline_auth(serde_json::json!({ "providers": {} })).is_none());
+        assert!(parse_cline_auth(serde_json::json!({ "version": 1 })).is_none());
     }
 
     #[test]

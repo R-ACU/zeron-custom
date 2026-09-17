@@ -616,17 +616,10 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(pi.display_name(), "Pi");
     assert!(pi.supports_steering());
     assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
-    assert_eq!(
-        pi.reasoning_levels(),
-        &[
-            zeron_proto::ReasoningLevel::Minimal,
-            zeron_proto::ReasoningLevel::Low,
-            zeron_proto::ReasoningLevel::Medium,
-            zeron_proto::ReasoningLevel::High,
-            zeron_proto::ReasoningLevel::XHigh,
-            zeron_proto::ReasoningLevel::Max,
-        ]
-    );
+    // Deliberately empty: pi's ladder is per MODEL (narrowed from pi's own
+    // catalog in `pi_thinking`), and a harness-wide fallback would hand a
+    // think-less model the full slider.
+    assert!(pi.reasoning_levels().is_empty());
 
     let kimi = AcpHarness::kimi();
     assert_eq!(kimi.id(), HarnessId::Kimi);
@@ -641,6 +634,30 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             zeron_proto::ReasoningLevel::Max,
         ]
     );
+
+    let cline = AcpHarness::cline();
+    assert_eq!(cline.id(), HarnessId::Cline);
+    assert_eq!(cline.display_name(), "Cline");
+    assert!(cline.supports_steering());
+    assert_eq!(cline.steering_mode(), SteeringMode::TurnBoundary);
+    // Cline's `session/new` advertises only `provider` and `model` config
+    // options — no `thought_level`, so the picker must show no effort row.
+    assert!(cline.reasoning_levels().is_empty());
+}
+
+#[tokio::test]
+async fn cline_spec_drives_the_shared_acp_wire() {
+    let cline = AcpHarness::cline().with_executable(fixture_path());
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&cline, request("scenario:happy"), controls).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted { harness, .. } if *harness == HarnessId::Cline
+    )));
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "Hello".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
 #[tokio::test]
@@ -1052,4 +1069,62 @@ async fn devin_missing_variant_is_bounded_and_never_prompts() {
         "{events:?}"
     );
     assert!(!dir.path().join("prompted").exists());
+}
+
+/// One real turn against the installed, signed-in Cline CLI — the only way to
+/// see whether its `session/prompt` wire normalizes into events zeron shows.
+/// `#[ignore]`d: it spends the account's tokens.
+///
+/// `cargo test -p zeron-harness --test acp cline_live -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a signed-in cline install; spends tokens"]
+async fn cline_live_completes_a_real_turn() {
+    let cline = AcpHarness::cline();
+    assert!(cline.installed(), "cline CLI not found on this device");
+    let mut req = request("Reply with exactly: cline verified. Do not use any tools.");
+    req.model = None;
+    let (controls, steer, _token) = controls();
+    // Dropping the steer sender closes the steering mailbox, so the parked
+    // session ends the stream as soon as the turn is done instead of waiting.
+    drop(steer);
+    // Not `run_to_end`: its 10s budget fits the fixtures, not a real model.
+    let t0 = std::time::Instant::now();
+    let stream = cline.run(req, controls).await.expect("run starts");
+    println!("run() returned after {:?}", t0.elapsed());
+    let mut stream = std::pin::pin!(stream);
+    let mut events: Vec<AgentEvent> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event");
+            println!("[{:?}] {}", t0.elapsed(), match &event {
+                AgentEvent::TextDelta { .. } => "TextDelta".to_string(),
+                other => format!("{other:?}").chars().take(90).collect(),
+            });
+            events.push(event);
+        }
+    })
+    .await
+    .expect("run finished in time");
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    println!("--- cline said ---\n{text}\n--- events: {} ---", events.len());
+    for event in &events {
+        if !matches!(event, AgentEvent::TextDelta { .. }) {
+            println!("{event:?}");
+        }
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted { harness, .. } if *harness == HarnessId::Cline
+    )));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    assert!(
+        text.to_lowercase().contains("cline"),
+        "no usable text came back"
+    );
 }

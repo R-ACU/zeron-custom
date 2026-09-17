@@ -26,6 +26,8 @@ pub(crate) struct SystemFrame {
     #[serde(default)]
     pub subtype: String,
     #[serde(default)]
+    pub content: Value,
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub tools: Vec<String>,

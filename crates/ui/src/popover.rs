@@ -517,6 +517,49 @@ pub fn anchored_menu_below_gap(
         .into_any_element()
 }
 
+/// Paint priority of a dropdown that opens from inside a [`modal`]. Deferred
+/// layers paint in priority order, and a modal sits at priority 2, so a
+/// regular priority-1 menu nested in one would paint UNDER its own dialog.
+pub const DIALOG_MENU_PRIORITY: usize = 3;
+
+/// [`anchored_menu_below`] for triggers inside a [`modal`] dialog (the
+/// automation editor's dropdowns): same motion, frost and occlusion, painted
+/// above the dialog. `align_end` right-aligns the card to the trigger.
+pub fn dialog_menu_below(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    align_end: bool,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
+    let origin = div().absolute().bottom_0().size_0();
+    let origin = if align_end {
+        origin.right_0()
+    } else {
+        origin.left_0()
+    };
+    origin
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(if align_end {
+                        Anchor::TopRight
+                    } else {
+                        Anchor::TopLeft
+                    })
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
+                        div().occlude().pt(px(6.0)).child(content),
+                    )),
+            )
+            .priority(DIALOG_MENU_PRIORITY),
+        )
+        .into_any_element()
+}
+
 /// [`anchored_menu`] opening UPWARD from the trigger (composer pickers, the
 /// user menu — anything anchored near the window bottom; Radix flips these
 /// automatically, gpui's `anchored` needs the side picked).

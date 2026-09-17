@@ -705,6 +705,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 branch: Some("main".into()),
                 checkout_id: None,
                 source_context: None,
+            automation: None,
                 config: None,
                 last_message_preview: Some("old preview".into()),
                 last_message_at: Some(now),

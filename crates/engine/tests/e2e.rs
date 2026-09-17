@@ -2515,3 +2515,58 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
         core.shutdown().await;
     }
 }
+
+
+#[tokio::test]
+async fn late_cost_reaches_rpc_without_transcript_mutation_and_reconnects() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = mock_script();
+    script.push(AgentEvent::Cost {
+        id: "pi/session/final-message".into(),
+        usd: 0.125,
+    });
+    let core = assemble(dir.path(), Arc::new(ScriptedHarness {
+        script,
+        // Let the completed transcript flush before the independent cost report.
+        step_delay: Duration::from_millis(250),
+        hang_until_interrupt: true,
+    }));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let mut stream = client.subscribe(
+        zeron_rpc::methods::WATCH_DOC_MESSAGES,
+        serde_json::json!({"chatId": CHAT}),
+    ).await.unwrap();
+    let initial = stream.recv().await.unwrap();
+    assert!(initial.get("sessionUsage").is_none());
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(handle.doc(), "cost-run", SessionCommandPayload::Run {
+        request: run_request("cost report"),
+        message_id: "cost-user".into(),
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut materialized = Vec::new();
+    let mut completed = false;
+    loop {
+        let value = tokio::time::timeout_at(deadline, stream.recv())
+            .await.expect("cost-only update must wake the RPC stream").unwrap();
+        let frame: zeron_doc::TranscriptFrame = serde_json::from_value(value.clone()).unwrap();
+        if value["sessionUsage"]["costUsd"] == serde_json::json!(0.125) {
+            assert!(completed, "the transcript completed before billing arrived");
+            assert!(frame.is_empty_delta(), "billing must not mutate the transcript");
+            assert_eq!(core.sessions.session_status(CHAT).unwrap().status, SessionStatus::Idle);
+            break;
+        }
+        zeron_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
+        completed |= materialized.iter().any(|entry| {
+            entry.role == MessageRole::Assistant && entry.status == Some(MessageStatus::Complete)
+        });
+    }
+    let mut reconnect = client.subscribe(
+        zeron_rpc::methods::WATCH_DOC_MESSAGES,
+        serde_json::json!({"chatId": CHAT}),
+    ).await.unwrap();
+    let restored = tokio::time::timeout(Duration::from_secs(2), reconnect.recv())
+        .await.unwrap().unwrap();
+    assert!(restored.get("reset").is_some());
+    assert_eq!(restored["sessionUsage"]["costUsd"], serde_json::json!(0.125));
+}

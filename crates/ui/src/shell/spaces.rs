@@ -22,7 +22,7 @@ struct ActiveChatRow {
     group: Option<(String, String)>,
 }
 
-fn compare_sidebar_chats(
+pub(super) fn compare_sidebar_chats(
     sort: SidebarSort,
     left: &zeron_proto::Chat,
     right: &zeron_proto::Chat,
@@ -177,6 +177,9 @@ pub(super) enum SpacesMenuRow {
     All,
     Space(String),
     AddSpace,
+    NewChat,
+    CreateProject,
+    ChangeWorkspace,
 }
 
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
@@ -410,31 +413,13 @@ impl Shell {
     /// search (ranked — `popover::filter_indices`), then "New project…".
     /// "All" only shows on an empty query (searching means hunting a space).
     fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
-        let query = self
-            .spaces_menu
-            .get()
-            .map(|menu| menu.search.read(cx).text().to_string())
-            .unwrap_or_default();
-        let state = self.state.read(cx);
-        let spaces = state.spaces_sorted();
-        let names: Vec<String> = spaces
-            .iter()
-            .map(|s| s.display_name().to_string())
-            .collect();
-        let mut rows: Vec<SpacesMenuRow> = Vec::new();
-        if query.trim().is_empty() {
-            rows.push(SpacesMenuRow::All);
-        }
-        rows.extend(
-            popover::filter_indices(&query, &names)
-                .into_iter()
-                .map(|ix| SpacesMenuRow::Space(spaces[ix].id.clone())),
-        );
-        rows.push(SpacesMenuRow::AddSpace);
-        rows
+        let query = self.spaces_menu.get().map(|m| m.search.read(cx).text().to_string()).unwrap_or_default();
+        let labels = vec!["New chat".to_string(), "Add workspace".to_string(), "New folder".to_string(), "Change default workspace".to_string()];
+        let rows = [SpacesMenuRow::NewChat, SpacesMenuRow::AddSpace, SpacesMenuRow::CreateProject, SpacesMenuRow::ChangeWorkspace];
+        popover::filter_indices(&query, &labels).into_iter().map(|i| rows[i].clone()).collect()
     }
 
-    fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_sidebar_view_menu(cx);
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
@@ -476,11 +461,14 @@ impl Shell {
 
     fn activate_spaces_menu_row(&mut self, row: SpacesMenuRow, cx: &mut Context<Self>) {
         match row {
+            SpacesMenuRow::NewChat => { self.close_spaces_menu(cx); self.open_new_session(cx); }
+            SpacesMenuRow::CreateProject => { self.close_spaces_menu(cx); self.create_local_project(cx); }
+            SpacesMenuRow::ChangeWorkspace => { self.close_spaces_menu(cx); self.choose_workspace(cx); }
             SpacesMenuRow::All => self.set_space_filter(None, cx),
             SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
             SpacesMenuRow::AddSpace => {
                 self.close_spaces_menu(cx);
-                self.open_add_space(cx);
+                self.choose_local_project(false, cx);
             }
         }
     }
@@ -692,14 +680,14 @@ impl Shell {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_sidebar_view_menu(cx)))
             .flex()
             .flex_col()
-            .child(popover::menu_heading(theme, "Organize"))
+            .when(!self.settings.workspace_initialized, |el| el.child(popover::menu_heading(theme, "Organize"))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
                     .children(organization_rows),
-            )
+            ))
             .child(popover::menu_separator())
             .child(popover::menu_heading(theme, "Sort"))
             .child(div().flex().flex_col().gap(px(2.0)).children(sort_rows))
@@ -712,215 +700,45 @@ impl Shell {
     /// The sidebar's space-filter row: current filter ("All projects" or the
     /// space's name) + chevron, the dropdown floating beneath while open.
     /// Sits OUTSIDE the sidebar's scroll region so the float never clips.
-    pub(super) fn render_spaces_filter(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let filter = self.settings.space_filter.clone();
-        // Name + the dropdown rows' "@ device" tag on the trigger itself, so
-        // the filtered space's host reads without opening the picker.
-        let (label, device_tag): (SharedString, Option<(SharedString, bool)>) = {
-            let state = self.state.read(cx);
-            match filter.as_deref().and_then(|id| state.space_row(id)) {
-                Some(space) => {
-                    let (tag, offline) = state.space_device_tag(space, Utc::now());
-                    (
-                        space.display_name().to_string().into(),
-                        Some((tag.into(), offline)),
-                    )
-                }
-                None => (SharedString::from("All projects"), None),
-            }
-        };
-        let open = self.spaces_menu.is_open();
-
-        let trigger = div()
-            .id("spaces-filter")
-            .flex_1()
-            .min_w_0()
-            .h(px(29.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .text_size(crate::typography::ui_rems(13.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(motion::hover_blend(
-                "spaces-filter",
-                theme.text.opacity(0.8),
-                theme.text,
-            ))
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "spaces-filter",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover(),
-                )
-            })
-            .on_hover(motion::hover_listener("spaces-filter"))
-            .cursor_pointer()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.spaces_menu.note_trigger_press()),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                // A press that found the menu open closes it (the card's
-                // mouse-down-out already began the close) — never reopen.
-                if this.spaces_menu.take_press_was_open() {
-                    this.close_spaces_menu(cx);
-                } else {
-                    this.open_spaces_menu(window, cx);
-                }
-            }))
-            .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            // flex_1 pushes the caret to the trigger's right edge and gives
-            // long space names a bound to truncate against; the "@ device"
-            // tag hugs the name inside it rather than sitting by the caret.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(div().min_w_0().truncate().child(label))
-                    .when_some(device_tag, |el, (tag, offline)| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(theme.text_muted.opacity(0.45))
-                                .child(tag),
-                        )
-                        // Disconnected glyph, not the word (user request).
-                        .when(offline, |el| {
-                            el.child(
-                                icon(icons::WIFI_OFF)
-                                    .size(px(12.0))
-                                    .flex_none()
-                                    .text_color(theme.warning.opacity(0.8)),
-                            )
-                        })
-                    }),
-            )
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(14.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.6)),
-            );
-        let trigger = if self.spaces_menu.get().is_some() {
+    pub(super) fn render_spaces_filter(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label = self.settings.workspace_space_id.as_deref()
+            .and_then(|id| self.state.read(cx).space_row(id))
+            .map(|s| s.display_name().to_string()).unwrap_or_else(|| "Workspace".into());
+        let mut add = div().id("workspace-add").size(px(29.0)).flex().items_center().justify_center()
+            .rounded(px(8.0)).hover(|s| s.bg(theme.glass_hover())).cursor_pointer()
+            .role(gpui::Role::Button).aria_label("New chat or project")
+            .on_mouse_down(MouseButton::Left,cx.listener(|this,_,_,_|this.spaces_menu.note_trigger_press()))
+            .on_click(cx.listener(|this,_,window,cx| {
+                if this.spaces_menu.take_press_was_open() { this.close_spaces_menu(cx); } else { this.open_spaces_menu(window,cx); }
+            })).child(icon(icons::PLUS).size(px(16.0)).text_color(theme.text_muted));
+        if self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
-            let menu = self.render_spaces_menu(theme, cx);
-            trigger.relative().child(popover::anchored_menu_below(
-                "spaces-filter-menu",
-                menu,
-                closing,
-            ))
-        } else {
-            trigger
-        };
-
-        let view_open = self.sidebar_view_menu.is_open();
-        let view_focus = self.sidebar_view_trigger_focus.clone();
-        let view_trigger = div()
-            .id("sidebar-view-options")
-            .role(gpui::Role::Button)
-            .aria_label("Sidebar view options")
-            .aria_expanded(view_open)
-            .track_focus(&view_focus)
-            .size(px(29.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(theme.border.opacity(0.0))
-            .in_focus(|el| el.border_color(theme.border_strong))
-            .cursor_pointer()
-            .text_color(theme.text_muted)
-            .bg(if view_open {
-                theme.glass_hover()
-            } else {
-                theme.glass_hover().opacity(0.0)
-            })
-            .hover(|el| el.bg(theme.glass_hover()))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.sidebar_view_menu.note_trigger_press()),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.sidebar_view_menu.take_press_was_open() {
-                    this.close_sidebar_view_menu(cx);
-                } else {
-                    this.open_sidebar_view_menu(window, cx);
-                }
-            }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if matches!(
-                    event.keystroke.key.to_ascii_lowercase().as_str(),
-                    "enter" | "space" | "arrowdown"
-                ) {
-                    cx.stop_propagation();
-                    if this.sidebar_view_menu.is_open()
-                        && !event.keystroke.key.eq_ignore_ascii_case("arrowdown")
-                    {
-                        this.close_sidebar_view_menu(cx);
-                    } else if !this.sidebar_view_menu.is_open() {
-                        this.open_sidebar_view_menu(window, cx);
-                    }
-                }
-            }))
-            .tooltip(|_, cx| cx.new(|_| SidebarViewOptionsTooltip).into())
-            .tooltip_show_delay(std::time::Duration::from_millis(350))
-            .child(
-                icon(icons::SORT)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted),
-            );
-        let view_trigger = if self.sidebar_view_menu.get().is_some() {
+            let menu = self.render_spaces_menu(theme,cx);
+            add = add.relative().child(popover::anchored_menu_below_end("workspace-add-menu",menu,closing));
+        }
+        let mut view = div().id("sidebar-view-options").size(px(29.0)).flex().items_center().justify_center()
+            .rounded(px(8.0)).hover(|s| s.bg(theme.glass_hover())).cursor_pointer()
+            .track_focus(&self.sidebar_view_trigger_focus).role(gpui::Role::Button).aria_label("Sidebar view options")
+            .on_mouse_down(MouseButton::Left,cx.listener(|this,_,_,_|this.sidebar_view_menu.note_trigger_press()))
+            .on_click(cx.listener(|this,_,window,cx| {
+                if this.sidebar_view_menu.take_press_was_open() { this.close_sidebar_view_menu(cx); } else { this.open_sidebar_view_menu(window,cx); }
+            })).tooltip(|_,cx|cx.new(|_|SidebarViewOptionsTooltip).into()).child(icon(icons::SORT).size(px(16.0)).text_color(theme.text_muted));
+        if self.sidebar_view_menu.get().is_some() {
             let closing = self.sidebar_view_menu.closing_since();
-            let menu = self.render_sidebar_view_menu(theme, cx);
-            view_trigger
-                .relative()
-                .child(popover::anchored_menu_below_end(
-                    "sidebar-view-options-menu",
-                    menu,
-                    closing,
-                ))
-        } else {
-            view_trigger
-        };
-
-        div()
-            .flex_none()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0))
-            .px(px(Theme::SPACE_SM))
-            .pt(px(8.0))
-            .pb(px(4.0))
-            .child(trigger)
-            .child(view_trigger)
-            .into_any_element()
+            let menu = self.render_sidebar_view_menu(theme,cx);
+            view = view.relative().child(popover::anchored_menu_below_end("sidebar-view-menu",menu,closing));
+        }
+        // A workspace is a section heading, not another navigation destination.
+        // Folder selection remains an explicit action in the adjacent plus menu.
+        div().flex_none().flex().items_center().gap(px(4.0)).px(px(Theme::SPACE_SM)).pt(px(20.0)).pb(px(4.0))
+            .text_color(theme.text_muted)
+            .child(div().id("workspace-heading").flex_1().min_w_0().h(px(29.0)).flex().items_center().gap(px(7.0))
+                .px(px(Theme::SPACE_SM))
+                .child(div().truncate().text_size(crate::typography::ui_rems(16.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme.text).child(label)))
+            .child(add).child(view).into_any_element()
     }
 
-    /// The dropdown card: search on top, "All projects" + space rows (check on
-    /// the active filter; right-click for rename/remove) + "New project…".
     fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (search, active, focus, list_scroll) = {
             let Some(menu) = self.spaces_menu.get() else {
@@ -957,8 +775,11 @@ impl Shell {
                         }
                         None => (row.clone(), SharedString::from("?"), None, false),
                     },
+                    SpacesMenuRow::NewChat => (row.clone(), "New chat".into(), None, false),
+                    SpacesMenuRow::CreateProject => (row.clone(), "New folder".into(), None, false),
+                    SpacesMenuRow::ChangeWorkspace => (row.clone(), "Change default workspace".into(), None, false),
                     SpacesMenuRow::AddSpace => {
-                        (row.clone(), SharedString::from("New project…"), None, false)
+                        (row.clone(), SharedString::from("Add workspace"), None, false)
                     }
                 })
                 .collect()
@@ -978,9 +799,10 @@ impl Shell {
                         let is_selected = match &row {
                             SpacesMenuRow::All => filter.is_none(),
                             SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
-                            SpacesMenuRow::AddSpace => false,
+                            _ => false,
                         };
                         let leading = match &row {
+                            SpacesMenuRow::NewChat => icons::CHAT_ROUND_LINE,
                             SpacesMenuRow::AddSpace => icons::PLUS,
                             _ => icons::FOLDER,
                         };
@@ -1065,6 +887,11 @@ impl Shell {
     /// order (not the raw recency list) so keyboard order never drifts from
     /// the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
+        if self.settings.workspace_initialized {
+            return self.workspace_groups(cx).into_iter().filter(|(id,_,_)| {
+                !self.sidebar_collapsed_groups.contains(&format!("project:{}",id.as_deref().unwrap_or("workspace")))
+            }).flat_map(|(_,_,chats)|chats).map(|c|c.id).collect();
+        }
         let filter = self.settings.space_filter.clone();
         let state = self.state.read(cx);
         let mut chats: Vec<zeron_proto::Chat> = state
@@ -1101,6 +928,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
+        if self.settings.workspace_initialized { return self.render_workspace_rows(theme,cx); }
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
         let mut rows: Vec<ActiveChatRow> = {
@@ -1316,11 +1144,14 @@ impl Shell {
     /// and the tail pages behind an explicit "Show N more" row (initial 10,
     /// +25 a click). `None` when nothing is archived under the current
     /// project filter.
-    pub(super) fn render_archived_section(
+    pub(super) fn render_chat_shelf(
         &mut self,
+        automation: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let key = if automation { "automation-chats" } else { "archived" };
+        let name = if automation { "Automations" } else { "Archived" };
         const INITIAL: usize = 10;
         const PAGE: usize = 25;
         let now = Utc::now();
@@ -1330,7 +1161,7 @@ impl Shell {
             state
                 .chats
                 .iter()
-                .filter(|c| c.archived)
+                .filter(|c| if automation { !c.archived && c.automation.is_some() } else { c.archived })
                 .filter(|chat| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,
@@ -1343,8 +1174,8 @@ impl Shell {
             return None;
         }
         let total = rows.len();
-        let open = self.archived_open;
-        let shown = self.archived_shown.max(INITIAL);
+        let open = if automation { self.automation_chats_open } else { self.archived_open };
+        let shown = if automation { self.automation_chats_shown } else { self.archived_shown }.max(INITIAL);
         let visible_count = total.min(shown);
         let has_more = total > shown;
         let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
@@ -1359,22 +1190,22 @@ impl Shell {
         // filling the middle, chevron flipping open/closed. The count only
         // shows while collapsed — expanded, the rows speak for themselves.
         let label: SharedString = if open {
-            "Archived".into()
+            name.into()
         } else {
-            format!("Archived ({total})").into()
+            format!("{name} ({total})").into()
         };
-        let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
+        let chevron = self.sidebar_disclosure_chevron(key, open, theme);
         let header = sidebar_disclosure_header(theme, label, chevron)
-            .id("archived-toggle")
+            .id(SharedString::from(format!("{key}-toggle")))
             .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.archived_open;
+                let was_open = if automation { this.automation_chats_open } else { this.archived_open };
                 this.begin_sidebar_disclosure_motion(
-                    "archived",
+                    key,
                     if was_open { body_height } else { 0.0 },
                     if was_open { 0.0 } else { body_height },
                 );
-                this.archived_open = !was_open;
-                this.archived_shown = INITIAL;
+                if automation { this.automation_chats_open = !was_open; this.automation_chats_shown = INITIAL; }
+                else { this.archived_open = !was_open; this.archived_shown = INITIAL; }
                 cx.notify();
             }));
         let section = div().flex().flex_col().child(header);
@@ -1396,7 +1227,7 @@ impl Shell {
                 .into();
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let brand = if self.settings.sidebar_show_harness {
+                let brand = if self.settings.sidebar_show_harness && chat.automation.is_none() {
                     chat.config
                         .as_ref()
                         .map(|c| crate::pickers::harness_brand_icon(c.harness))
@@ -1425,10 +1256,10 @@ impl Shell {
                         .hover(|s| s.bg(crate::theme::wash(0.18)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.set_chat_archived(restore_id.clone(), false, cx);
+                            this.set_chat_archived(restore_id.clone(), automation, cx);
                         }))
                         .child(
-                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                            crate::icons::icon(if automation { crate::icons::ARCHIVE_MINIMALISTIC } else { crate::icons::ARCHIVE_UP_MINIMALISTIC })
                                 .size(px(11.0))
                                 .flex_none()
                                 .text_color(theme.text_muted),
@@ -1437,7 +1268,7 @@ impl Shell {
                             div()
                                 .text_size(crate::typography::ui_rems(10.0))
                                 .text_color(theme.text_muted)
-                                .child(SharedString::from("Unarchive")),
+                                .child(SharedString::from(if automation { "Archive" } else { "Unarchive" })),
                         )
                         .into_any_element()
                 } else {
@@ -1490,6 +1321,7 @@ impl Shell {
                         )
                         // Archived history recedes: dimmed mark at rest,
                         // restored on hover (t3code's grayscale favicon).
+                        .when_some(chat.automation.as_ref(), |el, identity| el.child(crate::agent_avatar::automation_face(identity, SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE)))
                         .when_some(brand, |el, (mark, tint)| {
                             el.child(
                                 crate::icons::icon(mark)
@@ -1523,7 +1355,7 @@ impl Shell {
                 let remaining = (total - shown).min(PAGE);
                 body = body.child(
                     div()
-                        .id("archived-more")
+                        .id(SharedString::from(format!("{key}-more")))
                         // Sits outside the rows' gapped column — match the
                         // list's 2px row gap or it fuses with the last row.
                         .mt(px(2.0))
@@ -1539,7 +1371,8 @@ impl Shell {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.archived_shown = this.archived_shown.max(INITIAL) + PAGE;
+                            if automation { this.automation_chats_shown = this.automation_chats_shown.max(INITIAL) + PAGE; }
+                            else { this.archived_shown = this.archived_shown.max(INITIAL) + PAGE; }
                             cx.notify();
                         }))
                         .child(
@@ -1552,7 +1385,7 @@ impl Shell {
             }
             body.into_any_element()
         };
-        let body = self.render_sidebar_disclosure_body("archived", open, body_height, body);
+        let body = self.render_sidebar_disclosure_body(key, open, body_height, body);
         let section = section.pt(px(SIDEBAR_SECTION_GAP)).child(body);
         Some(section.into_any_element())
     }
@@ -2847,12 +2680,8 @@ impl Shell {
 
     pub(super) fn open_rename_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.close_space_menu(cx);
-        let current = self
-            .state
-            .read(cx)
-            .space_row(&space_id)
-            .map(|s| s.display_name().to_string())
-            .unwrap_or_default();
+        let current = self.settings.chat_folders.iter().find(|f| f.id == space_id).map(|f| f.name.clone())
+            .or_else(|| self.state.read(cx).space_row(&space_id).map(|s| s.display_name().to_string())).unwrap_or_default();
         let input = cx.new(|cx| ComposerInput::new("Project name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
@@ -2875,6 +2704,20 @@ impl Shell {
         };
         let name = dialog.input.read(cx).text().trim().to_string();
         if !name.is_empty() {
+            if dialog.space_id == "new-folder" {
+                let id = format!("folder:{}", uuid::Uuid::new_v4());
+                self.settings.chat_folders.push(crate::settings::ChatFolder { id: id.clone(), name,
+                    workspace: self.settings.workspace_space_id.clone() });
+                self.schedule_save(cx);
+                self.open_chat_folder(id, cx);
+                return;
+            }
+            if let Some(folder) = self.settings.chat_folders.iter_mut().find(|f| f.id == dialog.space_id) {
+                folder.name = name;
+                self.schedule_save(cx);
+                cx.notify();
+                return;
+            }
             self.mutate(
                 serde_json::json!({ "op": "renameSpace", "spaceId": dialog.space_id, "name": name }),
                 cx,
@@ -2907,8 +2750,18 @@ impl Shell {
             let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
+            let colors = [0x9ca3af, 0xa78bfa, 0x60a5fa, 0x34d399, 0xfbbf24, 0xfb7185];
+            let color_row = div().flex().gap(px(6.0)).p(px(8.0)).children(colors.into_iter().map(|color| {
+                let id = space_id.clone();
+                div().id(SharedString::from(format!("folder-color-{color}"))).size(px(18.0)).rounded_full()
+                    .bg(gpui::rgb(color)).cursor_pointer().role(gpui::Role::Button).aria_label(format!("Color #{color:06x}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.project_colors.insert(id.clone(), color);
+                        this.schedule_save(cx); this.close_space_menu(cx); cx.notify();
+                    }))
+            }));
             let menu = popover::popover_card(&theme)
-                .w(px(170.0))
+                .w(px(190.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_space_menu(cx);
                 }))
@@ -2923,6 +2776,7 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                .child(color_row)
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-delete-{space_id}"))
@@ -2930,7 +2784,12 @@ impl Shell {
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_space_menu(cx);
-                            this.delete_space_confirm = Some(delete_id.clone());
+                            if delete_id.starts_with("folder:") {
+                                this.settings.chat_folders.retain(|f| f.id != delete_id);
+                                crate::settings::update(SavePolicy::Immediate, cx, |settings| settings.chat_folder_assignments.retain(|_, f| f != &delete_id));
+                                this.settings.project_colors.remove(&delete_id);
+                                this.schedule_save(cx);
+                            } else { this.delete_space_confirm = Some(delete_id.clone()); }
                             cx.notify();
                         }))
                         .child(
@@ -2954,6 +2813,7 @@ impl Shell {
                 window.focus(&dialog.input.focus_handle(cx), cx);
             }
             let input = dialog.input.clone();
+            let creating = dialog.space_id == "new-folder";
             let card = popover::dialog_card(&theme)
                 .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
                     if ev.keystroke.key == "escape" {
@@ -2962,7 +2822,7 @@ impl Shell {
                         cx.stop_propagation();
                     }
                 }))
-                .child(popover::dialog_title(&theme, "Rename project"))
+                .child(popover::dialog_title(&theme, if creating { "New folder" } else { "Rename" }))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -2984,7 +2844,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Rename")
+                            popover::btn_primary(&theme, if creating { "Create" } else { "Save" })
                                 .id("rename-space-save")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.submit_rename_space(cx)),
@@ -3074,6 +2934,7 @@ mod tests {
             branch: None,
             checkout_id: None,
             source_context: None,
+            automation: None,
             config: None,
             last_message_preview: None,
             last_message_at: Some(Utc.timestamp_opt(10, 0).unwrap()),

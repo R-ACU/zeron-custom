@@ -340,6 +340,8 @@ struct ApiKeyProviderParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetApiKeyParams {
+    #[serde(default)]
+    cloudflare: Option<zeron_proto::CloudflareGateway>,
     provider: zeron_proto::ApiKeyProvider,
     key: String,
 }
@@ -498,6 +500,8 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    inbox: Option<crate::inbox::Inbox>,
+    automations: Option<crate::automations::Automations>,
     api_keys: Option<ApiKeys>,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
@@ -540,6 +544,8 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            inbox: None,
+            automations: None,
             api_keys: None,
             auth: None,
             links: None,
@@ -555,6 +561,13 @@ impl EngineRpc {
     }
 
     /// Attach the provider API-key store (ListApiKeys / SetApiKey / RemoveApiKey).
+    pub fn with_inbox(mut self, inbox: crate::inbox::Inbox) -> Self { self.inbox = Some(inbox); self }
+
+    pub fn with_automations(mut self, automations: crate::automations::Automations) -> Self {
+        self.automations = Some(automations);
+        self
+    }
+
     pub fn with_api_keys(mut self, api_keys: ApiKeys) -> Self {
         self.api_keys = Some(api_keys);
         self
@@ -1076,18 +1089,26 @@ fn doc_messages_stream(
     chat_id: String,
 ) -> BoxStream<'static, serde_json::Value> {
     use zeron_doc::transcript_delta::{TranscriptFrame, diff_transcript};
+    let usage_rx = sessions.as_ref().map(|sessions| sessions.watch_usage());
     futures::stream::unfold(
         (
             rx,
             None::<std::sync::Arc<Vec<zeron_doc::SessionMessageEntry>>>,
             doc,
             None,
-            (sessions, chat_id, None),
+            (sessions, chat_id, None, usage_rx),
         ),
         |(mut rx, mut prev, doc, mut previous_usage, mut billing)| async move {
             loop {
                 if prev.is_some() {
-                    rx.changed().await.ok()?;
+                    if let Some(usage_rx) = &mut billing.3 {
+                        tokio::select! {
+                            result = rx.changed() => result.ok()?,
+                            result = usage_rx.changed() => result.ok()?,
+                        }
+                    } else {
+                        rx.changed().await.ok()?;
+                    }
                 }
                 // Watchers retain the immutable published snapshot. Each
                 // connection used to deep-copy the entire transcript here.
@@ -1100,7 +1121,7 @@ fn doc_messages_stream(
                 // No-op commits (a second watcher attaching, command-only
                 // changes) produce empty deltas — skip the frame entirely.
                 let usage = doc.context_usage();
-                let (sessions, chat_id, previous_billing) = &mut billing;
+                let (sessions, chat_id, previous_billing, _) = &mut billing;
                 let billed = sessions.as_ref().and_then(|s| s.usage_totals(chat_id));
                 if frame.is_empty_delta() && usage == previous_usage && billed == *previous_billing
                 {
@@ -2321,12 +2342,56 @@ impl RpcService for EngineRpc {
             // Provider API keys. Device-local and IPC-only (see the method
             // docs): they configure THIS engine's process environment, so a
             // relayed call would silently configure the wrong machine.
+            methods::LIST_INBOX | methods::UPDATE_INBOX | methods::OPEN_INBOX_REVIEW => {
+                if params.get("targetDeviceId").and_then(|v| v.as_str()).is_some_and(|id| id != self.doc_host.device_id()) {
+                    return Err(RpcError::Failed("Inbox belongs to this local device only".into()));
+                }
+                let inbox = self.inbox.as_ref().ok_or_else(|| RpcError::Failed("Inbox unavailable".into()))?;
+                match method {
+                    methods::LIST_INBOX => RpcReply::value(&inbox.list()),
+                    methods::UPDATE_INBOX => {
+                        let p: zeron_proto::UpdateInboxParams = parse_params(params)?;
+                        RpcReply::value(&inbox.update(p).map_err(|e| RpcError::Failed(e.to_string()))?)
+                    }
+                    _ => {
+                        let p: zeron_proto::OpenInboxReviewParams = parse_params(params)?;
+                        let automations = self.automations.as_ref().ok_or_else(|| RpcError::Failed("Automations unavailable".into()))?;
+                        RpcReply::value(&automations.open_review(&p.id).await.map_err(|e| RpcError::Failed(e.to_string()))?)
+                    }
+                }
+            }
+            methods::LIST_AUTOMATIONS
+            | methods::SAVE_AUTOMATION
+            | methods::DELETE_AUTOMATION
+            | methods::RUN_AUTOMATION_NOW => {
+                if params.get("targetDeviceId").and_then(|v| v.as_str()).is_some_and(|id| id != self.doc_host.device_id()) {
+                    return Err(RpcError::Failed("Automations run on this local device only".into()));
+                }
+                let store = self.automations.as_ref()
+                    .ok_or_else(|| RpcError::Failed("Automations unavailable".into()))?;
+                match method {
+                    methods::LIST_AUTOMATIONS => RpcReply::value(&store.list()),
+                    methods::SAVE_AUTOMATION => {
+                        let p: zeron_proto::SaveAutomationParams = parse_params(params)?;
+                        RpcReply::value(&store.save(p).map_err(|e| RpcError::Failed(e.to_string()))?)
+                    }
+                    methods::RUN_AUTOMATION_NOW => {
+                        let p: zeron_proto::RunAutomationNowParams = parse_params(params)?;
+                        RpcReply::value(&store.run_now(&p.id).await.map_err(|e| RpcError::Failed(e.to_string()))?)
+                    }
+                    _ => {
+                        let p: zeron_proto::DeleteAutomationParams = parse_params(params)?;
+                        store.delete(&p.id).map_err(|e| RpcError::Failed(e.to_string()))?;
+                        RpcReply::value(&serde_json::json!({ "ok": true }))
+                    }
+                }
+            }
             methods::LIST_API_KEYS => RpcReply::value(&self.require_api_keys()?.list()),
             methods::SET_API_KEY => {
                 let p: SetApiKeyParams = parse_params(params)?;
                 let snapshot = self
                     .require_api_keys()?
-                    .set(p.provider, &p.key)
+                    .set_with_cloudflare(p.provider, &p.key, p.cloudflare)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)
             }

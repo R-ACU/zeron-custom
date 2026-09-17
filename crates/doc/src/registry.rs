@@ -870,6 +870,7 @@ impl RegistryDoc {
             ("deviceId", json!(chat.device_id)),
             ("title", opt_str(chat.title.as_deref())),
             ("archived", json!(chat.archived)),
+            ("automation", serde_json::to_value(&chat.automation)?),
             ("cwd", opt_str(chat.cwd.as_deref())),
             ("branch", opt_str(chat.branch.as_deref())),
             ("checkoutId", opt_str(chat.checkout_id.as_deref())),
@@ -967,6 +968,12 @@ impl RegistryDoc {
             .collect();
         chats.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(chats)
+    }
+
+    pub fn set_chat_automation(&mut self, chat_id: &str, automation: &zeron_proto::ChatAutomation) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) { return Ok(false); }
+        self.write(KIND_CHATS, chat_id, OpKind::Update, fields([("automation", serde_json::to_value(automation)?)]));
+        Ok(true)
     }
 
     pub fn rename_chat(&mut self, chat_id: &str, title: &str) -> Result<bool, DocError> {
@@ -1262,6 +1269,7 @@ impl RegistryDoc {
                     ("deviceId", json!(chat.device_id)),
                     ("title", opt_str(chat.title.as_deref())),
                     ("archived", json!(chat.archived)),
+            ("automation", serde_json::to_value(&chat.automation)?),
                     ("cwd", opt_str(chat.cwd.as_deref())),
                     ("branch", opt_str(chat.branch.as_deref())),
                     ("checkoutId", opt_str(chat.checkout_id.as_deref())),

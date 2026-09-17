@@ -259,6 +259,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         branch: Some("main".into()),
         checkout_id: None,
         source_context: None,
+            automation: None,
         config: Some(ChatConfig {
             harness: HarnessId::Mock,
             model: Some("mock-1".into()),
@@ -898,4 +899,22 @@ fn completion_marker_replicates_and_survives_next_turn() {
     source.upsert_session(&row).unwrap();
     server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
     assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
+}
+
+#[test]
+fn automation_identity_survives_archive_and_registry_snapshot() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("run-chat", "dev-a")).unwrap();
+    let identity = zeron_proto::ChatAutomation { id: "job-a".into(), avatar: Some(zeron_proto::AgentAvatar { shape: "flame".into(), color: "#abc123".into() }) };
+    assert!(doc.set_chat_automation("run-chat", &identity).unwrap());
+    assert!(!doc.set_chat_automation("missing", &identity).unwrap());
+    doc.set_chat_archived("run-chat", true).unwrap();
+    let row = doc.read_chats().unwrap().remove(0);
+    assert_eq!(row.automation, Some(identity.clone()));
+    let mut restored = RegistryDoc::new("dev-b");
+    restored.upsert_chat(&row).unwrap();
+    let restored = RegistryDoc::from_bytes(&restored.to_bytes().unwrap(), "dev-b").unwrap();
+    let restored = restored.read_chats().unwrap().remove(0);
+    assert!(restored.archived);
+    assert_eq!(restored.automation, Some(identity));
 }

@@ -113,6 +113,9 @@ pub struct ConversationSourceContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Chat {
+    /// Automation identity captured on creation, independent of retained run history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<ChatAutomation>,
     pub id: String,
     /// Owning (host) device.
     pub device_id: String,
@@ -158,6 +161,13 @@ pub struct Chat {
     /// dials the room the registry names. Per-chat and instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAutomation {
+    pub id: String,
+    pub avatar: Option<crate::AgentAvatar>,
 }
 
 impl Chat {

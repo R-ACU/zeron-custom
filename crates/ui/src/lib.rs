@@ -12,10 +12,13 @@
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
 //! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
 
+pub mod agent_avatar;
+mod agent_avatar_data;
 pub mod app_menus;
 pub mod appearance;
 pub mod appshots;
 pub mod attachments;
+pub mod autostart;
 pub mod badges;
 pub mod browser;
 pub mod change_requests;
@@ -24,6 +27,7 @@ mod comment_ui;
 pub mod comments;
 pub mod composer;
 mod composer_dock;
+pub mod composer_notice;
 mod context_usage;
 pub mod edge_fade;
 pub mod file_icons;
@@ -46,6 +50,7 @@ pub mod notify;
 pub mod permission_picker;
 pub mod pickers;
 pub mod popover;
+pub mod power;
 pub mod pricing;
 pub mod queue;
 pub mod rail;
@@ -121,6 +126,9 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    // Before any window exists: the shell reads the process identity for
+    // taskbar grouping and for the notification platform (Windows AUMID).
+    notify::init_platform_identity();
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
@@ -176,6 +184,10 @@ pub fn run_app(config: UiConfig) {
         );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
+        // Undo a lid-action override a crashed instance left behind, then arm
+        // the keep-awake veto from the persisted setting (Windows only).
+        power::init(data_dir.clone());
+        power::set_enabled(ui_settings.keep_awake_while_running);
         terminal::panel::init(cx);
         app_menus::init(cx);
         cx.register_url_scheme("zeron").detach();
@@ -208,6 +220,8 @@ pub fn run_app(config: UiConfig) {
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
+            // Give the power plan its lid action back before the process ends.
+            power::shutdown();
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })

@@ -3,6 +3,10 @@
 //! Ported from zeron's `packages/control/src/wire.ts` + `packages/harness/src/types.ts`.
 //! Context occupancy is replicated per chat; billing `Usage` remains a harness passthrough.
 
+pub mod inbox;
+pub use inbox::*;
+pub mod automations;
+pub use automations::*;
 pub mod agent;
 pub mod api_keys;
 pub mod entities;

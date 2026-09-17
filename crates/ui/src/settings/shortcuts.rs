@@ -505,7 +505,14 @@ impl Render for ShortcutsPage {
                         ),
                 )
                 .child(
-                    widgets::toggle_switch(&theme, escape_stops_active_agent)
+                    widgets::toggle_switch_t(
+                        &theme,
+                        widgets::switch_progress(
+                            "shortcuts-escape-stops-agent",
+                            escape_stops_active_agent,
+                            cx,
+                        ),
+                    )
                         .id("escape-stops-active-agent-toggle")
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
