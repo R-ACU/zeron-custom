@@ -21,14 +21,24 @@ $Zip = Join-Path $Root "target\package\zeron-$Version-windows-$Arch.zip"
 
 Push-Location $Root
 try {
+    # "release not found" is the normal case here, but redirecting a native
+    # command's stderr under $ErrorActionPreference = "Stop" turns that line
+    # into a terminating NativeCommandError. Only the exit code matters.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     gh release view "v$Version" --repo $Repo *>$null
-    if ($LASTEXITCODE -eq 0) {
+    $exists = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $previous
+    if ($exists) {
         throw "release v$Version already exists - bump [workspace.package] version in Cargo.toml first"
     }
 
     if ($SkipBuild) { $env:SKIP_BUILD = "1" }
+    # Calling a .ps1 does not set $LASTEXITCODE (it would still hold the value
+    # of the last native command), so the produced zip is the success check.
+    # package-windows.ps1 runs with $ErrorActionPreference = "Stop" and throws
+    # on its own failures.
     & "$PSScriptRoot\package-windows.ps1"
-    if ($LASTEXITCODE -ne 0) { throw "package-windows.ps1 failed" }
     if (-not (Test-Path $Zip)) { throw "expected package not found: $Zip" }
 
     $ghArgs = @("release", "create", "v$Version", "--repo", $Repo, "--title", "Zeron v$Version (Windows)", "--notes", $Notes)
