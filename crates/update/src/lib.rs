@@ -787,10 +787,41 @@ pub fn spawn_windows_apply(
         use std::os::windows::process::CommandExt as _;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
+        // The helper outlives us and relaunches the app, so anything it
+        // inherits outlives us too. `Stdio::null()` only replaces the child's
+        // std handles; CreateProcessW still inherits every handle marked
+        // inheritable in this process, and when `zeron update` runs from a
+        // terminal its own stdout IS the caller's pipe. Leaking it keeps that
+        // pipe open until the relaunched app quits, so a shell waiting on
+        // `zeron update` never gets its prompt back. Un-mark them first.
+        deny_std_handle_inheritance();
     }
     command.spawn().context("spawning the update helper")?;
     Ok(())
+}
+
+/// Clear `HANDLE_FLAG_INHERIT` on this process's std handles so spawned
+/// children cannot inherit them. Best effort: a process without a console has
+/// null std handles and there is nothing to clear.
+#[cfg(windows)]
+fn deny_std_handle_inheritance() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle returns a handle owned by this process (or a
+        // null/invalid one, which SetHandleInformation simply rejects); we
+        // only clear a flag on it.
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 /// Body of the hidden `zeron apply-update` subcommand the helper copy runs —
@@ -863,12 +894,14 @@ fn apply_log(message: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = format!("[{secs}] {message}");
-    eprintln!("{line}");
+    // Not `eprintln!`: the helper is detached, so writing to a dead
+    // stderr handle would panic instead of being ignored.
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
     let path = std::env::temp_dir().join("zeron-update").join("apply.log");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    use std::io::Write as _;
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "{line}");
     }

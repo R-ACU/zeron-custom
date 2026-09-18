@@ -15,5 +15,15 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# spawn_windows_apply: clear the inherit flag on this process's std handles
+# before spawning the detached update helper, so neither it nor the app it
+# relaunches keeps a caller's pipe open. Same windows-sys version as the
+# other crates.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
