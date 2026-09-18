@@ -728,7 +728,11 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
 /// [`spawn_windows_apply`]).
 pub async fn stage_windows(manifest: &Manifest, data_dir: &Path) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
-    let dir = data_dir.join("updates").join(version);
+    let updates = data_dir.join("updates");
+    let dir = updates.join(version);
+    // An unpacked build is ~110 MB, so every leftover staging dir is real
+    // disk. Only the one being staged is of any use.
+    prune_staged_except(&updates, version);
     if dir.join("zeron.exe").exists() {
         return Ok(dir);
     }
@@ -748,6 +752,37 @@ pub async fn stage_windows(manifest: &Manifest, data_dir: &Path) -> anyhow::Resu
     Ok(dir)
 }
 
+/// Delete every staging dir under `updates` except `keep`. Best effort: a dir
+/// still in use (a helper reading from it) simply stays until the next run.
+fn prune_staged_except(updates: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(updates) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == keep {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Delete helper copies left in `dir` by earlier updates. A copy belonging to
+/// a still-running helper is locked and stays; the next run clears it.
+fn prune_helper_copies(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("apply-") && name.ends_with(".exe") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Spawn the detached swap helper: a fresh temp copy of THIS exe (a running
 /// exe can be copied but not replaced, and a new temp path per pid never
 /// collides with a previous still-running helper) executing the hidden
@@ -760,6 +795,9 @@ pub fn spawn_windows_apply(
 ) -> anyhow::Result<()> {
     let temp = std::env::temp_dir().join("zeron-update");
     std::fs::create_dir_all(&temp).with_context(|| format!("creating {}", temp.display()))?;
+    // Each copy is the full ~110 MB exe and a running one cannot delete
+    // itself, so the next update is what clears the previous.
+    prune_helper_copies(&temp);
     let helper = temp.join(format!("apply-{}.exe", std::process::id()));
     std::fs::copy(
         std::env::current_exe().context("resolving the running exe")?,
@@ -1402,6 +1440,41 @@ mod tests {
             ),
             InstallKind::Unmanaged
         );
+    }
+
+    #[test]
+    fn staging_keeps_only_the_version_being_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let updates = tmp.path().join("updates");
+        for version in ["0.2.67", "0.2.68", "0.2.69"] {
+            std::fs::create_dir_all(updates.join(version)).unwrap();
+            std::fs::write(updates.join(version).join("zeron.exe"), b"x").unwrap();
+        }
+        // A stray file next to the version dirs is not a staging dir.
+        std::fs::write(updates.join("note.txt"), b"x").unwrap();
+
+        prune_staged_except(&updates, "0.2.69");
+
+        assert!(updates.join("0.2.69").join("zeron.exe").exists());
+        assert!(!updates.join("0.2.67").exists());
+        assert!(!updates.join("0.2.68").exists());
+        assert!(updates.join("note.txt").exists());
+        // Pruning a missing dir is a no-op, not an error.
+        prune_staged_except(&tmp.path().join("nope"), "0.2.69");
+    }
+
+    #[test]
+    fn helper_copies_are_cleared_but_the_log_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("apply-123.exe"), b"x").unwrap();
+        std::fs::write(tmp.path().join("apply-456.exe"), b"x").unwrap();
+        std::fs::write(tmp.path().join("apply.log"), b"x").unwrap();
+
+        prune_helper_copies(tmp.path());
+
+        assert!(!tmp.path().join("apply-123.exe").exists());
+        assert!(!tmp.path().join("apply-456.exe").exists());
+        assert!(tmp.path().join("apply.log").exists(), "the log must survive");
     }
 
     #[test]
